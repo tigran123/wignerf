@@ -8,7 +8,7 @@ Type=simple
 User=tigran
 Group=tigran
 
-WorkingDirectory=/home/tigran/python/quantum-infodynamics/wignerf/
+WorkingDirectory=/home/tigran/python/wignerf/
 Environment="PYTHONUNBUFFERED=1"
 # cupy JIT-compiles CUDA kernels at runtime (NVRTC) and caches the cubins.
 # ProtectHome=read-only makes the default ~/.cupy unwritable, AND PrivateTmp
@@ -19,8 +19,8 @@ Environment="PYTHONUNBUFFERED=1"
 # restarts): compile once, sub-second thereafter. No-op on the CPU-only VPS.
 CacheDirectory=wignerf
 Environment=CUPY_CACHE_DIR=/var/cache/wignerf/cupy
-EnvironmentFile=/home/tigran/python/quantum-infodynamics/wignerf/wignerf.env
-ExecStart=/home/tigran/python/quantum-infodynamics/wignerf/start.sh
+EnvironmentFile=/home/tigran/python/wignerf/wignerf.env
+ExecStart=/home/tigran/python/wignerf/start.sh
 
 Restart=always
 RestartSec=5

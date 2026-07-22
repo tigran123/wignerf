@@ -2,9 +2,9 @@
 # Launcher for the wignerf server (serves the API + the built SPA on one port).
 #
 # This script ONLY runs the server — it does NOT install or build anything.
-# Create the backend venv and build the frontend beforehand; see the
-# "Wigner Function Simulator" section of ../README.md for the install (after
-# git clone) and upgrade (after git pull) steps. Keeping build steps out of
+# Create the backend venv and build the frontend beforehand; see README.md for
+# the install (after git clone) and upgrade (after git pull) steps. Keeping
+# build steps out of
 # the launcher lets the systemd unit stay sandboxed with a read-only home
 # (the old auto sync/build needed write access to ~/.cache/uv, node_modules,
 # frontend/dist, …).
@@ -27,12 +27,12 @@ PORT="${WIGNERF_PORT:-8010}"
 
 if [ ! -x backend/.venv/bin/uvicorn ]; then
     echo "start.sh: backend/.venv is missing or incomplete — run the install steps" >&2
-    echo "         in the wignerf section of ../README.md before starting." >&2
+    echo "         in README.md before starting." >&2
     exit 1
 fi
 if [ ! -d frontend/dist ]; then
     echo "start.sh: frontend/dist is missing — build the SPA (npm ci && npm run build)" >&2
-    echo "         as described in the wignerf section of ../README.md." >&2
+    echo "         as described in README.md." >&2
     exit 1
 fi
 

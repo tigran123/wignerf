@@ -6,3 +6,8 @@ __pycache__/
 # Node / build artifacts (dist is rebuilt by start.sh)
 frontend/node_modules/
 frontend/dist/
+
+# Reference material kept locally, not redistributed here: the method paper
+# (arXiv:1212.3406, fetch it yourself) and the old batch 4D solver kept as a
+# historical reference for the multi-D work. See README.md.
+docs/

@@ -2,10 +2,17 @@
 
 Live client-server simulator of W(x,p,t) in 1D phase space, evolved by the
 spectral split-operator method of Cabrera, Bondar, Jacobs, Rabitz (2015)
-(PDF at the repo root: `Efficient-Method-2015.pdf`). The validated batch
-reference implementation is `../dynamics/solve.py` — the propagator here is
-a direct port of its math; **never modify `dynamics/solve.py`** (it carries
-uncommitted WIP).
+(arXiv:1212.3406; PDF at `docs/Efficient-Method-2015.pdf`). The propagator is
+a direct port of the math in a validated batch implementation of that method.
+
+**This repo is self-contained** — split out of `quantum-infodynamics` on
+2026-07-22 (`git filter-repo --subdirectory-filter wignerf`). Never read or
+write anything under `quantum-infodynamics`; everything needed is here.
+`docs/` is git-ignored reference material, not part of the program: the paper
+above, and `solve4D.py`, an old batch 4D solver kept only as a historical
+reference for the eventual multi-D work (read it for ideas if useful; it is
+not a spec, and the 2D version should be written fresh). Install/build steps
+live in this repo's `README.md`.
 
 Units are Hartree atomic units everywhere (ħ = mₑ = e = 1). `c` is a session
 parameter (default 137.035999; `c=1` reproduces the old natural-unit toy
@@ -23,11 +30,16 @@ labels only (`frontend/src/lib/units.ts`).
   `frontend/dist` exists; in dev, Vite proxies `/api` (incl. WebSocket).
 - `start.sh` — prod launcher: runs uvicorn only (guards that `backend/.venv`
   and `frontend/dist` exist, else errors). Install/build is manual and
-  pre-service — see the wignerf section of the top-level `README.md`.
+  pre-service — see `README.md`.
 
 Dependency workflow (same as urantia-library): edit `requirements*.in`,
 then `uv pip compile requirements[-x].in -o requirements[-x].txt` and
-`uv pip sync requirements.txt requirements-dev.txt [requirements-gpu.txt]`.
+`uv pip sync --compile-bytecode requirements.txt requirements-dev.txt
+[requirements-gpu.txt]`. The `--compile-bytecode` is not optional in a
+deployment: the systemd unit runs with a read-only home, so Python can never
+write `__pycache__/*.pyc` at runtime — install-time precompilation (plus
+`.venv/bin/python -m compileall main.py config.py core routers` for our own
+source) is what keeps startup fast. See `README.md`.
 
 ## Architecture (see the plan in git history / memory for rationale)
 
