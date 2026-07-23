@@ -301,6 +301,27 @@ def test_setup_document_is_what_the_run_started_from():
         assert client.get("/api/sessions/%s/setup" % sid).status_code == 404
 
 
+def test_choose_encoder_honors_config(monkeypatch):
+    """auto uses the GPU h264_nvenc if the runtime probe passes, else libx264;
+    cpu/nvenc force the choice. No GPU needed — the probe is monkeypatched."""
+    import config as appconfig
+    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: True)
+    monkeypatch.setattr(appconfig, "EXPORT_ENCODER", "auto")
+    assert videoexport.choose_encoder()[:2] == ["-c:v", "h264_nvenc"]
+    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: False)
+    assert videoexport.choose_encoder()[:2] == ["-c:v", "libx264"]
+    assert "veryfast" in videoexport.choose_encoder()   # not the old 'medium'
+    # cpu forces libx264 even where nvenc works; nvenc forces the GPU encoder
+    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: True)
+    monkeypatch.setattr(appconfig, "EXPORT_ENCODER", "cpu")
+    assert videoexport.choose_encoder()[:2] == ["-c:v", "libx264"]
+    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: False)
+    monkeypatch.setattr(appconfig, "EXPORT_ENCODER", "nvenc")
+    assert videoexport.choose_encoder()[:2] == ["-c:v", "h264_nvenc"]
+    # the explicit-argument form overrides the config
+    assert videoexport.choose_encoder("cpu")[:2] == ["-c:v", "libx264"]
+
+
 @needs_ffmpeg
 def test_export_end_to_end(tmp_path, monkeypatch):
     import config as appconfig
@@ -341,6 +362,44 @@ def test_export_end_to_end(tmp_path, monkeypatch):
             assert client.delete("/api/exports/%s" % jid).json()["ok"]
             assert client.get("/api/exports/%s" % jid).status_code == 404
             assert not (tmp_path / "").exists() or not list(tmp_path.glob("*.mp4"))
+        client.delete("/api/sessions/%s" % sid)
+
+
+@needs_ffmpeg
+def test_export_uses_the_parallel_pool(tmp_path, monkeypatch):
+    """The multi-process render path (not just the serial fast path) must
+    produce a valid h264 mp4 with the right frame count. Forced on a small
+    job by lowering the pool threshold and worker count."""
+    import config as appconfig
+    monkeypatch.setattr(appconfig, "EXPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(videoexport, "POOL_MIN_FRAMES", 4)
+    monkeypatch.setattr(videoexport, "export_workers", lambda: 2)
+    with TestClient(app) as client:
+        info = _mk(client)
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            first, last = _solve_a_few(client, ws, sid, n=8)
+            k1 = min(last, first + 7)
+            assert k1 - first + 1 >= 2*2      # enough frames to hit the pool
+            r = client.post("/api/sessions/%s/export" % sid,
+                            json={"k0": first, "k1": k1, "fps": 10,
+                                  "width": 320, "height": 240})
+            assert r.status_code == 202, r.text
+            jid = r.json()["job_id"]
+            total = r.json()["total"]
+            for _ in range(600):
+                time.sleep(0.1)
+                st = client.get("/api/exports/%s" % jid).json()
+                if st["state"] in ("done", "error", "cancelled"):
+                    break
+            assert st["state"] == "done", st
+            assert st["done"] == st["total"] == total and st["bytes"] > 0
+            info_ = videoexport.probe_json(videoexport.get(jid).path)
+            if info_ is not None:
+                v = info_["streams"][0]
+                assert v["codec_name"] == "h264"
+                assert int(v["nb_frames"]) == total
+            client.delete("/api/exports/%s" % jid)
         client.delete("/api/sessions/%s" % sid)
 
 

@@ -25,13 +25,18 @@ cleanup); the session object is duck-typed here.
 
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from time import monotonic
+
+import config
 
 from . import describe, render_mpl
 
@@ -40,6 +45,9 @@ log = logging.getLogger(__name__)
 # how long a finished file stays downloadable before the sweeper unlinks it
 FILE_TTL = 30*60.0
 PROGRESS_PERIOD = 0.5
+# below this many frames an export renders serially (the ~1-2 s pool warmup —
+# spawn + a FrameFigure per worker — is not worth it for a tiny job)
+POOL_MIN_FRAMES = 16
 
 _JOBS = {}
 _LOCK = threading.Lock()
@@ -52,6 +60,84 @@ _RENDER_LOCK = threading.Lock()
 
 def ffmpeg_path():
     return shutil.which("ffmpeg")
+
+
+# The frame RENDER (matplotlib/Agg) dominates export time, not the encode, so
+# the encoder choice is a top-up: nvenc frees the CPU for the render pool and
+# is ~3x faster at 4K, libx264 veryfast is the portable fallback. NB the right
+# GPU path is the h264_nvenc ENCODER, not ffmpeg's -hwaccel (that is a decode
+# flag and does nothing for our rawvideo input).
+_NVENC_OK = None
+
+
+def _nvenc_ok():
+    """Whether h264_nvenc actually WORKS here — cached. The encoder can be
+    built into ffmpeg yet fail at runtime without a driver/GPU (the CPU-only
+    VPS), so grepping -encoders is not enough: we run a tiny encode once."""
+    global _NVENC_OK
+    if _NVENC_OK is None:
+        _NVENC_OK = _probe_nvenc()
+        log.info("export: h264_nvenc %s", "available" if _NVENC_OK else
+                 "unavailable (falling back to libx264)")
+    return _NVENC_OK
+
+
+def _probe_nvenc():
+    exe = ffmpeg_path()
+    if exe is None:
+        return False
+    try:
+        return subprocess.run(
+            [exe, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def choose_encoder(mode=None):
+    """ffmpeg `-c:v …` args for the configured encoder (WIGNERF_EXPORT_ENCODER
+    = auto | cpu | nvenc). auto = nvenc if it works, else libx264."""
+    mode = (mode or config.EXPORT_ENCODER or "auto").lower()
+    if mode == "nvenc" or (mode == "auto" and _nvenc_ok()):
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19"]
+    # veryfast (was medium): ~2x faster encode, file ~7% larger, visually
+    # identical for this smooth content — and it frees cores for the render
+    # pool where nvenc is unavailable.
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-threads", "0"]
+
+
+def export_workers():
+    """How many frame-render processes an export uses (WIGNERF_EXPORT_WORKERS,
+    0 = auto). Scaling flattens past the physical cores, hence the cap."""
+    return config.EXPORT_WORKERS or min(os.cpu_count() or 4, 8)
+
+
+# ---------------------------------------------------------------------------
+# render-pool workers (run in spawn subprocesses — no CUDA, matplotlib only)
+# ---------------------------------------------------------------------------
+
+_WORKER = {}
+
+
+def _worker_init(variants, stats, meta, width, height, show_grid):
+    """One persistent FrameFigure per worker process, reused across records
+    (it re-applies the window itself on the rare auto-expand regrid). Building
+    it here — once per worker, not once per frame — is what the pool is for."""
+    _WORKER["fig"] = render_mpl.FrameFigure(
+        variants, stats, meta, width=width, height=height, show_grid=show_grid)
+
+
+def _worker_render(args):
+    """Render one record; return its RGBA bytes copied out of the Agg buffer
+    (the next update() overwrites the buffer, and the bytes are pickled back
+    to the parent)."""
+    k, t, geom, vframes, k0, k1 = args
+    buf = _WORKER["fig"].update(k, t, geom, vframes, k0, k1)
+    return bytes(memoryview(buf).cast("B"))
 
 
 class ExportJob(threading.Thread):
@@ -119,39 +205,33 @@ class ExportJob(threading.Thread):
         self._post()
         fig = None
         proc = None
+        executor = None
         try:
             stats, geom0 = self._scan()
             meta = render_mpl.meta_columns(
                 self.session.cfg, geom0, stats, self.variants, self.k0,
                 self.k1, self.total, self.spec.fps, self.session.param_log)
-            fig = render_mpl.FrameFigure(self.variants, stats, meta,
-                                         width=self.spec.width,
-                                         height=self.spec.height,
-                                         show_grid=self.spec.show_grid)
             proc = self._spawn_ffmpeg()
-            last = 0.0
-            for k in self.records:
-                if self.cancel_evt.is_set():
-                    raise _Cancelled()
-                rec = self.session.history.get(k)
-                if rec is None:
-                    raise ValueError("record %d is no longer retained "
-                                     "(history evicted)" % k)
-                t, geom, vframes = rec
-                try:
-                    proc.stdin.write(fig.update(k, t, geom,
-                                                self._order(vframes),
-                                                self.k0, self.k1))
-                except BrokenPipeError:
-                    # ffmpeg died mid-stream (its diagnostics went to the
-                    # server log); report that, not "broken pipe"
-                    raise ValueError("ffmpeg exited early with code %s"
-                                     % proc.wait(timeout=10)) from None
-                self.done += 1
-                now = monotonic()
-                if now - last > PROGRESS_PERIOD:
-                    last = now
-                    self._post()
+            self._last_post = 0.0
+            # Rendering a frame (matplotlib/Agg) dominates export time, so it
+            # is spread over a pool of processes while this thread feeds the
+            # ordered frames to one ffmpeg. A small job renders serially: the
+            # ~1-2 s pool warmup (spawn + a FrameFigure per worker) is not
+            # worth it, and it keeps the light path unchanged.
+            w = export_workers()
+            if w <= 1 or len(self.records) < max(2*w, POOL_MIN_FRAMES):
+                fig = self._render_serial(proc, stats, meta)
+            else:
+                # spawn, NOT fork: the backend initializes CUDA, and forking
+                # after that inherits a broken context. spawn starts clean
+                # Python; these workers only touch matplotlib/numpy.
+                executor = ProcessPoolExecutor(
+                    max_workers=w,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_worker_init,
+                    initargs=(self.variants, stats, meta, self.spec.width,
+                              self.spec.height, self.spec.show_grid))
+                self._render_parallel(proc, executor, w)
             proc.stdin.close()
             rc = proc.wait(timeout=120)
             proc = None
@@ -167,12 +247,81 @@ class ExportJob(threading.Thread):
             self.error = str(e)
             self._unlink()
         finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
             if proc is not None:
                 _kill(proc)
             if fig is not None:
                 fig.close()
             self.finished_at = time.monotonic()
             self._post()
+
+    def _emit(self, proc, buf):
+        """Write one rendered frame to ffmpeg + progress bookkeeping."""
+        try:
+            proc.stdin.write(buf)
+        except BrokenPipeError:
+            # ffmpeg died mid-stream (its diagnostics went to the server
+            # log); report that, not "broken pipe"
+            raise ValueError("ffmpeg exited early with code %s"
+                             % proc.wait(timeout=10)) from None
+        self.done += 1
+        now = monotonic()
+        if now - self._last_post > PROGRESS_PERIOD:
+            self._last_post = now
+            self._post()
+
+    def _read_record(self, k):
+        """Fetch one record's (t, geom, ordered-vframes) from history — always
+        in this thread (history is in-process; a paused session never evicts,
+        but the guard stays)."""
+        rec = self.session.history.get(k)
+        if rec is None:
+            raise ValueError("record %d is no longer retained "
+                             "(history evicted)" % k)
+        t, geom, vframes = rec
+        return t, geom, self._order(vframes)
+
+    def _render_serial(self, proc, stats, meta):
+        fig = render_mpl.FrameFigure(self.variants, stats, meta,
+                                     width=self.spec.width,
+                                     height=self.spec.height,
+                                     show_grid=self.spec.show_grid)
+        for k in self.records:
+            if self.cancel_evt.is_set():
+                raise _Cancelled()
+            t, geom, vframes = self._read_record(k)
+            self._emit(proc, fig.update(k, t, geom, vframes, self.k0, self.k1))
+        return fig
+
+    def _render_parallel(self, proc, executor, w):
+        """Frames render out of order in the pool but reach ffmpeg in order:
+        a sliding window of at most w+2 outstanding futures, consumed FIFO by
+        .result() (so workers run ahead while this thread waits on the head),
+        which also bounds memory to that many in-flight frames."""
+        window = deque()
+        pending = iter(self.records)
+
+        def submit_next():
+            for k in pending:
+                t, geom, vframes = self._read_record(k)
+                window.append(executor.submit(
+                    _worker_render,
+                    (k, t, geom, vframes, self.k0, self.k1)))
+                return True
+            return False
+
+        for _ in range(w + 2):
+            if self.cancel_evt.is_set():
+                raise _Cancelled()
+            if not submit_next():
+                break
+        while window:
+            if self.cancel_evt.is_set():
+                raise _Cancelled()
+            buf = window.popleft().result()
+            self._emit(proc, buf)
+            submit_next()
 
     def _order(self, vframes):
         """Records carry every session variant in bundle order; an export of
@@ -220,22 +369,23 @@ class ExportJob(threading.Thread):
 
     def _spawn_ffmpeg(self):
         cfg = self.session.cfg
+        enc = choose_encoder()
         comment = describe.config_json(
             cfg, self.session.param_log, at_record=self.k0,
             export={"records": [self.k0, self.k1], "stride": self.spec.stride,
                     "fps": self.spec.fps, "frames": self.total,
-                    "variants": self.variants})
+                    "variants": self.variants, "encoder": enc[1]})
         cmd = [ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y",
                "-f", "rawvideo", "-pixel_format", "rgba",
                "-video_size", "%dx%d" % (self.spec.width, self.spec.height),
-               "-framerate", str(self.spec.fps), "-i", "pipe:0",
-               "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+               "-framerate", str(self.spec.fps), "-i", "pipe:0", "-an"] + enc + [
                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                "-metadata", "title=wignerf W(x,p,t) records %d-%d"
                % (self.k0, self.k1),
                "-metadata", "comment=%s" % comment,
                self.path]
-        log.info("export %s: %d frames -> %s", self.id, self.total, self.path)
+        log.info("export %s: %d frames @ %s -> %s",
+                 self.id, self.total, enc[1], self.path)
         return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
     def _unlink(self):

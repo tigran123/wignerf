@@ -153,10 +153,30 @@ source) is what keeps startup fast. See `README.md`.
   prompt.
 - **mp4 export** (`core/videoexport.py` + `core/render_mpl.py` +
   `routers/export.py`): renders an ALREADY-COMPUTED record range on the
-  BACKEND — matplotlib/Agg frames piped as raw RGBA into
-  `ffmpeg -c:v libx264` (system ffmpeg, absence ⇒ 503). PAUSED-only (409
+  BACKEND — matplotlib/Agg frames piped as raw RGBA into ffmpeg (system
+  ffmpeg, absence ⇒ 503). PAUSED-only (409
   while running): a running session evicts old records, and the feature is
-  for filming a range you already played back. Two passes: a scan collects
+  for filming a range you already played back. **The frame RENDER, not the
+  encode, is the bottleneck** (measured 4-var 1024²: ~410 ms/frame render at
+  4K vs 34–109 ms to encode, and the encode already overlaps via the pipe;
+  363 ms of the render is the four `imshow` panels). So export renders frames
+  across a `ProcessPoolExecutor` (`export_workers`, `WIGNERF_EXPORT_WORKERS`,
+  auto = min(cpu, 8)) while this thread feeds the ORDERED frames to one
+  ffmpeg — a sliding window of ≤w+2 futures consumed FIFO by `.result()`
+  (workers run ahead, memory bounded). Measured ~3× (4K/4-var 2.2 → ~7 fps;
+  1080p 3.3 → ~9-10 fps). The pool is **spawn, NOT fork** — the backend
+  initializes CUDA and forking after that inherits a broken context; spawn
+  workers only touch matplotlib/numpy (never cupy — `xp` imports it lazily).
+  A small job (`< max(2·w, POOL_MIN_FRAMES=16)`) renders serially in-process
+  to skip the ~1-2 s pool warmup (`_render_serial`; the light path
+  unchanged). Encoder via `choose_encoder`/`WIGNERF_EXPORT_ENCODER`
+  (auto|cpu|nvenc): auto uses the GPU **`h264_nvenc` encoder** if a one-shot
+  runtime probe passes (`_nvenc_ok`, cached — the encoder can be built-in yet
+  fail with no driver/GPU, e.g. the VPS), else `libx264 -preset veryfast
+  -crf 18` (was `medium`; ~2× faster, file ~7% larger, visually identical for
+  this smooth content, and frees cores for the render pool). NB the GPU path
+  is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` — that is a DECODE flag and
+  does nothing for our rawvideo input. Two passes: a scan collects
   the E/ΔX·ΔP/γ series, the per-variant FIXED colour scale (no brightness
   flicker), the fixed marginal amplitudes and the widest window any record
   used, and proves every record is still retained before ffmpeg starts; then
@@ -300,6 +320,8 @@ running is pool recycling, not a leak).
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long 1440p exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
+| `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` encoder if a runtime probe succeeds (dedicated encoder block, ~3× faster at 4K, frees CPU for the render pool), else `libx264 -preset veryfast`. `cpu` forces libx264, `nvenc` forces the GPU. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to our rawvideo input). |
+| `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering a frame (matplotlib/Agg) dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` (spawn, not fork: the backend has CUDA up) while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`) uses all of these; a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
 | `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it (status carries `max_grid`). Lower it on VRAM-constrained hosts. Measured peak per variant worker: 160 MiB at 1024², 672 MiB at 2048², 2.7 GiB at 4096², 10.0 GiB at 8192² (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~5.4 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~20 GiB/card, which fits the 3090 and does NOT fit the 2080 Ti — cap by variant count, not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
 
 ## Commands

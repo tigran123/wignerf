@@ -21,6 +21,20 @@ WIGNERF_MAX_GRID     per-axis Nx/Np ceiling for auto-expand doublings
 WIGNERF_EXPORT_DIR   where mp4 exports are written before being downloaded
                      (default <tempdir>/wignerf-exports; files are deleted
                      after the download TTL, on session close and at exit)
+WIGNERF_EXPORT_ENCODER
+                     mp4 video encoder: auto | cpu | nvenc. auto = the GPU
+                     h264_nvenc if a probe succeeds (dedicated encoder block,
+                     ~3x faster at 4K), else libx264. cpu forces libx264,
+                     nvenc forces the GPU encoder. The bottleneck is frame
+                     RENDERING, not encoding — this only tops up the parallel
+                     render pool (and is the right GPU path: h264_nvenc, NOT
+                     ffmpeg -hwaccel, which is for decoding).
+WIGNERF_EXPORT_WORKERS
+                     export frame-render processes; 0 = auto
+                     (min(cpu_count, 8)). Rendering a frame (matplotlib/Agg)
+                     dominates export time, so it is spread over a spawn
+                     ProcessPoolExecutor while one ffmpeg encodes the ordered
+                     stream. One export at a time uses all of these.
 """
 
 import os
@@ -34,3 +48,5 @@ MAX_GRID = int(os.environ.get("WIGNERF_MAX_GRID", "4096"))
 EXPORT_DIR = os.environ.get(
     "WIGNERF_EXPORT_DIR",
     os.path.join(tempfile.gettempdir(), "wignerf-exports"))
+EXPORT_ENCODER = os.environ.get("WIGNERF_EXPORT_ENCODER", "auto")
+EXPORT_WORKERS = int(os.environ.get("WIGNERF_EXPORT_WORKERS", "0"))
