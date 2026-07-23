@@ -62,6 +62,7 @@ const sessionId = computed(() => session.info.value?.session_id ?? null)
 const plotsKey = computed(() => String(restartCount.value))
 
 let unsub: (() => void) | null = null
+let userPaused = false     // survives a reconnect; see recover()
 
 function payload() {
   const p: Record<string, unknown> = JSON.parse(JSON.stringify(cfg))
@@ -136,6 +137,9 @@ async function sendCommand(cmd: Record<string, unknown>) {
       && transportAction(session.status.value,
                          session.lastFrame.value?.record ?? null) === 'solve'
       && !(await mayDiscardExport('Computing new records'))) return
+  // Remember the user's transport intent across a reconnect (see recover()).
+  if (cmd.type === 'pause') userPaused = true
+  if (cmd.type === 'play') userPaused = false
   session.send(cmd)
 }
 
@@ -166,6 +170,15 @@ const livePhysics = computed(() => {
   if (!st || !session.connected.value) return null
   return { potential: st.potential, mass: st.mass, c: st.c,
            hbar_eff: st.hbar_eff, tol: st.tol }
+})
+
+// The RUN settings of the session actually running. Restart-only, so unlike
+// livePhysics a difference is not "pending" but INERT — the Setup panel says
+// so rather than leaving the form looking like it took effect.
+const liveRun = computed(() => {
+  const st = session.status.value
+  if (!st || !session.connected.value) return null
+  return { mode: st.mode, t2: st.t2, record_dt: st.record_dt }
 })
 
 // Boundary watch surfacing: a dismissible amber warning while W sits in
@@ -239,6 +252,18 @@ async function recover() {
   recovering = true
   reconnecting.value = true
   const sid = session.info.value?.session_id
+  // was playback in progress when the socket dropped? (the browser drops it
+  // under a large-grid frame flood.) If so, resume after reattaching — the
+  // server seeds the replay from the cursor, so this CONTINUES to the end
+  // rather than leaving the user stranded mid-playback.
+  const wasPlaying = session.status.value?.running === true
+  // ...but a Pause pressed DURING the outage must win. Each drop re-issued
+  // play unconditionally, so while the socket was dropping repeatedly (open
+  // DevTools captures every 32 MiB frame, which is enough to cause that) the
+  // transport flipped to Play and instantly back to Pause and playback could
+  // not be stopped at all. userPaused is set by sendCommand and cleared by an
+  // explicit play, so the resume fires only if the user still wants one.
+  userPaused = false
   try {
     for (;;) {
       await new Promise((r) => setTimeout(r, 1500))
@@ -246,6 +271,8 @@ async function recover() {
         if (!sid) break
         await api.get(`/sessions/${sid}`)
         session.reconnect()          // session survived: reattach
+        if (wasPlaying && !userPaused)
+          setTimeout(() => { if (!userPaused) sendCommand({ type: 'play' }) }, 400)
         return
       } catch (e: unknown) {
         const st = (e as { response?: { status?: number } }).response?.status
@@ -420,6 +447,7 @@ onBeforeUnmount(() => {
         <SetupPanel :cfg="cfg" :live="session.connected.value" :sign="session.status.value?.sign ?? 1"
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
+                    :live-run="liveRun"
                     :max-grid="session.status.value?.max_grid ?? 4096" v-model:show-grid="showGrid"
                     @dirty="restartNeeded = true" @restart="requestRestart"
                     @apply-live="applyLive"
@@ -450,6 +478,7 @@ onBeforeUnmount(() => {
           <SetupPanel :cfg="cfg" :live="session.connected.value" :sign="session.status.value?.sign ?? 1"
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
+                    :live-run="liveRun"
                     :max-grid="session.status.value?.max_grid ?? 4096" v-model:show-grid="showGrid"
                       @dirty="restartNeeded = true" @restart="requestRestart"
                       @apply-live="applyLive"

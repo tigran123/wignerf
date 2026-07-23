@@ -25,8 +25,6 @@ from .xp import ArrayBackend
 
 log = logging.getLogger(__name__)
 
-_EXP_CACHE_MAX = 8
-
 
 class SolverWorker(threading.Thread):
     def __init__(self, session, key, slot, device):
@@ -44,7 +42,9 @@ class SolverWorker(threading.Thread):
         self.dt = 0.0
         self.steps_total = 0
         self.steps_per_sec = 0.0
-        self._exp_cache = {}
+        # exponent slots, each (dts, (expU, expT)) or None — see _exponents
+        self._exp_main = None    # the full step self.dt (the hot path)
+        self._exp_odd = None     # the clamped substep that lands on tau_k
         self._rate_mark = (0, monotonic())
 
     def stop(self):
@@ -75,12 +75,30 @@ class SolverWorker(threading.Thread):
         re-enter THIS worker's device; blocks still referenced by other
         live sessions are untouched (free_all_blocks frees only free
         blocks)."""
+        # Drop this worker's OWN arrays FIRST — before the GPU guard, because on
+        # the CPU backend these are host RAM (1 GiB at 4096^2) held just as long.
+        # free_all_blocks() returns only blocks that are FREE in the pool, and
+        # _run's locals (W, prop) are gone by now but ATTRIBUTES are not: the two
+        # exponent slots still hold 4 complex128 meshes — 256 MiB at 2048^2, 1.0
+        # GiB at 4096^2, 4.0 GiB at 8192^2 — so without this the release leaves
+        # exactly that much behind. It then returns to the pool only when the
+        # worker is collected (the session<->worker cycle, so: not by
+        # refcounting) and to the DRIVER only at some later worker's
+        # free_all_blocks() — which is why VRAM used to come back on the SECOND
+        # "Restart session" rather than the first.
+        self._exp_clear()
         backend = getattr(self, "_backend", None)
         if backend is None or not backend.is_gpu:
             return
         try:
             with backend.device():
                 xp = backend.xp
+                # this thread's cuFFT plans (work areas are real VRAM) — the
+                # plan cache is per thread AND device, and this thread is done
+                try:
+                    xp.fft.config.get_plan_cache().clear()
+                except Exception:
+                    log.debug("cuFFT plan cache clear failed", exc_info=True)
                 xp.get_default_memory_pool().free_all_blocks()
                 xp.get_default_pinned_memory_pool().free_all_blocks()
         except Exception:
@@ -135,15 +153,32 @@ class SolverWorker(threading.Thread):
     @staticmethod
     def _finite(prop, backend):
         xp = backend.xp
-        return bool(xp.isfinite(prop.dU).all()) and bool(xp.isfinite(prop.dT).all())
+        return bool(xp.isfinite(prop.dU_im).all()) and bool(xp.isfinite(prop.dT_im).all())
+
+    def _exp_clear(self):
+        self._exp_main = self._exp_odd = None
 
     def _exponents(self, prop, dts):
-        pair = self._exp_cache.get(dts)
-        if pair is None:
-            if len(self._exp_cache) >= _EXP_CACHE_MAX:
-                self._exp_cache.clear()
-            pair = prop.exponents(dts)
-            self._exp_cache[dts] = pair
+        """Two purposeful slots, not a general cache.
+
+        Within a record almost every substep uses the full self.dt; only the
+        LAST one is clamped to land exactly on tau_k, and that value is unique
+        per record and never asked for again. So pin the full step and keep a
+        single slot for the clamped straggler — the hot path hits ~always and
+        exactly one exp() rebuild happens per record.
+
+        The 8-entry dict this replaces kept seven dead complex128 pairs alive:
+        256 MiB per worker at 1024^2 and 1 GiB at 2048^2, two thirds of the
+        entire device working set, to avoid a rebuild costing ~25% of one
+        Strang step once per record (a record is >= 8 substeps)."""
+        for slot in (self._exp_main, self._exp_odd):
+            if slot is not None and slot[0] == dts:
+                return slot[1]
+        pair = prop.exponents(dts)
+        if dts == self.dt:
+            self._exp_main = (dts, pair)
+        else:
+            self._exp_odd = (dts, pair)
         return pair
 
     def _advance(self, prop, W, t, t_tgt):
@@ -152,7 +187,7 @@ class SolverWorker(threading.Thread):
             direction = 1.0 if t_tgt > t else -1.0
             if self.dt == 0.0 or (self.dt > 0) != (direction > 0):
                 self.dt = direction*(abs(self.dt) or self.session.cfg.record_dt/8.)
-                self._exp_cache.clear()
+                self._exp_clear()
                 self.force_adjust = True
             rem = t_tgt - t
             adjust_due = self.force_adjust or self.steps_total % 20 == 0
@@ -166,7 +201,7 @@ class SolverWorker(threading.Thread):
                 if self.force_adjust or abs(dt_try) > abs(rem):
                     dt_try = self.dt
                 W, self.dt, eU, eT = prop.adjust_step(dt_try, W)
-                self._exp_cache = {self.dt: (eU, eT)}
+                self._exp_main, self._exp_odd = (self.dt, (eU, eT)), None
                 self.force_adjust = False
                 t += self.dt
             else:
@@ -219,7 +254,7 @@ class SolverWorker(threading.Thread):
                              "to [%g, %g]x[%g, %g]"
                              % (new.x1, new.x2, new.p1, new.p2))
         self._grid_state = new
-        self._exp_cache.clear()
+        self._exp_clear()
         self.force_adjust = True
         log.info("%s: regrid epoch %d applied at k>=%d: [%g, %g]x[%g, %g] %dx%d",
                  self.name, plan.epoch, plan.k_star,
@@ -254,5 +289,5 @@ class SolverWorker(threading.Thread):
                 self.session.post_error(
                     "variant '%s': parameter change rejected (%s)" % (self.key, e))
             else:
-                self._exp_cache.clear()
+                self._exp_clear()
                 self.force_adjust = True

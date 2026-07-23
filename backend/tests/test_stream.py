@@ -236,6 +236,131 @@ def test_playback_zero_delay_never_skips():
         client.delete("/api/sessions/%s" % sid)
 
 
+def test_close_while_attached_unwinds_streamer():
+    """Closing a session while its WebSocket is still attached must tear the
+    streamer down and free the history. Regression for the 2026-07-22 leak:
+    close() pops the session and stops its workers, but the ws_endpoint
+    coroutine still held `s` (hence its whole FrameHistory) until the client
+    disconnected — invisible to the TTL sweeper, tens of GB stranded at
+    8192^2. The tell was ws_attached staying True after close(): before the
+    fix the streamer never noticed the session was gone."""
+    import gc
+    import time as _time
+    import weakref
+    from core.session import SESSIONS
+    with TestClient(app) as client:
+        info = _mk(client)
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            ws.send_text(json.dumps({"type": "play"}))
+            _recv_frames(ws, 3)
+            s = SESSIONS[sid]
+            assert s.ws_attached
+            assert s.stream_task is not None    # the streamer task is tracked
+            href = weakref.ref(s.history)
+            # close WHILE the socket is still open (the leak trigger). close()
+            # both wakes an idle sender AND cancels the task, so a sender
+            # blocked in a large backpressured send is torn down too.
+            s.close()
+            for _ in range(200):
+                if not s.ws_attached:
+                    break
+                _time.sleep(0.02)
+            assert not s.ws_attached, "streamer did not unwind after close()"
+            assert s.stream_task is None, "streamer task not cleared"
+        # coroutine gone + our ref dropped -> the FrameHistory is collectable
+        del s
+        for _ in range(200):        # ws_endpoint teardown is bounded at 3 s
+            gc.collect()
+            if href() is None:
+                break
+            _time.sleep(0.02)
+        assert href() is None, "FrameHistory survived close(): the leak"
+
+
+def test_closed_history_needs_the_cyclic_collector():
+    """A closed session is CYCLIC garbage — session.workers holds each worker
+    and worker.session holds the session back — so refcounting alone never
+    frees its FrameHistory. On an idle server a gen-2 collection may not run
+    for many minutes, leaving tens of GB resident after a Restart and looking
+    exactly like a leak (that appearance is what the 2026-07-23 'leaked
+    session' hunt turned out to be). The TTL sweeper's _collect_closed() is
+    what makes the free deterministic; this pins both halves."""
+    import gc
+    import time as _time
+    import weakref
+    from core import session as sessmod
+    gc.disable()          # "the collector has not run yet", deterministically
+    try:
+        with TestClient(app) as client:
+            info = _mk(client)
+            sid = info["session_id"]
+            with client.websocket_connect(info["ws_url"]) as ws:
+                ws.send_text(json.dumps({"type": "play"}))
+                _recv_frames(ws, 3)
+            s = sessmod.SESSIONS[sid]
+            for _ in range(200):        # let the streamer finish unwinding
+                if not s.ws_attached:
+                    break
+                _time.sleep(0.02)
+            href = weakref.ref(s.history)
+            sessmod._closed_since_sweep = False
+            s.close()
+            del s
+            assert sessmod._closed_since_sweep, "close() did not arm the sweep"
+            assert href() is not None, \
+                "history freed by refcounting — the worker back-reference " \
+                "cycle is gone, so _collect_closed() is no longer needed"
+            sessmod._collect_closed()
+            assert not sessmod._closed_since_sweep, "flag not consumed"
+            # ws_endpoint may still be unwinding (its teardown is bounded at
+            # 3 s) and would hold the session through no fault of the
+            # collector — retry instead of racing it, or this test is flaky.
+            for _ in range(200):
+                if href() is None:
+                    break
+                _time.sleep(0.02)
+                sessmod._closed_since_sweep = True     # re-arm; it self-clears
+                sessmod._collect_closed()
+            assert href() is None, "history survived _collect_closed()"
+            # and it is a no-op when nothing closed
+            sessmod._collect_closed()
+    finally:
+        gc.enable()
+
+
+def test_ttl_sweeper_never_binds_a_session_in_its_own_frame():
+    """The idle-close loop must live in _sweep_idle, not in ttl_sweeper.
+
+    A `for` target outlives its loop, so iterating SESSIONS directly inside
+    ttl_sweeper left the LAST session examined bound in the sweeper's frame:
+    pinned across the 15 s sleep, and forever once SESSIONS emptied (an empty
+    loop never rebinds the name). Measured 2026-07-23 at 4096²/100 records:
+    3.2 GB of FrameHistory still resident after DELETE and an explicit
+    gc.collect(), held by the one task whose purpose is to reclaim it — at
+    8192² that is tens of GB. Structural, so re-inlining the loop fails here
+    rather than silently costing a user their RAM."""
+    from core import session as sessmod
+    assert "s" not in sessmod.ttl_sweeper.__code__.co_varnames, \
+        "ttl_sweeper binds a session in its own frame — use _sweep_idle"
+    assert "s" in sessmod._sweep_idle.__code__.co_varnames
+
+
+def test_malloc_trim_is_wired_on_glibc():
+    """_collect_closed must hand freed record buffers back to the OS.
+
+    glibc's mmap threshold ratchets up to 32 MiB, so records SMALLER than that
+    (8.02 MiB at 2048²) come from the arena and free() alone never lowers RSS
+    — measured 1459 MiB still held after gc.collect() at 2048²/300 records,
+    964 MiB of it recovered by malloc_trim(0)."""
+    import sys
+    from core import session as sessmod
+    if not sys.platform.startswith("linux"):
+        pytest.skip("malloc_trim is glibc-only")
+    got = sessmod._trim_malloc_arena()
+    assert got is None or isinstance(got, int)
+
+
 def test_two_variant_lockstep():
     with TestClient(app) as client:
         info = _mk(client, variants=("qn", "cn"))

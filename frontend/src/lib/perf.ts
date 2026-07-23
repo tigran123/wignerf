@@ -21,9 +21,44 @@ let frames = 0
 let drops = 0
 let t0 = performance.now()
 
-export function perfMsg(nbytes: number) { msgs++; bytes += nbytes }
-export function perfFrame() { frames++ }
-export function perfDrop(n: number) { drops += n }
+export function perfMsg(nbytes: number) { msgs++; bytes += nbytes; wMsgs++ }
+export function perfFrame() { frames++; wFrames++ }
+export function perfDrop(n: number) { drops += n; wDrops += n }
+
+/**
+ * Sliding-window rates for the ON-SCREEN readout. The counters above are
+ * cumulative-since-reset (for bracketing a __wfPerf measurement); a readout
+ * needs an instantaneous rate instead.
+ *
+ * Both rates are reported because they answer different questions, and the
+ * gap between them is the whole story at large grids: `received` is how fast
+ * the server delivers records, `painted` is how fast they reach the screen.
+ * When painted < received the client is DROPPING (useSession's queue collapses
+ * to newest), which looks like fast playback while it is really skipping —
+ * the readout must not let that pass for speed.
+ */
+let wT0 = performance.now()
+let wFrames = 0
+let wMsgs = 0
+let wDrops = 0
+let rPainted = 0
+let rReceived = 0
+let rDropped = 0
+
+export function perfRates(): { painted: number; received: number; dropped: number } {
+  const now = performance.now()
+  const dt = (now - wT0) / 1000
+  // ~3 updates/s: long enough to be steady, short enough to track a stall
+  if (dt >= 0.35) {
+    rPainted = wFrames / dt
+    rReceived = wMsgs / dt
+    rDropped = wDrops / dt
+    wT0 = now
+    wFrames = wMsgs = wDrops = 0
+  }
+  return { painted: rPainted, received: rReceived, dropped: rDropped }
+}
+
 export function perfStage(name: string, ms: number) {
   const s = (stages[name] ??= { ms: 0, n: 0 })
   s.ms += ms

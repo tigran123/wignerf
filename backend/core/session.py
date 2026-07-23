@@ -22,6 +22,8 @@ idle sessions.
 """
 
 import asyncio
+import ctypes
+import gc
 import logging
 import threading
 import time
@@ -52,6 +54,17 @@ SKEW_MARGIN = 2
 
 SESSIONS = {}
 _LOCK = threading.Lock()
+# set by close(), consumed by the TTL sweeper: a closed session's history is
+# cyclic garbage and needs the collector, not refcounting (see _collect_closed)
+_closed_since_sweep = False
+
+# glibc's malloc_trim(0), or None off glibc — see _trim_malloc_arena
+try:
+    _malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+    _malloc_trim.argtypes = [ctypes.c_size_t]
+    _malloc_trim.restype = ctypes.c_int
+except (OSError, AttributeError):       # pragma: no cover - non-glibc host
+    _malloc_trim = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +279,7 @@ class SimSession:
         # be a lie about the frames after the change
         self.param_log = []
         self.ws_attached = False
+        self.stream_task = None      # the attached streamer's asyncio task
         self.last_seen = time.monotonic()
         self.closed = False
         # Sessions ALWAYS start paused (both modes): computation begins only
@@ -588,6 +602,21 @@ class SimSession:
         if self.closed:
             return
         self.closed = True
+        # Tear an attached streamer down NOW so it releases this session (and
+        # its whole FrameHistory) — otherwise the ws_endpoint coroutine keeps
+        # tens of GB resident after the session leaves SESSIONS, invisible to
+        # the TTL sweeper. Two prongs: notify_frame wakes a sender idling in
+        # its frame wait so it sees self.closed at the loop top; cancelling
+        # the task interrupts a sender BLOCKED inside a large backpressured
+        # send_bytes (which never reaches the loop top on its own). Both go
+        # through the loop thread.
+        self.notify_frame()
+        t = self.stream_task
+        if t is not None:
+            try:
+                self.loop.call_soon_threadsafe(t.cancel)
+            except RuntimeError:
+                pass   # loop already closed during shutdown
         videoexport.close_session(self.id)   # cancel exports, unlink files
         for w in self.workers:
             w.stop()
@@ -595,6 +624,8 @@ class SimSession:
             w.join(timeout=3.0)
         with _LOCK:
             SESSIONS.pop(self.id, None)
+        global _closed_since_sweep
+        _closed_since_sweep = True   # this history needs the cyclic collector
 
 
 def create_session(cfg, compiled_potential, device, fft_threads, history_bytes,
@@ -618,14 +649,82 @@ def close_all():
         s.close()
 
 
+def _collect_closed():
+    """Free the FrameHistory of sessions closed since the last sweep.
+
+    A closed SimSession is unreachable but NOT refcount-free: it holds
+    `workers`, each worker holds `session` back, so the pair is a CYCLE and
+    only the cyclic collector can break it. That is fine for the little
+    objects and fatal for the impression a user gets, because the session
+    holds the whole FrameHistory: on an otherwise idle server a gen-2
+    collection may not run for many minutes, so tens of GB stay resident
+    long after Restart — indistinguishable from a leak (it is how the
+    "leaked session" hunt started; see the gotcha in CLAUDE.md).
+
+    Collecting only when something actually closed keeps this off the
+    steady-state path. Cost scales with the number of tracked CONTAINERS,
+    not with the bytes they point at, so a multi-GB history is cheap to
+    reap."""
+    global _closed_since_sweep
+    if not _closed_since_sweep:
+        return
+    _closed_since_sweep = False
+    t0 = time.monotonic()
+    n = gc.collect()
+    freed = _trim_malloc_arena()
+    log.info("post-close gc: %d objects in %.0f ms%s", n,
+             (time.monotonic() - t0)*1e3,
+             "" if freed is None else " (malloc_trim=%d)" % freed)
+
+
+def _trim_malloc_arena():
+    """Hand freed record buffers back to the OS.
+
+    glibc's mmap threshold is DYNAMIC: it starts at 128 KiB but ratchets up to
+    the size of each mmap'd block that gets freed, capped at 32 MiB. Records
+    LARGER than that cap always mmap and their memory returns on free; records
+    SMALLER come from the arena once the threshold has ratcheted, and free()
+    leaves them as arena free-chunks that never lower RSS. A 4096² record is
+    32.03 MiB (just over the cap, so it self-returns) while a 2048² record is
+    8.02 MiB — which is why a big 2048² run could sit at ~9.8 GB RSS after two
+    Restarts while the same test at 4096² looked clean. Measured at 2048²/300
+    records: 1459 MiB still held after gc.collect(), 964 MiB of it recovered
+    here. Returns the glibc result, or None where malloc_trim does not exist
+    (musl, macOS) — this is an optimisation, never a correctness requirement."""
+    if _malloc_trim is None:
+        return None
+    try:
+        return int(_malloc_trim(0))
+    except Exception:            # pragma: no cover - defensive
+        log.debug("malloc_trim failed", exc_info=True)
+        return None
+
+
+async def _sweep_idle(now):
+    """Close idle sessions.
+
+    A separate coroutine ON PURPOSE. A `for` target outlives its loop, so
+    doing this inline in ttl_sweeper left the LAST session examined bound in
+    the sweeper's frame — pinning its entire FrameHistory across the 15 s
+    sleep, and FOREVER once SESSIONS empties, because an empty loop never
+    rebinds the name. Measured 2026-07-23: 3.2 GB held at 4096²/100 records
+    after DELETE, surviving explicit gc.collect(); at 8192² it would be tens
+    of GB, pinned by the very task whose job is to reclaim them. Here the
+    reference dies with this frame when the coroutine returns."""
+    for s in list(SESSIONS.values()):
+        if not s.ws_attached and now - s.last_seen > WS_IDLE_TTL:
+            log.info("session %s idle > %.0fs, closing", s.id, WS_IDLE_TTL)
+            # close() joins worker threads (up to seconds for a wedged one)
+            # — never block the event loop the streamers run on
+            await asyncio.to_thread(s.close)
+
+
 async def ttl_sweeper():
     while True:
         await asyncio.sleep(15.0)
         now = time.monotonic()
         videoexport.sweep(now)     # unlink exported files past their TTL
-        for s in list(SESSIONS.values()):
-            if not s.ws_attached and now - s.last_seen > WS_IDLE_TTL:
-                log.info("session %s idle > %.0fs, closing", s.id, WS_IDLE_TTL)
-                # close() joins worker threads (up to seconds for a wedged
-                # one) — never block the event loop the streamers run on
-                await asyncio.to_thread(s.close)
+        await _sweep_idle(now)
+        # after the idle closes, so a session closed by THIS sweep is freed
+        # by THIS sweep rather than 15 s later
+        await asyncio.to_thread(_collect_closed)

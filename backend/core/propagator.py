@@ -17,6 +17,12 @@ Note the Bopp arguments are real-valued: qd(U, X, 1j*Theta) evaluates U at
 X -+ hbar*Theta/2 (complex dtype, zero imaginary part). For real U the
 exponent dU is purely imaginary, so |expU| = 1 and the evolution is
 unconditionally norm-stable; accuracy is governed by adjust_step.
+
+That imaginary-ness is exact, not approximate, so the generators are STORED
+as the real angular-rate meshes dU_im, dT_im (the generator being 1j times
+them) — half the device bytes of the complex128 arrays they replace, and
+exponents() reproduces the old phases bitwise. _rate_mesh refuses a generator
+with a real part rather than let it silently break norm stability.
 """
 
 import logging
@@ -83,14 +89,38 @@ class Propagator:
         # Broadcast to full (Nx, Np) so expU/expT multiplications are plain
         # elementwise products regardless of how U/dUdx broadcast.
         shape = (g.Nx, g.Np)
-        self.dU = xp.ascontiguousarray(xp.broadcast_to(xp.asarray(dU, dtype=xp.complex128), shape))
-        self.dT = xp.ascontiguousarray(xp.broadcast_to(xp.asarray(dT, dtype=xp.complex128), shape))
+        self.dU_im = self._rate_mesh(dU, shape, "dU")
+        self.dT_im = self._rate_mesh(dT, shape, "dT")
         # Energy mesh on the shifted grid (display/observables). The rest
         # energy m*c^2 cancels identically inside dT (kinetic term enters
         # only as a difference) but dominates <H>; observables subtract it.
         self.H = xp.ascontiguousarray(
             xp.broadcast_to((T(g.P) + self.U(g.X)).real.astype(xp.float64), shape))
         self.rest_energy = self.mass*self.c**2 if self.relativistic else 0.0
+
+    def _rate_mesh(self, d, shape, name):
+        """Store the exponent generator as the REAL angular-rate mesh w, where
+        the generator is exactly 1j*w — half the bytes of the complex128 array
+        it replaces, and exponents() rebuilds the phase from it unchanged.
+
+        dU and dT are purely imaginary for every valid variant: U is required
+        real (potential.py) so the quantum differential of a real function over
+        a real Bopp increment is imaginary, and the classical branch is
+        literally dUdx*1j*Theta. The real part is not dropped silently, though
+        — a nonzero one means |expU| != 1, an evolution that quietly gains or
+        loses norm, which is precisely what test_exponents_unit_modulus pins.
+        Refuse it here rather than let it decay a run."""
+        xp = self.xp
+        d = xp.asarray(d, dtype=xp.complex128)
+        re_max = float(xp.max(xp.abs(d.real)))
+        if re_max > 0.0:
+            im_max = float(xp.max(xp.abs(d.imag)))
+            if re_max > 1e-13*max(im_max, 1.0):
+                raise ValueError(
+                    "%s has a non-negligible real part (max|Re| = %.3g vs "
+                    "max|Im| = %.3g): |exp| would differ from 1 and the "
+                    "evolution would not conserve norm" % (name, re_max, im_max))
+        return xp.ascontiguousarray(xp.broadcast_to(d.imag, shape))
 
     def set_grid(self, grid):
         """Adopt a regridded domain (auto-expand): swap the grid, rebuild
@@ -115,8 +145,11 @@ class Propagator:
     # -- stepping -----------------------------------------------------------
 
     def exponents(self, dt):
+        """exp(1j*dt*w) for the real rate meshes — bitwise what exp(dt*1j*w)
+        gave when the generators were stored complex (exp of a zero real part
+        is exactly 1.0, so the phase is untouched)."""
         xp = self.xp
-        return xp.exp(dt*self.dU), xp.exp(dt*self.dT)
+        return xp.exp(1j*(dt*self.dU_im)), xp.exp(1j*(dt*self.dT_im))
 
     def solve_spectral(self, W, expU, expT):
         """One Strang step (solve.py:130-140). W in shifted order; returns a

@@ -53,13 +53,27 @@ source) is what keeps startup fast. See `README.md`.
   record per display refresh — the fastest speed at which every frame is
   still painted: the client measures its refresh interval (lib/perf.ts)
   and sends that as the delay, and every dial position is clamped to at
-  least it, so delivery never outpaces painting. Replay never skips a
+  least it, so delivery never outpaces painting. **At 4096²/8192² that is
+  NOT enough and there is deliberately no client-side pacing loop** — an
+  adaptive pacer keyed on paint time was built and REMOVED on 2026-07-23
+  because paint time is not the binding constraint there (8.7 ms/frame
+  against a 285 ms delivery interval); see the browser-receive-ceiling
+  gotcha. Don't rebuild it: the constraint is the browser's per-message
+  receive cost, so the fix is smaller messages (display downsampling), not
+  a smarter delay. Replay never skips a
   record; it slips on WS backpressure when the client can't keep up. The
   UI dial is "0" plus a log range 20 ms–1.5 s. Client frame fan-out is
   rAF-timed (useSession: decode per message, paint one frame per
   animation frame; small FIFO with drop-to-newest as a burst safety
   valve), so texture uploads, uPlot updates and Vue reactivity run per
-  PAINTED frame by construction. A playback-only run must never coalesce to the
+  PAINTED frame by construction. That drop-to-newest is why the timeline
+  readout shows painted/s AND received/s (`Timeline.vue`, `perfRates`):
+  when they diverge the client is SKIPPING records, which reads on screen
+  as fast playback and is really loss — one number alone cannot tell the
+  two apart, and the live/compute path makes that worse by design (the
+  `delay` gate applies only to replay — see `advance_cursor` — while live
+  coalesces to the newest record, so computing legitimately animates
+  faster than paced playback). A playback-only run must never coalesce to the
   frontier while sequential records are unsent (that would teleport
   playback to the end), and its auto-pause is delivery-aware — it fires
   only after the frontier record was SENT. The transport must stay
@@ -286,7 +300,7 @@ running is pool recycling, not a leak).
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long 1440p exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
-| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it (status carries `max_grid`). Lower it on VRAM-constrained hosts: a 4096² working set is ~1.3 GiB per variant worker. At the cap the session warns and keeps computing (moves still allowed). |
+| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it (status carries `max_grid`). Lower it on VRAM-constrained hosts. Measured peak per variant worker: 160 MiB at 1024², 672 MiB at 2048², 2.7 GiB at 4096², 10.0 GiB at 8192² (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~5.4 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~20 GiB/card, which fits the 3090 and does NOT fit the 2080 Ti — cap by variant count, not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
 
 ## Commands
 
@@ -371,6 +385,142 @@ grids) and the measured refresh interval.
   across threads; each worker owns its backend.
 - Relativistic variants: mc² cancels inside the propagator; observables
   subtract it from displayed E.
+- **The solver is float64 and stays float64 — this was measured, not
+  assumed.** float32 saves nothing where it looks like it would: the frame
+  history (`WIGNERF_HISTORY_MB`, the big RAM number) is already uint16 via
+  `core/quantize.py`, so the solver dtype buys zero extra records. float64
+  lives only in the per-worker device working set. And complex64 stepping
+  costs the diagnostics that this project navigates by: measured over 2000
+  steps at 256², Δpurity −2.4e-4 and ΔE +9.4e-4, both SECULAR — i.e. exactly
+  the boundary-wrap signature in the gotcha below, from a perfectly contained
+  state — with ΔX·ΔP noise of 1.3e-3, 150× the ~7e-6 relativistic shear that
+  `test_relativistic_uncertainty_shear` pins. (float64 for comparison:
+  +6.7e-13, bounded +4.2e-5, +5.1e-8.) Exponent construction could not be
+  float32 even in a mixed scheme: relativistic `dT` built in float32 has max
+  abs error 455 against max |dT| = 228 — 200% — because mc² cancels inside a
+  difference of ~1.9e4-magnitude terms. If throughput is ever the goal,
+  complex64 cuFFT is genuinely ~5× faster and could be an explicit opt-in
+  "preview" mode, but it must never be the default and never the setting a
+  physics claim is made from.
+- The exponent generators dU, dT are EXACTLY purely imaginary (max|Re| = 0
+  in all four variants), so they are stored as the real rate meshes
+  `dU_im`/`dT_im` and `exponents()` rebuilds the phase — half the bytes,
+  bitwise-identical results. `Propagator._rate_mesh` REFUSES a generator whose
+  real part exceeds 1e-13 relative to its imaginary part, rather than
+  truncating it: a real part means |expU| ≠ 1, an evolution that quietly
+  gains or loses norm.
+- The worker keeps **two** exponent slots, not a cache (`_exp_main` for the
+  full dt, `_exp_odd` for the substep clamped onto τ_k). The 8-entry dict
+  this replaced retained seven dead complex128 pairs — two thirds of the
+  whole working set — and measurably saved zero rebuilds, because dt is
+  re-tuned by `adjust_step` every 20 steps so the old entries were never
+  asked for again. Measured 4 workers at 1024²: 1781 → 904 MiB.
+- **`close()` must tear the streamer down, or the whole FrameHistory leaks.**
+  The `ws_endpoint` coroutine holds `s` (hence its entire history) as a local;
+  `close()` pops the session from `SESSIONS` and stops its workers but the
+  streamer must be ended too, or it keeps the session fully resident —
+  invisible to the TTL sweeper (already gone from `SESSIONS`) and surviving
+  its own workers' death (tens of GB stranded at 8192² on 2026-07-22). TWO
+  prongs, because the sender can be stuck in two different ways: `_sender`
+  loops on `not recv_task.done() and not s.closed` and `close()` wakes an
+  IDLE sender via `notify_frame`; AND `close()` cancels `s.stream_task` (the
+  sender runs as a task) to interrupt a sender BLOCKED inside a large
+  backpressured `send_bytes` — the loop-top `s.closed` check can never fire
+  for a blocked send, which is exactly what strands a 1024²/8192² history
+  where a 128 MiB frame stalls on a slow client. Pinned by
+  `test_close_while_attached_unwinds_streamer` (which also asserts
+  `stream_task` is set then cleared). Also: every ws send goes through
+  `_guard_send`, which turns a send-after-disconnect `RuntimeError` (uvicorn,
+  when a send races the client's close) into a normal `WebSocketDisconnect`
+  and LOGS it — otherwise it surfaced as a "streamer failed" traceback and the
+  frontend's auto-recover churned reconnects. `ws_endpoint` logs the
+  disconnect code and `_sender` logs where it stopped (`last_sent`), so a
+  mid-replay drop is diagnosable from the journal.
+- **The BROWSER'S WebSocket receive path is the large-grid wall, and it
+  degrades with MESSAGE SIZE — not the server, not painting, not pacing.**
+  Measured 2026-07-23, 4096² (32 MiB/record), Chrome + RTX 2080 Ti:
+  `__wfPerf` reported 3.5 records/s and 112 MiB/s with `queue_drops: 0` and
+  `fanout` 8.7 ms/frame — i.e. the client could paint ~115 fps and was idle,
+  waiting on delivery — while the SAME server fed a raw Python client on the
+  same machine at 402 MiB/s (14.8 rec/s). Two runs of different length
+  reported 110.91 and 112.77 MiB/s: a hard ceiling, not a loop settling.
+  32 MiB ÷ 112 MiB/s = 285 ms = the 3.5 fps observed. But it is NOT a fixed
+  bandwidth: at 2048² (8 MiB/record) the same browser sustains 60 fps ⇒
+  ≥480 MiB/s, 4× better, so the cost is per-message and grows sharply with
+  payload size. This is the measurement that makes display-downsampling the
+  only real fix for interactive 4096²/8192² (1024² display frames are 2 MiB;
+  the same ceiling then allows ~56 rec/s), and it is why no pacing policy can
+  help: the pacer targets paint time (8.7 ms), 33× off the real constraint.
+  Related, also measured: a full-speed replay makes server RSS hump ~3 GB
+  over 120 records at 4096² and then drain back to baseline (the sender
+  running ahead into the in-flight send queue plus allocator churn —
+  transient, not a leak; backpressure to a genuinely SLOW reader is bounded
+  at ~4 records). `pack_frame` costs 28 ms/record at 4096² ON THE EVENT LOOP
+  (two full copies: `tobytes()` then `b"".join`), capping replay at ~35 rec/s
+  server-side before the transport is even involved.
+- **`free_all_blocks()` frees only what is FREE — drop the worker's own arrays
+  first.** `_release_gpu_pool` runs in `run()`'s `finally`, where `_run`'s
+  locals (W, prop) are gone but ATTRIBUTES are not: the two exponent slots
+  still hold 4 complex128 meshes, so the release left exactly that behind —
+  256 MiB at 2048², 1.0 GiB at 4096², 4.0 GiB at 8192², per worker. Those
+  returned to the pool only when the worker was collected (session↔worker
+  cycle ⇒ needs gc) and to the DRIVER only at some LATER worker's
+  `free_all_blocks()`, which is why VRAM used to come back on the SECOND
+  "Restart session" and not the first. `self._exp_clear()` now runs before
+  the GPU guard (on CPU those meshes are host RAM, held just as long), and
+  the worker's own cuFFT plan cache (per thread AND device) is cleared in the
+  same place. Measured at 2048², one QN worker, gc disabled: release went
+  `used 256 → 256 MiB` before, `256 → 0` after; steady-state process VRAM
+  1094 → 838 MiB, and the two-restart staircase became one step.
+- **Two more things kept a closed session's RAM resident, both found only by
+  measuring RSS across a Restart (2026-07-23).** (1) `ttl_sweeper` iterated
+  `SESSIONS` inline, and a `for` target outlives its loop — so the sweeper
+  held the LAST session it examined across its 15 s sleep, and FOREVER once
+  SESSIONS emptied, because an empty loop never rebinds the name. 3.2 GB
+  survived DELETE + explicit `gc.collect()` at 4096²/100 records; tens of GB
+  at 8192². The loop now lives in `_sweep_idle`, whose frame dies on return
+  (pinned structurally by `test_ttl_sweeper_never_binds_a_session_in_its_own_
+  frame`). (2) glibc's mmap threshold is DYNAMIC — 128 KiB initially,
+  ratcheting up to the size of each freed mmap'd block, capped at 32 MiB. A
+  4096² record is 32.03 MiB (just over the cap, always mmap'd, self-returning)
+  but a 2048² record is 8.02 MiB, so after the ratchet those come from the
+  arena and `free()` never lowers RSS: 1459 MiB still held at 2048²/300
+  records, 964 MiB of it recovered by `malloc_trim(0)`, which
+  `_collect_closed` now calls. **Record size decides which of these you
+  see**, so test memory at more than one grid — 4096² looked clean while
+  2048² sat at ~9.8 GB after two Restarts.
+- **A closed session's history is CYCLIC garbage — freeing it needs the
+  collector, not refcounting.** `SimSession.workers` holds each
+  `SolverWorker` and `worker.session` holds the session back, so after
+  `close()` the pair (and the whole `FrameHistory` hanging off it) is
+  unreachable but not refcount-free. On an otherwise idle server a gen-2
+  collection may not run for many minutes, so tens of GB stay resident long
+  after Restart and look EXACTLY like a leak. `session._collect_closed()`
+  makes it deterministic: `close()` sets `_closed_since_sweep` and the TTL
+  sweeper does one `gc.collect()` per sweep that had a close (off the event
+  loop; collection cost scales with tracked CONTAINERS, not with the bytes
+  they point at, so a multi-GB history is cheap to reap). Pinned by
+  `test_closed_history_needs_the_cyclic_collector`, which asserts BOTH
+  halves — the history survives `close()` + `del`, and dies on
+  `_collect_closed()`. If the back-reference is ever removed, that test
+  fails loudly rather than silently keeping a now-pointless collect.
+- **Do not chase "leaked" objects with `gc.get_referrers` alone — it cannot
+  see frame locals.** The 2026-07-23 hunt for stray `SimSession`s (a sweeper
+  diagnostic listing live-but-unregistered sessions and their referrer
+  types) reported `{'list': 2, 'dict': 1}` and was wrong twice over: the two
+  lists were the diagnostic's OWN `live`/`leaked` locals, and the one dict
+  was a `SolverWorker.__dict__` — i.e. the ordinary cycle above, still
+  uncollected because the diagnostic never ran `gc.collect()` first. Verified
+  by reproducing the exact signature with `gc.disable()`; every real
+  lifecycle path (create/delete, reconnect churn, delete-while-streaming,
+  abandoned-then-closed) leaks nothing once collected. Two traps to remember:
+  a referrer snapshot must exclude its own containers, and in CPython 3.12
+  `gc.get_referrers` does NOT report an object held by a plain local
+  variable (fast locals are invisible unless `f_locals` was materialized) —
+  so "no coroutine frame holds it" is a conclusion that instrument can never
+  support. Use a `weakref` + explicit `gc.collect()` to decide whether
+  something leaked, and thread stacks (`sys._current_frames()`) to find who
+  is still running.
 - **Secular E drift + slow purity decay = boundary wrap, not a solver
   bug.** The spectral domain is a torus: when a state's orbit + ~5σ tails
   reach the x or p edge, mass wraps through the seam and the run faithfully

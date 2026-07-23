@@ -66,11 +66,13 @@ def test_exponents_unit_modulus(grid):
 
 def test_quantum_equals_classical_exponents(grid):
     """For quadratic U and T the quantum differential reduces exactly to the
-    classical derivative form: the dU/dT arrays must agree to roundoff."""
+    classical derivative form: the dU/dT arrays must agree to roundoff.
+    (The generators are stored as their real rate meshes; the generator is
+    1j times these, so comparing them is comparing dU and dT.)"""
     q = Propagator(grid, quantum=True, **harmonic())
     c = Propagator(grid, quantum=False, **harmonic())
-    assert float(np.max(np.abs(q.dU - c.dU))) < 1e-12
-    assert float(np.max(np.abs(q.dT - c.dT))) < 1e-12
+    assert float(np.max(np.abs(q.dU_im - c.dU_im))) < 1e-12
+    assert float(np.max(np.abs(q.dT_im - c.dT_im))) < 1e-12
 
 
 def test_quantum_equals_classical_evolution(grid):

@@ -7,11 +7,31 @@
 import { computed } from 'vue'
 import PotentialEditor from './PotentialEditor.vue'
 import { resetToDefaults, type GridCfg, type LivePhysics,
-         type SimConfig } from '../lib/config'
+         type LiveRun, type SimConfig } from '../lib/config'
 
 const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
                             liveGrid?: GridCfg | null; maxGrid?: number
-                            livePhysics?: LivePhysics | null }>()
+                            livePhysics?: LivePhysics | null
+                            liveRun?: LiveRun | null }>()
+
+/**
+ * RUN fields are SessionCreate-only, so editing one changes NOTHING about the
+ * session already running — and pressing Solve then computes under the old
+ * settings while the form displays the new ones. That is invisible and it
+ * misleads: on 2026-07-23 a run believed to be "run-ahead, t₂=100" was really
+ * the previous interactive session, and computed straight past t=100 with the
+ * form showing 100 the whole time. `status` has carried the live mode/t2/
+ * record_dt all along, so mark any field that disagrees with it.
+ */
+function runDiffers(field: keyof LiveRun) {
+  const lr = props.liveRun
+  if (!lr) return false
+  // t2 is null in interactive mode; a form t2 alongside a live null IS a
+  // difference (that is exactly the case that bit)
+  return (lr[field] ?? null) !== (props.cfg[field] ?? null)
+}
+const runStale = computed(() =>
+  (['mode', 't2', 'record_dt'] as const).some(runDiffers))
 
 /** Physics fields apply on `@change` (blur/Enter), so a typed-but-not-yet-
  *  committed value is otherwise invisible — mark it, and say so in the note
@@ -128,8 +148,14 @@ function adoptLive() {
           edited (amber): press Enter or leave the field to apply it live.
         </template>
         <template v-else>
-          m, c, ℏ, tol and auto-expand apply live at the frontier;
-          grid &amp; IC need a restart.
+          <!-- This line ENUMERATES, so an omission reads as a promise. It
+               used to list only "grid &amp; IC" as restart-only, leaving the RUN
+               block unmentioned — and mode/t₂ changed in the form but never
+               applied is indistinguishable from a run-ahead that ignored its
+               own t₂ (2026-07-23: a run "in run-ahead t₂=100" was really the
+               old interactive session, and computed straight past t=100). -->
+          m, c, ℏ, tol, t dir and auto-expand apply live at the frontier;
+          grid, IC, variants and RUN (mode, t₂, Δt rec) need a restart.
         </template>
       </p>
     </section>
@@ -190,7 +216,8 @@ function adoptLive() {
         <label class="flex items-center gap-1"
                title="interactive: no end time — Solve keeps computing new records until you pause. run-ahead: Solve computes at full speed until t = t₂, then pauses; the button becomes Play — pure playback of the finished history.">
           <span class="w-14 text-neutral-500">mode</span>
-          <select v-model="props.cfg.mode" class="wf-num" @change="emit('dirty')">
+          <select v-model="props.cfg.mode" class="wf-num" @change="emit('dirty')"
+                  :class="runDiffers('mode') ? 'text-amber-400' : ''">
             <option value="interactive">interactive</option>
             <option value="runahead">run-ahead</option>
           </select>
@@ -198,16 +225,26 @@ function adoptLive() {
         <label class="flex items-center gap-1" v-if="props.cfg.mode === 'runahead'">
           <span class="w-14 text-neutral-500">t₂</span>
           <input v-model.number="props.cfg.t2" type="number" step="any"
-                 class="wf-num" @change="emit('dirty')" />
+                 class="wf-num" @change="emit('dirty')"
+                 :class="runDiffers('t2') ? 'text-amber-400' : ''" />
         </label>
         <label class="flex items-center gap-1">
           <span class="w-14 text-neutral-500" title="physical time per record">Δτ rec</span>
           <input v-model.number="props.cfg.record_dt" type="number" step="any" min="0.001"
-                 class="wf-num" @change="emit('dirty')" />
+                 class="wf-num" @change="emit('dirty')"
+                 :class="runDiffers('record_dt') ? 'text-amber-400' : ''" />
         </label>
         <!-- playback speed lives ONLY in the transport bar; a session
              always starts at 1.00 a.u./s -->
       </div>
+      <!-- Name what is ACTUALLY running. The amber fields say "this differs";
+           only this line says WHAT you are computing under, which is the fact
+           you need when a run does not do what the form describes. -->
+      <p v-if="runStale" class="text-xs text-amber-400">
+        running: {{ liveRun!.mode === 'runahead'
+                    ? `run-ahead, t₂ = ${liveRun!.t2}` : 'interactive (no t₂)' }},
+        Δτ rec = {{ liveRun!.record_dt }} — restart to apply the values above
+      </p>
       <button class="w-full py-1.5 rounded bg-sky-800 hover:bg-sky-700 font-medium"
               @click="emit('restart')">Restart session</button>
       <button class="w-full py-1 rounded bg-neutral-800 hover:bg-neutral-700 text-xs text-neutral-300"

@@ -49,6 +49,16 @@ export interface SimConfig {
 export type LivePhysics = Pick<SimConfig,
   'potential' | 'mass' | 'c' | 'hbar_eff' | 'tol'>
 
+/** The RUN settings of the SESSION that is actually running, from `status`.
+ *  These are SessionCreate-only (absent from ParamChange), so a form value
+ *  that differs from these is not pending — it is inert until a restart, and
+ *  the panel marks it amber to say so. */
+export type LiveRun = Pick<SimConfig, 'mode' | 'record_dt'>
+  // t2 is NULL in interactive mode — not merely absent. A form t2 sitting
+  // beside a live null is the exact mismatch this type exists to expose, so
+  // it must not be narrowed to SimConfig's `number`.
+  & { t2: number | null }
+
 const STORAGE_KEY = 'wignerf.cfg'
 const ALL_KEYS = ['qn', 'qr', 'cn', 'cr'] as const
 
