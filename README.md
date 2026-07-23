@@ -210,9 +210,11 @@ The unit's `WorkingDirectory`, `EnvironmentFile` and `ExecStart` are absolute
 paths — adjust them if the checkout is not at `/home/tigran/python/wignerf`.
 
 Two constraints are load-bearing and commented in the file: `CacheDirectory`
-gives CuPy a persistent kernel cache (otherwise every restart recompiles,
-blocking the first frame for a minute), and
-`PrivateDevices` **must** stay `no` — `yes` hides `/dev/nvidia*`, and the
+gives CuPy a persistent kernel cache — and matplotlib a persistent font cache
+via `MPLCONFIGDIR` — because the read-only home plus `PrivateTmp` otherwise
+leaves both rebuilding from scratch on every restart (a minute of CuPy
+recompilation blocking the first frame; ~0.7 s of matplotlib font scanning);
+and `PrivateDevices` **must** stay `no` — `yes` hides `/dev/nvidia*`, and the
 solver falls back to CPU without saying anything.
 
 ## docs/ (not tracked)

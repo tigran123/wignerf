@@ -1,7 +1,7 @@
 [Unit]
 Description=Wigner Function Simulator
-After=network-online.target nginx.service
-Requires=nginx.service
+#After=network-online.target nginx.service
+#Requires=nginx.service
 
 [Service]
 Type=simple
@@ -19,6 +19,15 @@ Environment="PYTHONUNBUFFERED=1"
 # restarts): compile once, sub-second thereafter. No-op on the CPU-only VPS.
 CacheDirectory=wignerf
 Environment=CUPY_CACHE_DIR=/var/cache/wignerf/cupy
+# Same story for matplotlib (imported at startup by the mp4 exporter): the
+# read-only home makes ~/.config/matplotlib unwritable, so it falls back to a
+# fresh /tmp dir that PrivateTmp then wipes — rebuilding the font cache on
+# EVERY start and logging a warning about it. Measured here: 1.12 s cold vs
+# 0.39 s warm for import + first draw, paid again on every --reload in dev.
+# Lives beside CUPY_CACHE_DIR rather than in wignerf.env because the path only
+# exists by virtue of CacheDirectory= three lines up; splitting them lets one
+# be changed without the other. matplotlib creates the subdir if missing.
+Environment=MPLCONFIGDIR=/var/cache/wignerf/matplotlib
 EnvironmentFile=/home/tigran/python/wignerf/wignerf.env
 ExecStart=/home/tigran/python/wignerf/start.sh
 
