@@ -12,22 +12,31 @@ import { resetToDefaults, type GridCfg, type LivePhysics,
 const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
                             liveGrid?: GridCfg | null; maxGrid?: number
                             livePhysics?: LivePhysics | null
-                            liveRun?: LiveRun | null }>()
+                            liveRun?: LiveRun | null
+                            // true once the session has COMPUTED records — before
+                            // that there is no meaningful "run mode" to diverge from
+                            hasRun?: boolean }>()
 
 /**
  * RUN fields are SessionCreate-only, so editing one changes NOTHING about the
  * session already running — and pressing Solve then computes under the old
  * settings while the form displays the new ones. That is invisible and it
- * misleads: on 2026-07-23 a run believed to be "run-ahead, t₂=100" was really
+ * misleads: on 2026-07-23 a run believed to be "batch, t₂=100" was really
  * the previous interactive session, and computed straight past t=100 with the
  * form showing 100 the whole time. `status` has carried the live mode/t2/
  * record_dt all along, so mark any field that disagrees with it.
  */
 function runDiffers(field: keyof LiveRun) {
   const lr = props.liveRun
-  if (!lr) return false
-  // t2 is null in interactive mode; a form t2 alongside a live null IS a
-  // difference (that is exactly the case that bit)
+  // Before ANY computation there is no run to diverge from — the session is
+  // just an implementation detail that silently tracks the form (it
+  // auto-restarts on a run-field change while idle). So the run fields are
+  // never "stale" until records exist.
+  if (!lr || !props.hasRun) return false
+  // t2 only matters in BATCH mode; interactive has no end time, so the form's
+  // (hidden, leftover) t2 must NOT count as a difference against a session's
+  // t2=null. A batch form vs an interactive session is caught by `mode`.
+  if (field === 't2' && props.cfg.mode !== 'batch') return false
   return (lr[field] ?? null) !== (props.cfg[field] ?? null)
 }
 const runStale = computed(() =>
@@ -151,8 +160,8 @@ function adoptLive() {
           <!-- This line ENUMERATES, so an omission reads as a promise. It
                used to list only "grid &amp; IC" as restart-only, leaving the RUN
                block unmentioned — and mode/t₂ changed in the form but never
-               applied is indistinguishable from a run-ahead that ignored its
-               own t₂ (2026-07-23: a run "in run-ahead t₂=100" was really the
+               applied is indistinguishable from a batch run that ignored its
+               own t₂ (2026-07-23: a run "in batch t₂=100" was really the
                old interactive session, and computed straight past t=100). -->
           m, c, ℏ, tol, t dir and auto-expand apply live at the frontier;
           grid, IC, variants and RUN (mode, t₂, Δt rec) need a restart.
@@ -214,24 +223,24 @@ function adoptLive() {
       <h3 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Run</h3>
       <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
         <label class="flex items-center gap-1"
-               title="interactive: no end time — Solve keeps computing new records until you pause. run-ahead: Solve computes at full speed until t = t₂, then pauses; the button becomes Play — pure playback of the finished history.">
+               title="interactive: no end time — Solve keeps computing new records until you pause, streaming a live preview you can zoom. batch: Solve computes at full speed until t = t₂ with NO frame streaming — the heatmap/marginals dim and only a progress report (t, %, throughput) is sent, so heavy runs are not slowed by transferring frames; the observable curves still update. Then the button becomes Play — playback of the finished history.">
           <span class="w-14 text-neutral-500">mode</span>
-          <select v-model="props.cfg.mode" class="wf-num" @change="emit('dirty')"
+          <select v-model="props.cfg.mode" class="wf-num"
                   :class="runDiffers('mode') ? 'text-amber-400' : ''">
             <option value="interactive">interactive</option>
-            <option value="runahead">run-ahead</option>
+            <option value="batch">batch</option>
           </select>
         </label>
-        <label class="flex items-center gap-1" v-if="props.cfg.mode === 'runahead'">
+        <label class="flex items-center gap-1" v-if="props.cfg.mode === 'batch'">
           <span class="w-14 text-neutral-500">t₂</span>
-          <input v-model.number="props.cfg.t2" type="number" step="any"
-                 class="wf-num" @change="emit('dirty')"
+          <input v-model.number.lazy="props.cfg.t2" type="number" step="any"
+                 class="wf-num"
                  :class="runDiffers('t2') ? 'text-amber-400' : ''" />
         </label>
         <label class="flex items-center gap-1">
           <span class="w-14 text-neutral-500" title="physical time per record">Δτ rec</span>
-          <input v-model.number="props.cfg.record_dt" type="number" step="any" min="0.001"
-                 class="wf-num" @change="emit('dirty')"
+          <input v-model.number.lazy="props.cfg.record_dt" type="number" step="any" min="0.001"
+                 class="wf-num"
                  :class="runDiffers('record_dt') ? 'text-amber-400' : ''" />
         </label>
         <!-- playback speed lives ONLY in the transport bar; a session
@@ -241,8 +250,8 @@ function adoptLive() {
            only this line says WHAT you are computing under, which is the fact
            you need when a run does not do what the form describes. -->
       <p v-if="runStale" class="text-xs text-amber-400">
-        running: {{ liveRun!.mode === 'runahead'
-                    ? `run-ahead, t₂ = ${liveRun!.t2}` : 'interactive (no t₂)' }},
+        running: {{ liveRun!.mode === 'batch'
+                    ? `batch, t₂ = ${liveRun!.t2}` : 'interactive (no t₂)' }},
         Δτ rec = {{ liveRun!.record_dt }} — restart to apply the values above
       </p>
       <button class="w-full py-1.5 rounded bg-sky-800 hover:bg-sky-700 font-medium"

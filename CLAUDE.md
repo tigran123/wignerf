@@ -207,7 +207,7 @@ source) is what keeps startup fast. See `README.md`.
   The video must READ like the screen: plot titles are copied
   verbatim from `SeriesPlot.vue`/`MarginalsPlot.vue` (γ keeps the UI's
   "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²), field labels
-  match the Setup panel (ℏ, "run-ahead"), and the series y-window +
+  match the Setup panel (ℏ, "batch"), and the series y-window +
   tick decimals reproduce that component's `scales.y.range` rule
   (`render_mpl.series_ylim`); the "grid lines on plots" toggle rides along
   in `ExportSpec.show_grid` and governs EVERY plot in the frame — charts
@@ -258,17 +258,35 @@ source) is what keeps startup fast. See `README.md`.
   for the active variant families or the IC preview errors, Solve (button
   AND Space) is disabled and "Use at restart"/"Apply live" are greyed —
   a computation must never run behind a visibly broken form.
+- **Run modes: `interactive` vs `batch`** (SessionCreate `mode`; `batch`
+  requires `t2`). Both start paused. INTERACTIVE computes until paused and
+  streams a coalesced live preview (the newest complete record) so you can
+  watch/zoom in real time. BATCH (renamed from `runahead` on 2026-07-24)
+  computes flat-out until t2 and streams NO frames while computing — the
+  heatmaps + marginals dim and the streamer sends only a throttled
+  (`PROGRESS_PERIOD` = 0.25 s) JSON `progress` message (record, t, percent,
+  per-variant steps/s; ~300 bytes). This is for heavy runs where transferring
+  hundreds of MiB/record of live preview measurably slowed compute and hit the
+  browser-receive ceiling; the progress report is ~1000× cheaper on the event
+  loop and the workers are untouched. Batch's `status` carries `computing`
+  (`running and not stop_at_frontier`) which drives the frontend dimming; the
+  observable SERIES (E/ΔX·ΔP/γ) stay LIVE during batch compute because they
+  poll `GET /sessions/{id}/series` (cheap, frame-independent). Batch's live
+  branch never sends a frame (computing OR paused-at-frontier) — you review a
+  finished batch run via explicit playback (seek + sequential replay, which DO
+  stream frames). Its t2 auto-stop is NOT delivery-gated (unlike playback):
+  batch has no `delivered` frames, so the frontier reaching t2 is itself the
+  completion signal.
 - **Sessions always start paused** (both modes): computation begins only on
   the explicit Solve/Play command. The transport button label predicts its
   effect: Solve = will compute, Play = pure history playback, Pause while
   running. Playback-only runs (play pressed behind the frontier, or after a
-  finished run-ahead) auto-pause AT the frontier — they never roll into
+  finished batch run) auto-pause AT the frontier — they never roll into
   computation; only an explicit Solve does (`SessionClock.stop_at_frontier`).
-  A run-ahead that REACHES t2 ends the run too (`advance_cursor`, same
-  delivery-aware condition): its workers already idle there, and leaving
-  `running` set froze the transport on "Pause" forever and locked out
-  every paused-only action (pinned by `test_runahead_starts_paused_and_
-  stops_at_t2`).
+  A batch run that REACHES t2 ends the run too (`advance_cursor`): its workers
+  already idle there, and leaving `running` set froze the transport on "Pause"
+  forever and locked out every paused-only action (pinned by
+  `test_batch_starts_paused_and_stops_at_t2`).
   Setup persists in browser localStorage; "↺ defaults" (IC editor) and
   "Reset setup to defaults" (Setup panel) restore defaults in the form and
   mark the session restart-dirty.

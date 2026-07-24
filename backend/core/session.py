@@ -14,7 +14,9 @@ Pacing (see plan):
   follows the newest lockstep-complete record (coalescing). Detached from
   the frontier (user seeked back, or a playback-only run), the display
   replays history one frame per `delay` seconds.
-- interactive computes until paused; runahead stops when t passes t2.
+- interactive computes until paused (streaming a coalesced live preview);
+  batch stops when t passes t2 and streams NO frames while computing — only
+  a throttled progress report (routers/stream.py) — for heavy runs.
 
 Sessions are registered in SESSIONS; a WS detach pauses the session and
 starts the idle TTL. ttl_sweeper() (spawned from main's lifespan) closes
@@ -144,7 +146,7 @@ class SessionClock:
         with self._cond:
             return self._t_of(k)
 
-    def _runahead_done(self, frontier):
+    def _batch_done(self, frontier):
         if self.t2 is None:
             return False
         t_prev = self._t_of(frontier)
@@ -160,7 +162,7 @@ class SessionClock:
         with self._cond:
             if not self.running or self.stop_at_frontier:
                 return None
-            if self.mode == "runahead" and self._runahead_done(frontier):
+            if self.mode == "batch" and self._batch_done(frontier):
                 return None
             k = frontier + 1
             if k > latest_complete + 1 + SKEW_MARGIN:
@@ -178,10 +180,10 @@ class SessionClock:
     def set_running(self, v, latest_complete=None):
         """`latest_complete` (the frontier at play time) decides whether this
         run is playback-only: pressing play behind the frontier (BOTH modes)
-        or after a finished run-ahead must replay history and PAUSE at the
+        or after a finished batch run must replay history and PAUSE at the
         end — computing new records is always an explicit request made AT
         the frontier (the transport button shows "Solve" exactly then;
-        interactive then computes until paused, runahead until t2)."""
+        interactive then computes until paused, batch until t2)."""
         with self._cond:
             self.running = bool(v)
             if not self.running:
@@ -189,8 +191,8 @@ class SessionClock:
             elif latest_complete is not None:
                 behind = self.cursor < latest_complete
                 self.stop_at_frontier = behind or \
-                    (self.mode == "runahead" and
-                     self._runahead_done(latest_complete))
+                    (self.mode == "batch" and
+                     self._batch_done(latest_complete))
                 # Solve pressed AT the frontier re-attaches the display to
                 # it (live coalescing); play behind starts detached (replay)
                 self.browsed = behind
@@ -238,15 +240,16 @@ class SessionClock:
                     # frontier or the transport would offer "Play" over a
                     # few phantom records the user never rewound to.
                     self.cursor = float(max(self.cursor, latest_complete))
-                    # A run-ahead that reached t2 is FINISHED: its workers
+                    # A batch run that reached t2 is FINISHED: its workers
                     # already idle (next_target returns None), so leaving
                     # `running` set would freeze the transport on "Pause"
                     # forever and lock out every paused-only action (mp4
-                    # export). Delivery-aware like the playback stop above:
-                    # never end the run over records nobody has seen.
-                    if self.running and self.mode == "runahead" \
-                       and self._runahead_done(latest_complete) \
-                       and delivered >= latest_complete:
+                    # export). Unlike the playback stop above this is NOT
+                    # delivery-gated: batch streams no frames (only a progress
+                    # report), so `delivered` never advances — the frontier
+                    # reaching t2 is itself the completion signal.
+                    if self.running and self.mode == "batch" \
+                       and self._batch_done(latest_complete):
                         self.running = False
                 self._cond.notify_all()
             return self.cursor
@@ -584,6 +587,10 @@ class SimSession:
             "type": "status",
             "session_id": self.id,
             "running": self.clock.running,
+            # computing = actively producing NEW records (batch dims the
+            # display and streams no frames only in this phase); a
+            # playback-only replay has running=True but computing=False
+            "computing": self.clock.running and not self.clock.stop_at_frontier,
             "mode": self.clock.mode,
             "t2": self.clock.t2,
             "delay": self.clock.delay,

@@ -35,6 +35,7 @@ router = APIRouter()
 _client_msg = TypeAdapter(protocol.ClientMsg)
 
 STATUS_PERIOD = 1.0
+PROGRESS_PERIOD = 0.25   # batch-mode progress cadence (~4 Hz, ~300 bytes each)
 
 
 async def _handle(msg, s, ws):
@@ -102,12 +103,31 @@ def _pack_record(s, k, live):
     if rec is None:
         return None
     t, geom, variants = rec
+    # batch mode streams no live preview at all (only interactive coalesces
+    # to the frontier), so FLAG_LIVE_PREVIEW is now never set — the constant
+    # stays defined for the unchanged binary layout.
     flags = 0 if live else protocol.FLAG_REPLAY
-    if s.cfg.mode == "runahead" and live:
-        flags |= protocol.FLAG_LIVE_PREVIEW
     # geometry comes from the RECORD, never the session's current grid —
     # replay across a regrid boundary must decode with the old geometry
     return protocol.pack_frame(k, t, geom, variants, flags=flags)
+
+
+def _progress_msg(s, lc):
+    """A tiny, throttled progress report for BATCH compute — no frames. The
+    heavy live-preview bundle (tens/hundreds of MiB per record) is replaced
+    by this ~300-byte JSON: current time, percent toward t2, the frontier
+    record, and per-variant throughput. Built on the sender's event-loop
+    task, never on the worker threads."""
+    c = s.clock
+    t = c.t_of(lc) if lc >= 0 else c.t1
+    span = (c.t2 - c.t1) or 1.0
+    pct = max(0.0, min(1.0, (t - c.t1) / span)) * 100.0   # sign-agnostic
+    return {"type": "progress", "record": lc, "t": t, "t1": c.t1, "t2": c.t2,
+            "percent": pct,
+            "per_variant": [{"variant": w.key,
+                             "steps_per_sec": round(w.steps_per_sec, 2),
+                             "steps_total": w.steps_total}
+                            for w in s.workers]}
 
 
 async def _guard_send(coro):
@@ -137,6 +157,7 @@ async def _sender(ws, s, recv_task):
     last_sent = int(c) - 1 if c >= 1 else -1
     last_wall = monotonic()
     last_status = 0.0
+    last_progress = 0.0
     last_running = s.clock.running
     await _guard_send(ws.send_text(json.dumps(s.status())))
     # exit on s.closed too: a DELETE/TTL close() pops the session and stops
@@ -165,6 +186,15 @@ async def _sender(ws, s, recv_task):
             last_running = s.clock.running
             last_status = now
             await _guard_send(ws.send_text(json.dumps(s.status())))
+        # batch compute streams no frames — send a throttled progress report
+        # instead. Only while actually computing new records (running and not
+        # a playback-only replay): batch PLAYBACK takes the replay branch below
+        # and streams frames exactly like interactive.
+        batch_computing = (s.cfg.mode == "batch" and s.clock.running
+                           and not s.clock.stop_at_frontier)
+        if batch_computing and now - last_progress > PROGRESS_PERIOD:
+            last_progress = now
+            await _guard_send(ws.send_text(json.dumps(_progress_msg(s, lc))))
 
         k = None
         live = True
@@ -183,10 +213,16 @@ async def _sender(ws, s, recv_task):
             # is what used to teleport playback straight to the end.
             gap = s.clock.stop_at_frontier and last_sent < lc
             if target >= lc and not gap:
-                k = lc                   # live: coalesce to newest
-                # (runahead keeps the cursor pinned here until the user
-                # seeks, so the newest frame previews while computing;
-                # after a seek both modes replay from history identically)
+                # live: coalesce to newest — but batch NEVER streams a live
+                # frame here (computing OR paused-at-frontier): its only
+                # feedback is the progress report above, and the display is
+                # reviewed via explicit playback. Only interactive keeps the
+                # live preview pinned to the frontier. Frames still reach a
+                # batch client through seek and sequential replay (below);
+                # playback already delivered the frontier record there, so
+                # suppressing this coalesce never drops it.
+                if s.cfg.mode != "batch":
+                    k = lc
             else:
                 # Replay: exact sequential records from history, paced by
                 # the cursor. Batch the sends (the loop ticks at ~20 Hz;

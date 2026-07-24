@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import type { Frame } from '../lib/protocol'
-import type { SessionStatus } from '../composables/useSession'
+import type { SessionStatus, ProgressEvent } from '../composables/useSession'
 import { displayInterval } from '../lib/perf'
 import { transportAction } from '../lib/transport'
 import { AU_ENERGY_EV, AU_TIME_FS } from '../lib/units'
@@ -9,8 +9,15 @@ import { AU_ENERGY_EV, AU_TIME_FS } from '../lib/units'
 const props = defineProps<{
   status: SessionStatus | null
   lastFrame: Frame | null
+  // batch compute streams no frames, so t comes from the progress report
+  progress: ProgressEvent | null
   setupValid: boolean
 }>()
+
+// batch mode computing: no frames stream, the display is dimmed and t/percent
+// come from the progress report instead of the (frozen/absent) lastFrame
+const batchComputing = computed(() =>
+  props.status?.mode === 'batch' && !!props.status?.computing)
 
 const emit = defineEmits<{
   (e: 'command', cmd: Record<string, unknown>): void
@@ -67,7 +74,7 @@ const delayTitle = computed(() => running.value
  * "Play" = pure playback of already-computed history; "Pause" while
  * running. Playback-only runs auto-pause at the frontier (the backend
  * flips running off and the button becomes "Solve") — computation only
- * ever starts from an explicit Solve. Run-ahead: solving until t2 is
+ * ever starts from an explicit Solve. Batch: solving until t2 is
  * reached, pure playback afterwards. Solve is DISABLED while the setup
  * form holds invalid data (potential draft / IC preview) — computing
  * while the visible setup is broken misleads; playback stays allowed.
@@ -100,9 +107,18 @@ function setDelay(ev: Event) {
 // "(… fs)" part slid about; fixed decimals plus a right-aligned
 // fixed-width field pin every glyph to its column. The exported frames
 // have the same rule (core/render_mpl.py).
-const tAu = computed(() => props.lastFrame ? props.lastFrame.t.toFixed(3) : '—')
+// during batch compute there is no frame — t rides the progress report
+const tNow = computed<number | null>(() =>
+  batchComputing.value ? (props.progress?.t ?? null)
+                       : (props.lastFrame?.t ?? null))
+const tAu = computed(() => tNow.value != null ? tNow.value.toFixed(3) : '—')
 const tFs = computed(() =>
-  props.lastFrame ? (props.lastFrame.t*AU_TIME_FS).toFixed(3) : '—')
+  tNow.value != null ? (tNow.value*AU_TIME_FS).toFixed(3) : '—')
+// percent toward t₂ while a batch run computes (a compact echo of the big
+// progress bar on the dimmed heatmap)
+const batchPct = computed(() =>
+  batchComputing.value && props.progress
+    ? `${props.progress.percent.toFixed(0)}%` : null)
 
 /**
  * Direct t entry: whenever the session is paused and history exists, the t
@@ -208,6 +224,9 @@ const stepInfo = computed(() => {
             @click="startEditT"><span class="wf-fixnum w-[7ch]">{{ tAu }}</span>
         a.u. (<span class="wf-fixnum w-[7ch]">{{ tFs }}</span> fs)</span>
     </div>
+    <div v-if="batchPct" class="shrink-0 px-2 py-0.5 rounded bg-amber-900/60 text-amber-300 text-xs tabular-nums"
+         title="batch compute progress toward t₂ — no frames are streamed; press Play when done to review">
+      batch {{ batchPct }}</div>
     <div class="tabular-nums w-64 truncate shrink-0"><span class="text-neutral-400">E =</span>
       <span class="wf-fixnum w-[9ch]">{{ eHa }}</span>
       Ha (<span class="wf-fixnum w-[8ch]">{{ eEv }}</span> eV)</div>

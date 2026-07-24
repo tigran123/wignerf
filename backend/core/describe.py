@@ -129,16 +129,15 @@ def param_lines(cfg, param_log=(), k0=None, k1=None):
     st = state_at(cfg, param_log, k0)
     at = lambda f: st.get(f, getattr(cfg, f))
     # label the fields exactly as the UI does: ℏ (not hbar_eff — the Physics
-    # panel calls it ℏ) and "run-ahead" (the mode select's label, not the
-    # wire value "runahead")
+    # panel calls it ℏ). The mode's wire value ("batch"/"interactive") is also
+    # its display label, so no remapping is needed.
     lines = [
         "U(x) = %s" % at("potential"),
         "m = %s   c = %s   ℏ = %s   tol = %s"
         % (_num(at("mass")), _num(at("c")), _num(at("hbar_eff")),
            _num(at("tol"))),
         "t₁ = %s   record_dt = %s   mode = %s%s   auto-expand: %s"
-        % (_num(cfg.t1), _num(cfg.record_dt),
-           "run-ahead" if cfg.mode == "runahead" else cfg.mode,
+        % (_num(cfg.t1), _num(cfg.record_dt), cfg.mode,
            ("  t₂ = %s" % _num(cfg.t2)) if cfg.t2 is not None else "",
            "on" if at("auto_expand") else "off"),
     ]

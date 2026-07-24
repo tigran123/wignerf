@@ -2,8 +2,10 @@
 import { computed, ref, watch } from 'vue'
 import type { Frame } from '../lib/protocol'
 import type { GridCfg } from '../lib/config'
+import type { ProgressEvent } from '../composables/useSession'
 import { VARIANT_META, type VariantKey } from '../lib/variants'
 import { createViewWindow, remapView } from '../lib/viewWindow'
+import { AU_TIME_FS } from '../lib/units'
 import WignerPanel from './WignerPanel.vue'
 
 const props = defineProps<{
@@ -11,7 +13,16 @@ const props = defineProps<{
   variants: VariantKey[]   // in bundle order (= session config order)
   domain: GridCfg
   showGrid: boolean
+  // batch mode streams no frames: 'computing' dims the heatmaps and shows a
+  // live progress card; 'review' shows a "press Play" hint over the (blank)
+  // panels of a finished run; null = normal live/playback display.
+  batchOverlay?: 'computing' | 'review' | null
+  progress?: ProgressEvent | null
 }>()
+
+const throughput = computed(() =>
+  (props.progress?.per_variant ?? [])
+    .map((v) => `${v.variant} ${v.steps_per_sec}/s`).join('   '))
 
 // Zoom/pan coupling: decoupled by default (each panel its own window);
 // the "link zoom" toggle drives all panels from one shared window.
@@ -54,7 +65,8 @@ const gridClass = computed(() => {
 
 <template>
   <div class="relative w-full h-full min-h-0">
-    <div class="grid gap-1 w-full h-full min-h-0" :class="gridClass">
+    <div class="grid gap-1 w-full h-full min-h-0" :class="[gridClass,
+           batchOverlay === 'computing' ? 'opacity-20 grayscale pointer-events-none' : '']">
       <div v-for="(v, i) in variants" :key="v"
            class="min-h-0 border rounded overflow-hidden"
            :style="{ borderColor: VARIANT_META[v].color + '66' }">
@@ -71,5 +83,39 @@ const gridClass = computed(() => {
       <input type="checkbox" :checked="linked" @change="toggleLink" />
       <span>link zoom</span>
     </label>
+
+    <!-- batch mode: no frames are streamed while computing, so stand a
+         progress card in for the dimmed heatmaps (the observable series keep
+         updating live). A finished run shows a "review" hint over its blank
+         panels. -->
+    <div v-if="batchOverlay"
+         class="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
+      <div class="min-w-[22rem] max-w-[80%] rounded-lg bg-black/80 border border-neutral-700 px-5 py-4 text-center text-neutral-200 shadow-xl">
+        <template v-if="batchOverlay === 'computing'">
+          <div class="text-sm font-medium text-amber-300">Batch computing — no live preview</div>
+          <div class="mt-3 h-2 w-full rounded bg-neutral-800 overflow-hidden">
+            <div class="h-full bg-amber-500 transition-[width] duration-200"
+                 :style="{ width: `${progress?.percent ?? 0}%` }"></div>
+          </div>
+          <div class="mt-2 tabular-nums text-sm">
+            <span class="wf-fixnum">{{ (progress?.percent ?? 0).toFixed(1) }}</span>%
+            <span class="text-neutral-500 mx-2">·</span>
+            t = <span class="wf-fixnum">{{ (progress?.t ?? 0).toFixed(3) }}</span> a.u.
+            (<span class="wf-fixnum">{{ ((progress?.t ?? 0)*AU_TIME_FS).toFixed(3) }}</span> fs)
+            <span class="text-neutral-500">/ t₂ = {{ progress?.t2 }}</span>
+          </div>
+          <div v-if="throughput" class="mt-1 text-xs text-neutral-400 tabular-nums">{{ throughput }}</div>
+          <div class="mt-2 text-xs text-neutral-500">
+            the observable plots keep updating; press Play when done to review the run
+          </div>
+        </template>
+        <template v-else>
+          <div class="text-sm font-medium text-neutral-300">Batch run finished</div>
+          <div class="mt-1 text-xs text-neutral-500">
+            no frames were streamed while computing — press Play to review the run
+          </div>
+        </template>
+      </div>
+    </div>
   </div>
 </template>

@@ -123,7 +123,7 @@ class SessionCreate(BaseModel):
     tol: float = Field(default=1e-2, gt=0, lt=1)
     t1: float = 0.0
     record_dt: float = Field(default=0.05, gt=0)
-    mode: Literal["interactive", "runahead"] = "interactive"
+    mode: Literal["interactive", "batch"] = "interactive"
     t2: Optional[float] = None
     # boundary watch response policy: detection always runs; when True the
     # session auto-regrids (exact fixed-lattice move/double) at the frontier
@@ -135,8 +135,8 @@ class SessionCreate(BaseModel):
     def _check(self):
         if len(set(self.variants)) != len(self.variants):
             raise ValueError("duplicate variants")
-        if self.mode == "runahead" and self.t2 is None:
-            raise ValueError("runahead mode requires t2")
+        if self.mode == "batch" and self.t2 is None:
+            raise ValueError("batch mode requires t2")
         # mass >= 0 exists for massless RELATIVISTIC runs (T = c|p|); the
         # non-relativistic T = p^2/2m diverges and would stream NaN frames
         if self.mass == 0.0 and any(not VARIANTS[v]["relativistic"]

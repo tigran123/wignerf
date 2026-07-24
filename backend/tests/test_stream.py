@@ -583,9 +583,9 @@ def test_series_backfill():
         client.delete("/api/sessions/%s" % info["session_id"])
 
 
-def test_runahead_starts_paused_and_stops_at_t2():
+def test_batch_starts_paused_and_stops_at_t2():
     with TestClient(app) as client:
-        info = _mk(client, mode="runahead", t2=0.5)   # 10 records at 0.05
+        info = _mk(client, mode="batch", t2=0.5)   # 10 records at 0.05
         with client.websocket_connect(info["ws_url"]) as ws:
             # sessions start PAUSED in both modes: without play, only the
             # Cauchy record exists
@@ -595,57 +595,75 @@ def test_runahead_starts_paused_and_stops_at_t2():
             assert r["record_extent"][1] == 0, "computed without being asked"
             assert r["t2"] == 0.5
 
-            # play: workers run flat-out; the preview stream carries the
-            # newest lockstep-complete record
+            # play: workers run flat-out — but batch streams NO frames while
+            # computing, only a throttled progress report; the run must
+            # auto-pause once the frontier reaches t2.
             ws.send_text(json.dumps({"type": "play"}))
-            saw_preview = False
-            for _ in range(400):
+            saw_progress = False
+            saw_frame = False
+            done = False
+            max_pct = -1.0
+            for _ in range(2000):
                 m = ws.receive()
                 if m.get("bytes"):
-                    f = protocol.unpack_frame(m["bytes"])
-                    if f.flags & protocol.FLAG_LIVE_PREVIEW:
-                        saw_preview = True
-                    if f.record == 10:
-                        assert f.t == pytest.approx(0.5, abs=1e-9)
-                        break
-            else:
-                raise AssertionError("run-ahead never reached t2")
-            assert saw_preview
+                    saw_frame = True
+                    break
+                d = json.loads(m["text"])
+                if d["type"] == "progress":
+                    saw_progress = True
+                    max_pct = max(max_pct, d["percent"])
+                    assert d["t2"] == 0.5
+                elif d["type"] == "status" and not d["running"] and saw_progress:
+                    done = True
+                    break
+            assert not saw_frame, "batch streamed a frame while computing"
+            assert saw_progress, "batch sent no progress report"
+            assert done, "batch never auto-paused at t2"
             # ... and STOPS at t2: the frontier must not advance past it,
             # and the RUN must end — the workers idle from here on, so a
             # still-"running" clock would freeze the transport button on
             # "Pause" forever and lock out every paused-only action
-            _time.sleep(0.5)
             r = client.get("/api/sessions/%s" % info["session_id"]).json()
             assert r["record_extent"][1] == 10, "computed past t2"
-            assert not r["running"], "finished run-ahead still reports running"
-            # the whole timeline is scrubbable immediately
+            assert not r["running"], "finished batch run still reports running"
+            assert not r["computing"]
+            # the whole timeline is scrubbable immediately — playback (seek)
+            # DOES stream frames, unlike batch compute
             ws.send_text(json.dumps({"type": "seek", "record": 4}))
             for _ in range(200):
                 m = ws.receive()
                 if m.get("bytes") and protocol.unpack_frame(m["bytes"]).record == 4:
                     break
             else:
-                raise AssertionError("scrub into computed run-ahead failed")
+                raise AssertionError("scrub into computed batch run failed")
         client.delete("/api/sessions/%s" % info["session_id"])
 
 
-def test_runahead_rewind_plays_back_without_computing():
-    """Pausing a run-ahead mid-run and rewinding must offer pure playback:
-    play behind the frontier replays history gaplessly and auto-pauses AT
-    the frontier — it must never jump to the end nor resume computing
-    toward t2. Only play AT the frontier resumes the run-ahead."""
+def test_batch_rewind_plays_back_without_computing():
+    """Pausing a batch run mid-compute and rewinding must offer pure playback:
+    play behind the frontier replays history gaplessly (frames DO stream in
+    playback) and auto-pauses AT the frontier — it must never jump to the end
+    nor resume computing toward t2. Only play AT the frontier resumes the batch
+    run (which itself streams no frames, only progress)."""
     import time as _time
     with TestClient(app) as client:
-        info = _mk(client, mode="runahead", t2=100.0)   # far away: never done
+        info = _mk(client, mode="batch", t2=100.0)   # far away: never done
         sid = info["session_id"]
         with client.websocket_connect(info["ws_url"]) as ws:
             ws.send_text(json.dumps({"type": "play"}))
-            _recv_frames(ws, 4)
+            # batch compute streams no frames — advance via progress reports
+            for _ in range(2000):
+                m = ws.receive()
+                assert not m.get("bytes"), "batch streamed a frame while computing"
+                d = json.loads(m["text"])
+                if d["type"] == "progress" and d["record"] >= 4:
+                    break
+            else:
+                raise AssertionError("batch never progressed to record 4")
             ws.send_text(json.dumps({"type": "pause"}))
             _time.sleep(0.3)                    # let in-flight records land
             frontier = client.get("/api/sessions/%s" % sid).json()["record_extent"][1]
-            assert 3 <= frontier < 1999, "expected a mid-run pause"
+            assert 4 <= frontier < 1999, "expected a mid-run pause"
 
             ws.send_text(json.dumps({"type": "seek", "record": 0}))
             for _ in range(200):                # wait out the seek echo
@@ -663,7 +681,7 @@ def test_runahead_rewind_plays_back_without_computing():
                     if seen[-1] == frontier:
                         break
             assert seen == list(range(1, frontier + 1)), \
-                "runahead playback skipped records: %r" % seen[:20]
+                "batch playback skipped records: %r" % seen[:20]
             r = None
             for _ in range(100):
                 _time.sleep(0.05)
@@ -672,9 +690,9 @@ def test_runahead_rewind_plays_back_without_computing():
                     break
             assert r is not None and not r["running"]
             assert r["record_extent"][1] == frontier, \
-                "rewound runahead playback resumed computing toward t2"
+                "rewound batch playback resumed computing toward t2"
 
-            # play AT the frontier resumes the run-ahead
+            # play AT the frontier resumes the batch run
             ws.send_text(json.dumps({"type": "play"}))
             for _ in range(100):
                 _time.sleep(0.05)

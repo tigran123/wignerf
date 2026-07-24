@@ -37,7 +37,7 @@ export interface SimConfig {
   tol: number
   record_dt: number
   delay: number
-  mode: 'interactive' | 'runahead'
+  mode: 'interactive' | 'batch'
   t2: number
   // boundary watch response: detection always runs server-side; this only
   // decides whether the domain auto-moves/doubles (live-toggleable)
@@ -91,6 +91,10 @@ export function mergeConfig(target: SimConfig, s: unknown) {
       (ALL_KEYS as readonly string[]).includes(x))
     if (v.length) target.variants.splice(0, target.variants.length, ...v)
   }
+  // 'runahead' was renamed to 'batch' (2026-07-24); migrate a persisted or
+  // imported setup so it is not rejected by the backend's mode literal.
+  if ((target as unknown as Record<string, unknown>).mode === 'runahead')
+    target.mode = 'batch'
 }
 
 /** Load the persisted setup (merged over defaults) — a hard reload must

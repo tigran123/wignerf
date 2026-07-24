@@ -115,12 +115,13 @@ def _stats(n=3):
 def test_video_labels_match_the_ui():
     """The video must NAME things as the SPA does: SeriesPlot.vue's titles
     verbatim (γ keeps 2πℏ∬W²dxdp, not the equivalent Tr ρ²), the Setup
-    panel's ℏ, and the mode select's "run-ahead" — not the wire value."""
+    panel's ℏ, and the mode select's label (the wire value "batch" IS its
+    display label)."""
     cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
-                                 variants=["qn"], mode="runahead", t2=5.0)
+                                 variants=["qn"], mode="batch", t2=5.0)
     text = " ".join(describe.param_lines(cfg))
     assert "ℏ = 1" in text and "ℏ_eff" not in text
-    assert "mode = run-ahead" in text and "runahead" not in text
+    assert "mode = batch" in text
 
     geom = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
     stats = _stats()

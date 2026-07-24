@@ -58,7 +58,10 @@ export interface SessionStatus {
   type: 'status'
   session_id: string
   running: boolean
-  mode: 'interactive' | 'runahead'
+  // actively producing NEW records — false during a playback-only replay
+  // even though `running` is true. Batch dims the display only while this holds.
+  computing?: boolean
+  mode: 'interactive' | 'batch'
   t2: number | null
   delay: number
   sign: number
@@ -98,6 +101,19 @@ export interface ExportEvent {
   duration_s: number
 }
 
+/** Server 'progress' event: batch-mode compute progress (routers/stream.py).
+ *  Sent ~4 Hz WHILE computing, replacing the frame bundles interactive mode
+ *  streams — a few hundred bytes each, negligible traffic. */
+export interface ProgressEvent {
+  type: 'progress'
+  record: number
+  t: number
+  t1: number
+  t2: number
+  percent: number
+  per_variant: { variant: string; steps_per_sec: number; steps_total: number }[]
+}
+
 export interface SessionInfo {
   session_id: string
   ws_url: string
@@ -124,6 +140,9 @@ export function useSession() {
   // newest mp4-export progress event (the panel also polls REST, so a
   // missed event never leaves the progress bar stuck)
   const exportEvent = ref<ExportEvent | null>(null)
+  // newest batch-compute progress report (t / percent / throughput); the
+  // display shows this in place of frames while a batch run computes
+  const progress = ref<ProgressEvent | null>(null)
 
   let ws: WebSocket | null = null
   const handlers = new Set<FrameHandler>()
@@ -214,6 +233,7 @@ export function useSession() {
         else if (d.type === 'eviction' && status.value)
           status.value.record_extent = d.new_extent
         else if (d.type === 'export') exportEvent.value = d as ExportEvent
+        else if (d.type === 'progress') progress.value = d as ProgressEvent
         else if (d.type === 'boundary')
           boundary.value = d.axes.length ? (d as BoundaryEvent) : null
         else if (d.type === 'params_applied')
@@ -272,6 +292,7 @@ export function useSession() {
     regrid.value = null
     paramsApplied.value = null
     exportEvent.value = null
+    progress.value = null
     if (info.value) {
       const sid = info.value.session_id
       info.value = null
@@ -302,6 +323,6 @@ export function useSession() {
   }
 
   return { status, info, connected, errors, lastFrame, boundary, regrid,
-           paramsApplied, exportEvent, create, send, onFrame, onClose,
+           paramsApplied, exportEvent, progress, create, send, onFrame, onClose,
            reconnect, destroy, beaconDestroy }
 }

@@ -57,6 +57,22 @@ watch(cfg, () => saveConfig(cfg), { deep: true })
 const activeVariants = ref<VariantKey[]>([...cfg.variants])
 const activeGrid = ref({ ...cfg.grid })
 const sessionId = computed(() => session.info.value?.session_id ?? null)
+// batch mode while it computes new records: no frames stream, so the heatmap
+// and marginals are dimmed and a progress report stands in for the display
+// (the observable series keep updating from their own cheap REST poll)
+const batchComputing = computed(() =>
+  session.status.value?.mode === 'batch' && !!session.status.value?.computing)
+// what the heatmap should overlay in batch mode: the live progress while
+// computing, or a "press Play to review" hint once a finished run sits at the
+// frontier with nothing painted (batch streamed no frames, so it is blank)
+const batchOverlay = computed<'computing' | 'review' | null>(() => {
+  const st = session.status.value
+  if (st?.mode !== 'batch') return null
+  if (st.computing) return 'computing'
+  if (!session.lastFrame.value
+      && transportAction(st, null) === 'play') return 'review'
+  return null
+})
 // NOTE: showGrid is deliberately NOT part of this key — toggling grid
 // lines must never remount/blank the panels (charts rebuild internally)
 const plotsKey = computed(() => String(restartCount.value))
@@ -180,6 +196,54 @@ const liveRun = computed(() => {
   if (!st || !session.connected.value) return null
   return { mode: st.mode, t2: st.t2, record_dt: st.record_dt }
 })
+// Whether the session has COMPUTED anything beyond the initial IC record.
+// Until it has, there is no meaningful "run mode" — the form is the sole
+// source of truth and the (idle) session silently tracks it (see the watch
+// below). So the run-field staleness warning only applies once a run exists.
+const hasRun = computed(() =>
+  (session.status.value?.record_extent?.[1] ?? -1) > 0)
+
+// Serialized identity of the run-defining fields (t₂ only matters in batch),
+// used to tell whether a FRESH session still matches the form.
+function runKeyOf(mode: string, t2: number | null, record_dt: number) {
+  return JSON.stringify([mode, mode === 'batch' ? t2 : null, record_dt])
+}
+const formRunKey = () => runKeyOf(cfg.mode, cfg.t2, cfg.record_dt)
+
+// A run-defining field (mode / t₂ / Δτ rec) is SessionCreate-only. On a FRESH
+// session — connected, idle, nothing computed beyond the initial IC record —
+// silently adopt the change by re-creating the session, so switching e.g. to
+// interactive before you have computed anything just takes effect (no stale
+// "running: batch — restart to apply", and Solve then runs the mode you SEE,
+// not the one the session happened to be created with). Once a run has
+// actually produced records the change stays INERT and the amber warning
+// protects that run — the user restarts explicitly.
+//
+// Restarts are SERIALIZED and COALESCED. create() clears status/connected
+// while it runs, so a second edit arriving mid-restart would otherwise be
+// dropped (the watch guard bails on the null status) and leave the new session
+// on the FIRST edit's values while the form shows the later one — with no
+// warning, because a fresh session shows none. Instead, once we start managing
+// an idle session we loop until what we created matches the current form.
+let autoRestarting = false
+async function syncFreshSessionToForm() {
+  if (autoRestarting) return              // a loop is already running; it re-reads
+                                          // the form each pass and will catch this edit
+  const st = session.status.value
+  if (!session.connected.value || !st || st.running
+      || (st.record_extent?.[1] ?? -1) > 0) return   // a real run exists: don't touch
+  autoRestarting = true
+  try {
+    let sent = runKeyOf(st.mode, st.t2, st.record_dt)  // the live session's config
+    while (sent !== formRunKey()) {
+      sent = formRunKey()
+      await restart()                     // restart() reads cfg as it stands NOW
+    }
+  } finally {
+    autoRestarting = false
+  }
+}
+watch(() => [cfg.mode, cfg.t2, cfg.record_dt], () => { void syncFreshSessionToForm() })
 
 // Boundary watch surfacing: a dismissible amber warning while W sits in
 // the edge band (the server posts an all-clear that removes it), and a
@@ -457,7 +521,7 @@ onBeforeUnmount(() => {
         <SetupPanel :cfg="cfg" :live="session.connected.value" :sign="session.status.value?.sign ?? 1"
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
-                    :live-run="liveRun"
+                    :live-run="liveRun" :has-run="hasRun"
                     :max-grid="session.status.value?.max_grid ?? 4096" v-model:show-grid="showGrid"
                     @dirty="restartNeeded = true" @restart="requestRestart"
                     @apply-live="applyLive"
@@ -470,6 +534,7 @@ onBeforeUnmount(() => {
       <div class="flex-1 min-w-0 min-h-0">
         <PanelGrid :key="plotsKey" :frame-source="session.onFrame"
                    :variants="activeVariants" :domain="activeGrid"
+                   :batch-overlay="batchOverlay" :progress="session.progress.value"
                    :show-grid="showGrid" />
       </div>
 
@@ -477,6 +542,7 @@ onBeforeUnmount(() => {
         <PlotsColumn :frame-source="session.onFrame" :session-id="sessionId"
                      :variants="activeVariants" :grid="activeGrid"
                      :last-frame="session.lastFrame.value"
+                     :batch-computing="batchComputing"
                      :show-grid="showGrid" :plots-key="plotsKey" />
       </aside>
     </main>
@@ -488,7 +554,7 @@ onBeforeUnmount(() => {
           <SetupPanel :cfg="cfg" :live="session.connected.value" :sign="session.status.value?.sign ?? 1"
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
-                    :live-run="liveRun"
+                    :live-run="liveRun" :has-run="hasRun"
                     :max-grid="session.status.value?.max_grid ?? 4096" v-model:show-grid="showGrid"
                       @dirty="restartNeeded = true" @restart="requestRestart"
                       @apply-live="applyLive"
@@ -503,6 +569,7 @@ onBeforeUnmount(() => {
           <PlotsColumn :frame-source="session.onFrame" :session-id="sessionId"
                        :variants="activeVariants" :grid="activeGrid"
                        :last-frame="session.lastFrame.value"
+                       :batch-computing="batchComputing"
                        :show-grid="showGrid" :plots-key="plotsKey" />
         </div>
       </div>
@@ -510,6 +577,7 @@ onBeforeUnmount(() => {
       <div class="flex-1 min-w-0 min-h-0">
         <PanelGrid :key="plotsKey" :frame-source="session.onFrame"
                    :variants="activeVariants" :domain="activeGrid"
+                   :batch-overlay="batchOverlay" :progress="session.progress.value"
                    :show-grid="showGrid" />
       </div>
     </main>
@@ -529,6 +597,7 @@ onBeforeUnmount(() => {
     <ControlBar
       :status="session.status.value"
       :last-frame="session.lastFrame.value"
+      :progress="session.progress.value"
       :setup-valid="setupValid"
       @command="sendCommand"
     />

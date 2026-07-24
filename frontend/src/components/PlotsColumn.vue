@@ -15,18 +15,26 @@ defineProps<{
   lastFrame: Frame | null
   showGrid: boolean
   plotsKey: string
+  // batch compute streams no frames — the colorbar and marginals (frame-fed)
+  // are dimmed; the series plots below stay live (they poll REST, not frames)
+  batchComputing?: boolean
 }>()
 </script>
 
 <template>
   <div class="flex flex-col gap-2">
-    <Colorbar :last-frame="lastFrame" />
-    <MarginalsPlot :key="'r' + plotsKey" :frame-source="frameSource"
-                   :variants="variants" which="rho" :show-grid="showGrid"
-                   :a1="grid.x1" :a2="grid.x2" :n="grid.Nx" />
-    <MarginalsPlot :key="'p' + plotsKey" :frame-source="frameSource"
-                   :variants="variants" which="phi" :show-grid="showGrid"
-                   :a1="grid.p1" :a2="grid.p2" :n="grid.Np" />
+    <!-- frame-fed views: dimmed during batch compute (no frames stream) -->
+    <div class="flex flex-col gap-2 transition-opacity"
+         :class="batchComputing ? 'opacity-20 grayscale pointer-events-none' : ''"
+         :title="batchComputing ? 'batch mode streams no frames while computing — press Play when done to review' : undefined">
+      <Colorbar :last-frame="lastFrame" />
+      <MarginalsPlot :key="'r' + plotsKey" :frame-source="frameSource"
+                     :variants="variants" which="rho" :show-grid="showGrid"
+                     :a1="grid.x1" :a2="grid.x2" :n="grid.Nx" />
+      <MarginalsPlot :key="'p' + plotsKey" :frame-source="frameSource"
+                     :variants="variants" which="phi" :show-grid="showGrid"
+                     :a1="grid.p1" :a2="grid.p2" :n="grid.Np" />
+    </div>
     <!-- cursor-t: the painted frame's time, so the series carry the same
          moving marker the exported video does -->
     <SeriesPlot :key="'e' + plotsKey" :session-id="sessionId"
