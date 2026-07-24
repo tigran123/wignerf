@@ -28,6 +28,7 @@ import logging
 import threading
 import time
 import uuid
+import weakref
 from collections import deque
 from dataclasses import dataclass, replace
 
@@ -41,7 +42,15 @@ from .xp import resolve_devices
 
 log = logging.getLogger(__name__)
 
-WS_IDLE_TTL = 120.0
+# Grace before a DETACHED (no client) session is closed and its RAM+VRAM
+# freed. Measured from last_seen, which is stamped only on WS detach (and
+# creation), so this IS the post-departure grace. Kept well above recover()'s
+# ~1.5 s reattach (SimulatorView.vue) so a transient socket drop on a still-open
+# tab re-attaches (ws_attached=True re-shields it) before the sweeper fires; a
+# genuine departure is freed promptly instead — the frontend also sends a
+# keepalive DELETE on pagehide, so this is the fallback for the cases a beacon
+# cannot cover (crash, kill -9, network partition).
+WS_IDLE_TTL = 20.0
 
 # How many records a fast variant worker may run ahead of the lockstep
 # frontier (the newest record ALL variants have landed on). Without a bound
@@ -57,6 +66,13 @@ _LOCK = threading.Lock()
 # set by close(), consumed by the TTL sweeper: a closed session's history is
 # cyclic garbage and needs the collector, not refcounting (see _collect_closed)
 _closed_since_sweep = False
+# weakrefs to sessions closed since the last SUCCESSFUL collect. A collect that
+# ran while something still rooted the cycle (the departing DELETE handler's own
+# `s` local, or an attached streamer coroutine still unwinding on the event
+# loop) frees nothing — so _collect_closed keeps the flag ARMED while any of
+# these are still alive, and the next sweep retries. Clearing regardless was the
+# bug that stranded a beacon-DELETE'd history until an automatic gen-2 gc.
+_closed_refs = []
 
 # glibc's malloc_trim(0), or None off glibc — see _trim_malloc_arena
 try:
@@ -622,10 +638,11 @@ class SimSession:
             w.stop()
         for w in self.workers:
             w.join(timeout=3.0)
+        global _closed_since_sweep
         with _LOCK:
             SESSIONS.pop(self.id, None)
-        global _closed_since_sweep
-        _closed_since_sweep = True   # this history needs the cyclic collector
+            _closed_since_sweep = True   # this history needs the cyclic collector
+            _closed_refs.append(weakref.ref(self))  # ...until this ref goes dead
 
 
 def create_session(cfg, compiled_potential, device, fft_threads, history_bytes,
@@ -668,13 +685,25 @@ def _collect_closed():
     global _closed_since_sweep
     if not _closed_since_sweep:
         return
-    _closed_since_sweep = False
     t0 = time.monotonic()
     n = gc.collect()
     freed = _trim_malloc_arena()
-    log.info("post-close gc: %d objects in %.0f ms%s", n,
+    # Stay ARMED while any just-closed session is still alive: gc could not
+    # reclaim it because something still roots the cycle — the departing DELETE
+    # handler's `s` local, or an attached streamer coroutine mid-unwind on the
+    # event loop. Whoever calls us next (the DELETE path immediately, else the
+    # 5 s sweeper) retries once that root is gone. Clearing unconditionally was
+    # the bug that left a beacon-DELETE'd history resident until a chance
+    # gen-2 gc (which, on an idle server, may not run for minutes).
+    with _LOCK:
+        _closed_refs[:] = [r for r in _closed_refs if r() is not None]
+        _closed_since_sweep = bool(_closed_refs)
+        rooted = len(_closed_refs)
+    log.info("post-close gc: %d objects in %.0f ms%s%s", n,
              (time.monotonic() - t0)*1e3,
-             "" if freed is None else " (malloc_trim=%d)" % freed)
+             "" if freed is None else " (malloc_trim=%d)" % freed,
+             "" if not rooted
+             else " (%d session(s) still rooted, will retry)" % rooted)
 
 
 def _trim_malloc_arena():
@@ -705,7 +734,7 @@ async def _sweep_idle(now):
 
     A separate coroutine ON PURPOSE. A `for` target outlives its loop, so
     doing this inline in ttl_sweeper left the LAST session examined bound in
-    the sweeper's frame — pinning its entire FrameHistory across the 15 s
+    the sweeper's frame — pinning its entire FrameHistory across the sweep
     sleep, and FOREVER once SESSIONS empties, because an empty loop never
     rebinds the name. Measured 2026-07-23: 3.2 GB held at 4096²/100 records
     after DELETE, surviving explicit gc.collect(); at 8192² it would be tens
@@ -721,10 +750,14 @@ async def _sweep_idle(now):
 
 async def ttl_sweeper():
     while True:
-        await asyncio.sleep(15.0)
+        # 5 s cadence so a detached session is closed ~WS_IDLE_TTL+5 s after
+        # departure, not +15 s. The per-sweep work is cheap when nothing
+        # closed (gc runs only when _closed_since_sweep), so a tight cadence
+        # costs nothing on an idle server.
+        await asyncio.sleep(5.0)
         now = time.monotonic()
         videoexport.sweep(now)     # unlink exported files past their TTL
         await _sweep_idle(now)
         # after the idle closes, so a session closed by THIS sweep is freed
-        # by THIS sweep rather than 15 s later
+        # by THIS sweep rather than one cadence later
         await asyncio.to_thread(_collect_closed)

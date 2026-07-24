@@ -3,6 +3,7 @@ Session lifecycle: create (validates + compiles the potential, spawns the
 solver workers), inspect, delete, and the scalar time-series backfill.
 """
 
+import logging
 import os
 import time
 from functools import partial
@@ -17,6 +18,7 @@ from core import session as sessions
 from core.potential import PotentialError, compile_potential
 from core.protocol import VARIANTS, SessionCreate
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -99,7 +101,33 @@ def delete_session(sid: str):
     s = sessions.get_session(sid)
     if s is None:
         raise HTTPException(404, "no such session")
+    # Arrival timestamp: compared against uvicorn's "connection closed" line it
+    # measures how long the browser sat on the keepalive DELETE before flushing
+    # it (worst on a full-quit vs a reload/tab-close).
+    log.info("DELETE %s received — closing", sid)
+    t0 = time.monotonic()
     s.close()
+    t1 = time.monotonic()
+    # Drop our OWN reference before collecting: `s` is a live frame local, so
+    # leaving it bound roots the session↔worker cycle and gc.collect() below
+    # would free nothing. With it gone, the only remaining root is a streamer
+    # coroutine still unwinding on the event loop (if any) — and
+    # _collect_closed keeps the sweep armed for exactly that case, so the 5 s
+    # sweeper retries once it releases. This makes RSS return here in the
+    # common case and bounds it at one sweep otherwise.
+    del s
+    # Reap the just-closed session's cyclic FrameHistory NOW rather than
+    # leaving it to the next TTL sweep. This is the prompt-departure path — the
+    # frontend's pagehide beacon DELETEs here — so returning RSS to the OS
+    # promptly is the whole point. close() armed _closed_since_sweep, so this
+    # runs the gc.collect()+malloc_trim. Safe on the event loop: delete_session
+    # is a sync endpoint, so FastAPI runs it in a threadpool thread.
+    sessions._collect_closed()
+    # close() = worker join (VRAM; but a join that times out on a mid-record
+    # worker frees the card LATER — see "worker … released GPU pool");
+    # collect = gc + malloc_trim (RSS).
+    log.info("DELETE %s: close() %.2fs, collect %.2fs",
+             sid, t1 - t0, time.monotonic() - t1)
     return {"ok": True}
 
 

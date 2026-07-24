@@ -66,6 +66,11 @@ class SolverWorker(threading.Thread):
             self.session.clock.set_running(False)
         finally:
             self._release_gpu_pool()
+            # The true VRAM-free moment: if this worker was mid-record when the
+            # session closed, the join in close() timed out and the thread ran
+            # on to here — so this timestamp, not close()'s return, is when the
+            # card actually gives the memory back.
+            log.info("worker %s released GPU pool", self.name)
 
     def _release_gpu_pool(self):
         """Return unused CuPy pool blocks to the driver when the session

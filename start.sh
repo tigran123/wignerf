@@ -42,7 +42,14 @@ cd backend
 # every multi-MiB frame bundle on the event loop and caps the stream at ~10-25 records/s
 # (measured 12x slower than uncompressed on localhost).
 # The binary frames are already quantized; never compress.
-UVICORN_OPTS=(--no-access-log --ws-per-message-deflate false)
+# --ws-ping-interval/timeout: WS keepalive pings so a HALF-OPEN drop (killed
+# browser, laptop sleep, network partition — no TCP FIN) is detected and closed,
+# which runs ws_endpoint's finally (detach) so the idle TTL can reap the session
+# instead of receive_text() blocking on the dead socket. These MATCH uvicorn's
+# current defaults (20/20); pinned explicitly so that keepalive can't silently
+# regress (a --ws impl swap, a future default change) and leak a session.
+UVICORN_OPTS=(--no-access-log --ws-per-message-deflate false
+              --ws-ping-interval 20 --ws-ping-timeout 20)
 
 # Pass --root-path only when APP_ROOT_PATH names a real prefix. Both empty
 # and "/" mean "no prefix" — but passing --root-path / makes uvicorn prepend

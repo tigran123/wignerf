@@ -305,26 +305,72 @@ def test_closed_history_needs_the_cyclic_collector():
                 _time.sleep(0.02)
             href = weakref.ref(s.history)
             sessmod._closed_since_sweep = False
+            sessmod._closed_refs.clear()   # ignore any prior test's closures
             s.close()
             del s
             assert sessmod._closed_since_sweep, "close() did not arm the sweep"
             assert href() is not None, \
                 "history freed by refcounting — the worker back-reference " \
                 "cycle is gone, so _collect_closed() is no longer needed"
-            sessmod._collect_closed()
-            assert not sessmod._closed_since_sweep, "flag not consumed"
-            # ws_endpoint may still be unwinding (its teardown is bounded at
-            # 3 s) and would hold the session through no fault of the
-            # collector — retry instead of racing it, or this test is flaky.
+            # _collect_closed keeps the flag ARMED until the cycle is actually
+            # freed; ws_endpoint may still be unwinding (teardown bounded at
+            # 3 s) and would root the session through no fault of the collector,
+            # so retry — the flag self-clears once nothing closed is rooted.
             for _ in range(200):
+                sessmod._collect_closed()
                 if href() is None:
                     break
                 _time.sleep(0.02)
-                sessmod._closed_since_sweep = True     # re-arm; it self-clears
-                sessmod._collect_closed()
             assert href() is None, "history survived _collect_closed()"
+            assert not sessmod._closed_since_sweep, \
+                "flag must self-clear once the closed session is freed"
             # and it is a no-op when nothing closed
             sessmod._collect_closed()
+    finally:
+        gc.enable()
+
+
+def test_collect_stays_armed_while_a_closed_session_is_rooted():
+    """The fix for the beacon-DELETE RSS-stuck race: _collect_closed must NOT
+    clear _closed_since_sweep while a just-closed session is still reachable.
+
+    On a browser departure the DELETE handler runs close() then _collect_closed
+    in a threadpool thread, but the session's streamer coroutine may still be
+    unwinding on the event loop (and, before the del s fix, the handler's own
+    `s` local rooted it too). gc then frees nothing. If the flag were cleared
+    regardless, the 5 s sweeper would no-op and the multi-GB history would sit
+    resident until a chance gen-2 gc — the observed 'RSS stuck at 13.2 GB'.
+    So the flag stays armed while any _closed_refs entry is alive, and clears
+    the moment the last root drops."""
+    import gc
+    import weakref
+    from core import session as sessmod
+    gc.disable()
+    try:
+        with TestClient(app) as client:
+            info = _mk(client)
+            s = sessmod.SESSIONS[info["session_id"]]
+            href = weakref.ref(s.history)
+            sessmod._closed_since_sweep = False
+            sessmod._closed_refs.clear()
+            s.close()
+            # Hold a live reference (stands in for the DELETE frame local / a
+            # mid-unwind streamer): the cycle is rooted, so gc frees nothing and
+            # the flag must remain armed for a later retry.
+            rooted = s
+            del s
+            sessmod._collect_closed()
+            assert href() is not None, "rooted history should NOT be freed yet"
+            assert sessmod._closed_since_sweep, \
+                "flag cleared while a closed session was still rooted — the bug"
+            # Drop the last root; the next collect frees it and disarms.
+            del rooted
+            for _ in range(200):
+                sessmod._collect_closed()
+                if href() is None:
+                    break
+            assert href() is None, "history not freed once unrooted"
+            assert not sessmod._closed_since_sweep, "flag did not self-clear"
     finally:
         gc.enable()
 
@@ -344,6 +390,40 @@ def test_ttl_sweeper_never_binds_a_session_in_its_own_frame():
     assert "s" not in sessmod.ttl_sweeper.__code__.co_varnames, \
         "ttl_sweeper binds a session in its own frame — use _sweep_idle"
     assert "s" in sessmod._sweep_idle.__code__.co_varnames
+
+
+def test_detached_session_swept_after_grace_attached_is_shielded():
+    """A session with no client is closed once last_seen ages past
+    WS_IDLE_TTL; an attached one is shielded no matter how stale it is.
+
+    This is the fallback that reclaims a session whose browser departed
+    without a DELETE — the frontend's pagehide keepalive-DELETE covers the
+    common case, this covers crash / kill -9 / half-open once the socket
+    finally closes and detaches. Behaviour, not the exact grace value, so it
+    survives a retune of WS_IDLE_TTL."""
+    import asyncio
+    import time as _time
+
+    from core import session as sessmod
+    with TestClient(app) as client:
+        info = _mk(client)
+        sid = info["session_id"]
+        s = sessmod.SESSIONS[sid]
+
+        # Age last_seen past the grace, but keep it ATTACHED first: an attached
+        # session is never swept, however stale — and this ordering also keeps
+        # the real 5 s background sweeper from racing the manipulation.
+        s.ws_attached = True
+        s.last_seen = _time.monotonic() - (sessmod.WS_IDLE_TTL + 1.0)
+        asyncio.run(sessmod._sweep_idle(_time.monotonic()))
+        assert sid in sessmod.SESSIONS and not s.closed, \
+            "an attached session must never be swept"
+
+        # Now detached and past the grace: it is closed and unregistered.
+        s.ws_attached = False
+        asyncio.run(sessmod._sweep_idle(_time.monotonic()))
+        assert sid not in sessmod.SESSIONS and s.closed, \
+            "a detached session past WS_IDLE_TTL must be swept"
 
 
 def test_malloc_trim_is_wired_on_glibc():

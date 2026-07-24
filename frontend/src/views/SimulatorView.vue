@@ -344,12 +344,22 @@ function onKey(ev: KeyboardEvent) {
   }
 }
 
+// A genuine page departure (tab close, reload, navigation) does NOT run Vue's
+// onBeforeUnmount reliably, and its awaited DELETE would not complete during
+// unload — so fire a keepalive DELETE here to free the session's RAM+VRAM at
+// once instead of leaving it to the idle TTL. Skip a bfcache suspend
+// (e.persisted): that page may be restored, and an open WebSocket usually
+// disqualifies bfcache anyway. This is distinct from recover() (a live-tab
+// socket drop), which is never a pagehide.
+const onPageHide = (e: PageTransitionEvent) => { if (!e.persisted) session.beaconDestroy() }
 onMounted(() => {
   window.addEventListener('keydown', onKey)
+  window.addEventListener('pagehide', onPageHide)
   void restart()
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey)
+  window.removeEventListener('pagehide', onPageHide)
   unsub?.()
   void session.destroy()
 })

@@ -458,6 +458,53 @@ grids) and the measured refresh interval.
   frontend's auto-recover churned reconnects. `ws_endpoint` logs the
   disconnect code and `_sender` logs where it stopped (`last_sent`), so a
   mid-replay drop is diagnosable from the journal.
+- **A departing browser must free its session PROMPTLY, not on the idle TTL.**
+  A tab close / reload / navigate sends NO `DELETE` (Vue's `onBeforeUnmount`
+  does not run on a real unload, and its awaited DELETE would not complete):
+  the backend learns only via the WS close, whose `finally` merely *pauses +
+  detaches* (`ws_attached=False`, `set_running(False)`, stamp `last_seen`) —
+  it never calls `close()`. So the session lingers in `SESSIONS` with
+  alive-but-idle workers holding the full `FrameHistory` (RSS) and each
+  worker's CuPy pool + cuFFT cache + exponent meshes (VRAM) until the idle
+  sweeper reaps it. A reload creates a NEW session at once, so it competes
+  with its own just-orphaned twin for the same RAM/VRAM (worker OOM = the
+  "denied computation" symptom). THREE-part fix: (1) the frontend fires a
+  `keepalive` `DELETE` on `pagehide` (`useSession.beaconDestroy`, registered
+  in `SimulatorView.vue`; skips `event.persisted` bfcache) so a genuine
+  departure frees resources promptly — this is safe against `recover()`, which
+  is a live-tab `sock.onclose`, never a pagehide. The `DELETE` path
+  (`delete_session`) drops its own `s` local (`del s`) and calls
+  `_collect_closed()` right after `close()` so the history's cyclic garbage is
+  gc'd + `malloc_trim`'d promptly instead of waiting up to a sweep cadence; it
+  is a sync endpoint so that runs in a threadpool thread, off the event loop.
+  **The `del s` and the arm-until-freed logic are not optional** — a closed
+  session is a cycle, so `gc.collect()` frees NOTHING while any live reference
+  roots it, and at DELETE time there are two: the handler's own `s` local (hence
+  `del s`) and, if a client was attached, the `ws_endpoint` streamer coroutine
+  still unwinding on the event loop (its teardown is bounded at 3 s and races
+  the threadpool DELETE). So `_collect_closed` keeps `_closed_since_sweep`
+  ARMED while any `weakref` in `_closed_refs` is still alive, and only clears it
+  once the cycle is actually gone. Clearing it unconditionally — the original
+  DELETE-path call did — meant a collect that ran a beat before the streamer
+  released left the flag down, the 5 s sweeper then no-op'd, and the multi-GB
+  history sat resident until a chance gen-2 gc (the observed "RSS stuck at
+  13.2 GB, nothing in the logs"). Now it frees at once when nothing else roots
+  it, else the sweeper retries within ~5 s. Pinned by
+  `test_collect_stays_armed_while_a_closed_session_is_rooted`. VRAM comes back
+  at worker-join inside `close()` (a worker finishes its in-flight record before
+  seeing the stop flag, so a mid-compute large-grid quit takes a few seconds).
+  (2) `WS_IDLE_TTL` is 20 s
+  (down from 120), swept every 5 s (down from 15), so the crash/kill fallback
+  is bounded at ~20-25 s; 20 s stays well above `recover()`'s ~1.5 s reattach,
+  so a transient drop on a live tab still re-shields (`ws_attached=True`)
+  before the sweep. (3) `start.sh` PINS `--ws-ping-interval/timeout 20` (these
+  MATCH uvicorn's current defaults) so a HALF-OPEN drop (kill -9, laptop
+  sleep, network partition — no TCP FIN) is detected by the keepalive and
+  closed, running the `finally` (detach) instead of `receive_text()` blocking
+  on the dead socket forever; that bounds the case at ~60 s. Explicit only so
+  the keepalive can't silently regress (a `--ws` impl swap, a future default
+  change). The 20 s grace is pinned by
+  `test_detached_session_swept_after_grace_attached_is_shielded`.
 - **The BROWSER'S WebSocket receive path is the large-grid wall, and it
   degrades with MESSAGE SIZE — not the server, not painting, not pacing.**
   Measured 2026-07-23, 4096² (32 MiB/record), Chrome + RTX 2080 Ti:
@@ -497,7 +544,7 @@ grids) and the measured refresh interval.
 - **Two more things kept a closed session's RAM resident, both found only by
   measuring RSS across a Restart (2026-07-23).** (1) `ttl_sweeper` iterated
   `SESSIONS` inline, and a `for` target outlives its loop — so the sweeper
-  held the LAST session it examined across its 15 s sleep, and FOREVER once
+  held the LAST session it examined across its sweep sleep, and FOREVER once
   SESSIONS emptied, because an empty loop never rebinds the name. 3.2 GB
   survived DELETE + explicit `gc.collect()` at 4096²/100 records; tens of GB
   at 8192². The loop now lives in `_sweep_idle`, whose frame dies on return

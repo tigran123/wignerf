@@ -280,7 +280,28 @@ export function useSession() {
     }
   }
 
+  /**
+   * Best-effort teardown for a genuine page departure (pagehide: tab close,
+   * reload, navigation). The Vue onBeforeUnmount → destroy() path does NOT
+   * fire on a real browser unload, and an awaited DELETE would not complete
+   * anyway, so without this the backend only learns of the departure via the
+   * WS close — which merely pauses+detaches the session and leaves it holding
+   * RAM+VRAM until the idle TTL reaps it. `keepalive` lets the DELETE survive
+   * the document being torn down; it reuses the same endpoint destroy() uses
+   * (idempotent server-side — a later DELETE just 404s). NOT a substitute for
+   * recover(): that reattaches a still-open tab after a transient socket drop,
+   * which is not a pagehide, so this never interferes with it.
+   */
+  function beaconDestroy() {
+    const sid = info.value?.session_id
+    if (!sid) return
+    try {
+      fetch(`${api.defaults.baseURL}/sessions/${sid}`,
+            { method: 'DELETE', keepalive: true })
+    } catch { /* page is going away; nothing to recover */ }
+  }
+
   return { status, info, connected, errors, lastFrame, boundary, regrid,
            paramsApplied, exportEvent, create, send, onFrame, onClose,
-           reconnect, destroy }
+           reconnect, destroy, beaconDestroy }
 }
