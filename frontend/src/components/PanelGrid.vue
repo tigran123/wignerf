@@ -102,7 +102,9 @@ const gridClass = computed(() => {
             <span class="text-neutral-500 mx-2">·</span>
             t = <span class="wf-fixnum">{{ (progress?.t ?? 0).toFixed(3) }}</span> a.u.
             (<span class="wf-fixnum">{{ ((progress?.t ?? 0)*AU_TIME_FS).toFixed(3) }}</span> fs)
-            <span class="text-neutral-500">/ t₂ = {{ progress?.t2 }}</span>
+            <span class="text-neutral-500">/ t₂ =
+              <span class="wf-fixnum">{{ (progress?.t2 ?? 0).toFixed(3) }}</span> a.u.
+              (<span class="wf-fixnum">{{ ((progress?.t2 ?? 0)*AU_TIME_FS).toFixed(3) }}</span> fs)</span>
           </div>
           <div v-if="throughput" class="mt-1 text-xs text-neutral-400 tabular-nums">{{ throughput }}</div>
           <div class="mt-2 text-xs text-neutral-500">
