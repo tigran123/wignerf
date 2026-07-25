@@ -334,6 +334,27 @@ def test_unknown_device_is_a_clean_422():
                            json=_cfg(device="cpu")).status_code == 200
 
 
+def test_device_outside_the_host_pool_is_refused(monkeypatch):
+    """WIGNERF_DEVICE has to be a POLICY, not a suggestion. It only checked that
+    the spec parsed and the card existed, so a host pinned to one device — or to
+    cpu, to keep its cards free for something else — could be overridden by any
+    client that asked for another. The refusal names the pool, because "device
+    not available" without saying what IS available is a dead end."""
+    import config
+    monkeypatch.setattr(config, "DEVICE", "cpu")
+    with TestClient(app) as client:
+        # in the pool
+        assert client.post("/api/sessions",
+                           json=_cfg(device="cpu")).status_code == 200
+        # outside it — refused whether or not this host physically has the card
+        r = client.post("/api/sessions", json=_cfg(device="cuda:0"))
+        assert r.status_code == 422
+        assert "WIGNERF_DEVICE=cpu" in r.text and "cpu" in r.text
+        # and every member of a list is checked, not just the first
+        r = client.post("/api/sessions", json=_cfg(device="cpu,cuda:0"))
+        assert r.status_code == 422 and "cuda:0" in r.text
+
+
 def test_history_cap_is_clamped_to_the_host_ceiling():
     """A session may narrow the host's RAM policy, never widen it."""
     import config

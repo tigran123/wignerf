@@ -8,6 +8,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
+import Colorbar from './Colorbar.vue'
 import GridOverlay from './GridOverlay.vue'
 import { decodeFrame } from '../lib/protocol'
 import { defaultConfig, type GridCfg, type ICCfg, type ICComponentCfg } from '../lib/config'
@@ -54,6 +55,8 @@ const viewExtents = computed(() => {
 })
 
 const state = reactive({ previewOk: false, error: '' })
+const wmin = ref<number | null>(null)
+const wmax = ref<number | null>(null)
 
 // gate for the transport Solve: an IC (or grid) the preview endpoint
 // rejects must not coexist with a running computation; starts pessimistic
@@ -74,6 +77,10 @@ async function refresh() {
     }, { responseType: 'arraybuffer' })
     const f = decodeFrame(data as ArrayBuffer)
     const v = f.variants[0]!
+    // the preview's OWN colour range, for its overlaid bar: it is a W plot like
+    // the panels and autoscales the same way, so it carries its own scale
+    wmin.value = v.wmin
+    wmax.value = v.wmax
     renderer.upload(v, f.Nx, f.Np)
     renderer.render()
     deficit.value = String(headers['x-wignerf-norm-deficit'] ?? '')
@@ -278,6 +285,10 @@ onBeforeUnmount(() => {
              :class="i === selected ? 'border-yellow-300' : 'border-neutral-400/70'"
              :style="markerStyle(c)"></div>
       </div>
+      <!-- the preview's own colour scale, overlaid so it costs no height in a
+           column the W panels are competing with. No name label here, so it
+           takes the top slot the panels reserve for theirs. -->
+      <Colorbar :min="wmin" :max="wmax" place="top-1 left-2" />
     </div>
     <div v-if="state.error" class="text-[11px] text-red-400">{{ state.error }}</div>
     <div v-if="deficit" class="text-xs text-neutral-400">

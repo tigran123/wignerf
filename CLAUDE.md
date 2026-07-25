@@ -94,6 +94,19 @@ source) is what keeps startup fast. See `README.md`.
   backend; frames stream in shifted order and the *shader* unshifts via a
   half-period texture offset (`render/WignerRenderer.ts`, R16UI texture,
   manual bilinear with periodic wrap, diverging LUT centered at W=0).
+  **Every W plot autoscales to its OWN range and therefore carries its OWN
+  colorbar**, overlaid in its corner (`Colorbar.vue`, taking an explicit
+  min/max). `WignerPanel` uploads `f.variants[variantIndex]` and the renderer
+  sets `q = [v.wmin, v.wmax]` from it, so the four variants' scales drift apart
+  as they evolve — measured on a cat state in x²/2 + 0.3x⁴ at t = 15: QN wmin
+  −1.87e-1 vs CN −2.70e-1 (44% apart), wmax +3.18e-1 vs +3.51e-1. A single
+  shared bar read `variants[0]` and so mislabelled the other three panels; it
+  agreed with all of them only at record 0, which IS the IC, which is exactly
+  why it looked right. The IC preview has one too — it is a W plot with its own
+  range. Overlaid rather than stacked because it then costs no layout height:
+  the bar used to head the diagnostics column, the tallest of the three in
+  portrait (808 px against setup 758, IC 557), so a row spent there was a row
+  the panels started later by.
 - **Boundary watch / auto-expand** (`core/boundary.py`): detection is
   ALWAYS on — every record, each worker sums the outer edge band of the
   ρ/φ marginals it already computed (host-side, O(Nx+Np), no extra device
@@ -225,7 +238,20 @@ source) is what keeps startup fast. See `README.md`.
   (`core/describe.py`; cat states print ψ(x,0), the compact complete form),
   and any live parameter change inside the range (`session.param_log`) —
   so one frame documents the whole run; the same facts go into the mp4
-  `comment` tag as JSON. Progress: `export` events on the session WS plus a
+  `comment` tag as JSON. That block is anchored at `FrameFigure.META_TOP` with
+  `va="top"` and grows DOWNWARD, so it had nothing stopping it running off the
+  bottom edge: the figure is always 19.2×10.8 in at 16:9 (dpi carries the
+  resolution), 8 pt at linespacing 1.6 advances 0.016461 of the height, and
+  0.185/0.016461 = **11 lines fit**. `param_lines` grows by one line per live
+  parameter change plus the float32 PREVIEW line, and a 4-variant cat run with
+  4 live changes measures **10 lines in float64, 11 in float32** — i.e. a
+  realistic export sat exactly at the edge and one more change clipped in
+  silence. `_meta_fontsize` now shrinks to fit (one size for BOTH columns, so
+  they stay matched, derived from `get_figheight()` so a non-16:9 export keeps
+  the full 8 pt), and past a 5 pt floor `_meta_fit` elides with "… +N more
+  lines — full detail in the mp4 comment tag", which is an honest pointer
+  because `describe.config_json` really does carry all of it. Static art, baked
+  into the blit background: no per-frame cost. Progress: `export` events on the session WS plus a
   REST poll; the file lives in `WIGNERF_EXPORT_DIR` until downloaded, TTL
   (30 min), session close or shutdown. The header button stays ENABLED
   while computing (a disabled button explained only by a tooltip is how
@@ -246,6 +272,23 @@ source) is what keeps startup fast. See `README.md`.
   session restart, because each of them is fixed at worker construction (FFT
   plan dtype, `ArrayBackend` device, `FrameHistory` cap) (auto-expand moves the LIVE grid; the Setup panel shows it and
   offers "adopt" to copy it into the form).
+  **Every restart-only field goes amber when it disagrees with the session**,
+  COMPUTE included — a form reading `cuda:0` over a session on `cuda:1` is the
+  same trap as one reading float64 over a float32 run. `precision` gets it via
+  `LiveRun`, but `device` and `history_mb` cannot: the form holds a REQUEST
+  (`''` = the host's pool, `0` = its ceiling) while `status` reports what was
+  GRANTED (a resolved device list, a clamped cap). So `SetupPanel` resolves the
+  request the way the server would — `''` against the pool from `/api/device`'s
+  `devices` (hence `hostPool`, distinct from `choices`), a bare `cuda` to
+  `cuda:0` to match `resolve_devices`, and `history_mb` clamped to
+  `history_mb_max` so asking for 999999 on a 110000 host is not a "difference"
+  — and only then compares. One amber line names what is running, exactly as
+  the RUN section's does, and only while something differs.
+  The steady-state facts are NOT repeated in the panel: the devices and the
+  history cap ride the timeline's own `hist 0.1 / 107 GiB · dev: cuda:1, cuda:0`
+  readout, which is drawn anyway. A standing "running on …, history cap …"
+  paragraph there spent vertical space in a narrow column to say what that
+  readout already says for free.
   `apply_params` compares against what is LIVE and drops the fields that
   did not change — no worker command, no `param_log` entry, no
   `params_applied`, and nothing at all if the whole message is a no-op (the
@@ -361,13 +404,35 @@ device array in its own frame, so they die on return before `free_all_blocks()`
 pool blocks back to the driver on session close (nvidia-smi "used" while
 running is pool recycling, not a leak).
 
+Two things about that release are load-bearing and both were wrong until
+2026-07-25. **The preview allocates from its OWN pool** (`_pool`, installed with
+`cupy.cuda.using_allocator`, which is thread-local — previews run in starlette's
+threadpool, workers own their own threads). `free_all_blocks()` acts on whichever
+pool it is handed, and there is no per-backend allocator anywhere, so releasing
+the process DEFAULT pool also returned the running workers' cached blocks to the
+driver — on every IC keystroke, the exact opposite of what the free-VRAM check
+above is for. Isolation is free: a cold 1 GiB allocation measured 3.1 ms against
+2.6 ms pool-warm, and the release empties the pool after every preview anyway, so
+every preview was already cold. **And the failure path needs a SECOND release,
+after the `except` handler has exited.** While an exception propagates its
+traceback still references `_build_frame`'s frame and every device array in it,
+so the `finally`'s `free_all_blocks()` frees nothing (measured at 128 MiB:
+`finally` alone left all of it reserved, `finally` plus the later call left none)
+— and a release *inside* the handler is no better, the exception is live for the
+whole handler. Untreated, a preview that OOMs at 8192² parks GiB on the card
+until the next SUCCESSFUL preview, starving the solver the fallback exists to
+protect. Related: that handler logs `traceback.format_exc()` and deliberately
+NOT `exc_info=True`, because a LogRecord built with `exc_info` stores the
+traceback, and any handler that retains records (pytest's log capture does) then
+pins the frame past the release.
+
 ## Configuration (environment variables, read by backend/config.py)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and the list of choices**; `SessionCreate.device` (Setup → Compute, restart-only) overrides it per session with any spec this host resolves — an unknown one is a 422, not a worker that dies on start. `GET /api/device` returns BOTH `devices` (the pool) and `choices` (the pool **plus cpu**), because CPU is always a legal target but never appears in an `auto` pool on a CUDA host; the Setup select is built from `choices`. |
+| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and an enforced POLICY**: `SessionCreate.device` (Setup → Compute, restart-only) may narrow it per session but never widen it — a spec outside `xp.devices_allowed(WIGNERF_DEVICE)` (the pool **plus cpu**) is a 422 naming the pool, as is a malformed or absent one. It used to check only that the spec parsed and the card existed, so a host pinned to `cuda:1` (or to `cpu`, to keep its cards free) could be overridden by any client. `GET /api/device` returns BOTH `devices` (the pool) and `choices` — and `choices` IS `devices_allowed`, the same list the validator uses, so the Setup select can never offer a device the API refuses. CPU is always a legal target but never appears in an `auto` pool on a CUDA host, which is why it is appended. `resolve_devices` returns CANONICAL specs (a bare `cuda` → `cuda:0`), without which that membership test would reject a device the host does offer. |
 | `WIGNERF_PORT` | `8010` | Backend port (8000 belongs to urantia-library). Used by start.sh; `uvicorn --port` otherwise. |
-| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster and ~58% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`'s `default_factory` — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing. **The SPA defers rather than guesses**: until the user operates the precision control the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. |
+| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster and ~58% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`'s `default_factory` — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the precision control — or an IMPORT supplies one — the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. Two exceptions, both deliberate. An **imported** setup document or mp4 marks the precision CHOSEN (`importConfig` → `markPrecisionChosen`): it is the run someone exported, and reproducing it is what the document is for — without it the import silently ran at the host default and left the form showing a float32 that never happened, behind a "restart to apply" no restart could clear (`status.precision` never CHANGES, so the sync watcher never fires). And a form with **auto-expand on** sends `float64` explicitly rather than deferring, because auto-expand is float64-only, so asking for it IS asking for float64 — deferring it on a float32 host asks for a pair the schema refuses and 422s every create. |
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` (Setup → Compute) may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long 1440p exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
@@ -438,6 +503,16 @@ grids) and the measured refresh interval.
   it expired (old code/comments elsewhere in the repo may keep theirs).
 - Nx, Np must be even (shader unshift + fftshift symmetry); powers of 2
   for FFT speed. Grid warns, API schema enforces evenness.
+- **A failed API call goes through `lib/apierror.apiErrorText`, never
+  `data.detail` directly.** FastAPI's `detail` is a STRING for the
+  `HTTPException`s we raise, but an ARRAY of pydantic error objects for any
+  body-validation failure — so `detail ?? String(e)` rendered a schema refusal
+  as the whole raw blob: `type`/`loc`/`ctx` plus a verbatim copy of the entire
+  request `input` (grid, IC, every component), with the one readable sentence
+  buried in the middle of it. The refusal messages in `core/protocol.py` are
+  written to be read by a person; the helper strips pydantic's "Value error, "
+  prefix, names the field for per-field errors, and de-duplicates. Used by both
+  `SimulatorView.restart` and `ExportPanel`.
 - **Live numeric readouts get FIXED decimals in a FIXED-width field** — the
   control bar's t/E (`.wf-fixnum`, tabular-nums) and the exported frames'
   header (`%*.3f` + a monospace family, widths from the export's own t
@@ -518,6 +593,41 @@ grids) and the measured refresh interval.
     residual has a measured float32 floor of ~7.4e-7 (flat in dt, and larger at
     larger grids) against 1.6e-15 in float64 — below that the controller shrinks
     dt through all 15 tries every 20 steps and never converges.
+    **Both refusals are also enforced in the FORM, not just answered with a
+    422**: `lib/config.applyPrecisionInvariants` clears `auto_expand` and raises
+    `tol` to `TOL_MIN_F32` (the frontend mirror of `protocol.TOL_MIN_F32` — move
+    both together), and the Setup panel disables the checkbox and lowers the tol
+    input's `min`. The config-level invariant is the load-bearing half: the panel
+    can be unmounted, and `probeHost`/`mergeConfig` reach the same combinations
+    from outside it. **How the gates are EXPLAINED is a settled three-part
+    pattern, and a standing paragraph is not part of it** — two permanent notes
+    beside controls you are not allowed to change were crowding the actual
+    controls out of a narrow column. Instead: a compact permanent marker in the
+    label that costs no line ("auto-expand domain — float64 only", "tol ≥1e-5");
+    the full reason in the control's `title`; and the reason ONCE in amber
+    (`f32Applied`, recorded at the moment of the switch so it names only what
+    actually changed — a form already at tol = 0.01 had nothing raised) while
+    `runDiffers('precision')` holds, so "Restart session" clears it and the
+    header badge carries the one permanent fact from then on. The amber note is
+    not garnish: it is the only path on a touch device, which has no hover.
+    Clearing `auto_expand` in the form is NOT enough on its own, because it
+    applies LIVE — `SimulatorView` watches `cfg.precision` and sends
+    `auto_expand: false` to a running session, since the status→form watcher
+    cannot (`status.auto_expand` does not CHANGE, so it never fires) and the
+    checkbox is by then disabled, which left a session quietly expanding behind
+    an unchecked, unreachable box.
+    **And the invariants must be applied SYNCHRONOUSLY at the point of change,
+    never from a watcher.** `SetupPanel`'s precision select calls
+    `onPrecisionChange` directly, because a watcher is too late: a child's setup
+    runs during the parent's render, so `SimulatorView`'s own `cfg.precision`
+    watcher holds a lower id and its pre-flush job runs FIRST — and on a fresh
+    session it restarts (`syncFreshSessionToForm`) inside that same flush,
+    serializing a config the panel had not fixed up yet. Symptom: picking
+    float32 with auto-expand on 422'd immediately in BOTH run modes (both start
+    fresh, so both take the auto-restart path). `payload()` therefore calls
+    `applyPrecisionInvariants` too — the form must be self-consistent before it
+    is serialized, and that is the last place it can be guaranteed regardless of
+    which watcher ran first.
   - **Do NOT "optimize" `exponents()` by casting the ANGLE instead of the
     result.** `exp(1j*θ).astype(complex64)` is safe for any finite θ because the
     modulus is 1; `exp(1j*θ.astype(float32))` is NaN for θ ~ 1e91, which a steep

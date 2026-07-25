@@ -22,10 +22,22 @@ GPU previews are serialized so two peaks cannot stack, the build's device
 arrays all die with its frame, and the pool is released immediately after.
 Anything unexpected — OOM above all — falls back to the CPU, which is slow but
 always correct.
+
+The pool the preview allocates from is its OWN (see _pool), not the process
+default one the solver workers share. That is what makes "release immediately
+after" honest: free_all_blocks() acts on whatever pool it is handed, so
+releasing the DEFAULT pool also returned the running workers' cached blocks to
+the driver — on every IC keystroke — which is the exact opposite of what the
+free-VRAM check above is for. cupy.cuda.using_allocator is thread-local and
+previews run in starlette's threadpool while workers own their own threads, so
+neither can see the other's pool. The isolation is free: a cold 1 GiB
+allocation measured 3.1 ms against 2.6 ms pool-warm, and since the release
+empties the pool after every preview, every preview was already cold.
 """
 
 import logging
 import threading
+import traceback
 from typing import Optional
 from urllib.parse import quote
 
@@ -52,6 +64,7 @@ PREVIEW_BYTES_PER_CELL = 88
 PREVIEW_HEADROOM = 1.4     # never take the last of a card a session is using
 
 _backends = {}                    # device spec -> ArrayBackend (contexts are
+_pools = {}                       # device spec -> private cupy MemoryPool
 _backends_lock = threading.Lock()  # expensive; make each one once)
 # One GPU preview at a time. The client debounces, but two concurrent 8192^2
 # builds would want 11 GiB between them and the second would OOM a card that
@@ -65,6 +78,19 @@ def _backend(spec="cpu"):
         if b is None:
             b = _backends[spec] = ArrayBackend(device=spec)
         return b
+
+
+def _pool(spec, b):
+    """This device's private CuPy memory pool — see the module docstring for
+    why the preview must not allocate from (and above all must not release)
+    the pool the solver workers share. Module-level rather than per-request so
+    the release is observable from a test; it is emptied after every preview
+    either way, so a fresh pool would behave identically."""
+    with _backends_lock:
+        p = _pools.get(spec)
+        if p is None:
+            p = _pools[spec] = b.xp.cuda.MemoryPool()
+        return p
 
 
 def _pick_device(cells):
@@ -91,21 +117,31 @@ def _pick_device(cells):
     return best
 
 
-def _release(b):
+def _release(b, pool):
     """Give the build's VRAM back to the driver. Call this only once the
     arrays are unreachable — free_all_blocks() frees blocks that are already
     FREE, so one surviving reference keeps the whole 5.5 GiB resident (the
-    lesson _release_gpu_pool records in core/worker.py)."""
+    lesson _release_gpu_pool records in core/worker.py). On the FAILURE path
+    that reference is the in-flight exception's traceback, which pins
+    _build_frame's frame; hence preview_wigner calls this a second time once
+    the handler has exited.
+
+    A MemoryPool is per-device internally, so re-enter the build's device or
+    free_all_blocks() empties the wrong arena. The per-thread cuFFT plan cache
+    goes first: under a private allocator a plan's work area comes from `pool`,
+    so the cache would hold it against the free. Unlike
+    worker._release_gpu_pool this does NOT touch the pinned pool — that is host
+    RAM shared with every worker's device->host staging, and a preview has no
+    business reclaiming it."""
     if not b.is_gpu:
         return
     try:
         with b.device():
-            xp = b.xp
             try:
-                xp.fft.config.get_plan_cache().clear()
+                b.xp.fft.config.get_plan_cache().clear()
             except Exception:
                 log.debug("preview: plan cache clear failed", exc_info=True)
-            xp.get_default_memory_pool().free_all_blocks()
+            pool.free_all_blocks()
     except Exception:
         log.debug("preview: pool release failed", exc_info=True)
 
@@ -185,14 +221,27 @@ def _respond(payload, deficit, warns):
 @router.post("/preview/wigner")
 def preview_wigner(req: WignerPreviewIn):
     spec = _pick_device(req.grid.Nx*req.grid.Np)
+    # What to release once the failed build's frame is unreachable. The
+    # `finally` below covers the success path, but it CANNOT free a failed one:
+    # while the exception propagates its traceback still references
+    # _build_frame's frame and every device array in it, and free_all_blocks()
+    # frees only blocks that are already free. Nor would a release inside the
+    # `except` help — the exception is live for the whole handler. Measured at
+    # 128 MiB: `finally` alone left all of it reserved, `finally` plus this
+    # left none. Without it a preview that OOMs at 8192^2 parks multiple GiB on
+    # the card until the next SUCCESSFUL preview, starving the very solver the
+    # fallback exists to protect.
+    failed = None
     if spec is not None:
+        b = pool = None      # _backend() itself can raise (a vanished device)
         try:
             b = _backend(spec)
-            with _gpu_lock:
+            pool = _pool(spec, b)
+            with _gpu_lock, b.xp.cuda.using_allocator(pool.malloc):
                 try:
                     return _respond(*_build_frame(b, req))
                 finally:
-                    _release(b)
+                    _release(b, pool)
         except ValueError as e:
             # a bad IC spec, not a device problem — the CPU would reject it too
             raise HTTPException(422, str(e))
@@ -200,8 +249,21 @@ def preview_wigner(req: WignerPreviewIn):
             # OOM above all (another session can claim the card between the
             # free-memory check and the build), but anything device-shaped
             # lands here: the preview must still come back, just slower.
-            log.warning("preview: GPU build on %s failed, falling back to CPU",
-                        spec, exc_info=True)
+            #
+            # format_exc(), NOT exc_info=True: a LogRecord built with exc_info
+            # stores the (type, value, TRACEBACK) tuple, and any handler that
+            # keeps records — pytest's log capture does, and so does anything
+            # buffering for a report — then holds _build_frame's frame and its
+            # device arrays alive past the release below, which is the whole
+            # bug this structure exists to fix. Rendering the frames to text
+            # here keeps every line of the diagnostic and none of the
+            # references.
+            log.warning("preview: GPU build on %s failed, falling back to "
+                        "CPU\n%s", spec, traceback.format_exc())
+            if pool is not None:
+                failed = (b, pool)
+    if failed is not None:
+        _release(*failed)
     try:
         return _respond(*_build_frame(_backend("cpu"), req))
     except ValueError as e:

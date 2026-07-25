@@ -486,6 +486,42 @@ def test_layout_is_resolution_independent():
     assert sizes[3840][1] == 3840*2160*4
 
 
+def test_metadata_block_never_runs_off_the_figure():
+    """The block is anchored with va="top" and grows DOWNWARD, so it used to
+    walk off the bottom edge in silence. Measured at 16:9 (the figure is always
+    19.2x10.8 in — dpi carries the resolution): 11 lines fit, and a 4-variant
+    cat run with 4 live parameter changes is already 10 in float64 and 11 with
+    the float32 PREVIEW line. So a realistic export sat exactly at the edge and
+    one more live change clipped."""
+    cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
+                                 variants=["qn"])
+    stats = _stats()
+    meta = meta_columns(cfg, protocol.RecordGeom(32, 32, -6., 6., -7., 7.),
+                        stats, ["qn"], 0, 2, 3, 30)
+    fig = FrameFigure(["qn"], stats, meta)
+    try:
+        F = FrameFigure
+        # a block that already fits is untouched — no cosmetic change to any
+        # export that was fine before
+        assert fig._meta_fontsize(11) == F.META_FONTSIZE
+        assert fig._meta_fit(["x"]*11, F.META_FONTSIZE) == ["x"]*11
+        # one line past the budget shrinks instead of clipping
+        assert F.META_MIN_FONTSIZE <= fig._meta_fontsize(12) < F.META_FONTSIZE
+        # and the invariant that matters, across the whole range: the last
+        # line's baseline stays inside the figure
+        for n in (1, 11, 12, 20, 60, 200):
+            fs = fig._meta_fontsize(n)
+            kept = fig._meta_fit(["line %d" % i for i in range(n)], fs)
+            assert fs >= F.META_MIN_FONTSIZE
+            advance = fs*F.META_LINESPACING/72.0/fig.fig.get_figheight()
+            assert len(kept)*advance <= F.META_TOP + 1e-9, (n, fs, len(kept))
+            # nothing is dropped silently
+            if len(kept) < n:
+                assert "more lines" in kept[-1] and "comment tag" in kept[-1]
+    finally:
+        fig.close()
+
+
 def test_export_unknown_session_and_job():
     with TestClient(app) as client:
         assert client.post("/api/sessions/nope/export", json={}).status_code == 404

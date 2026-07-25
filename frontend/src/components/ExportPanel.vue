@@ -21,6 +21,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import type { ExportEvent, SessionStatus } from '../composables/useSession'
+import { apiErrorText } from '../lib/apierror'
 import { importConfig, type SimConfig } from '../lib/config'
 import { extractWignerfDoc } from '../lib/mp4meta'
 import { fmtTime } from '../lib/units'
@@ -250,8 +251,7 @@ async function start() {
     job.value = data
     startPoll(data.job_id)
   } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    error.value = err.response?.data?.detail ?? String(e)
+    error.value = apiErrorText(e)
   } finally {
     busy.value = false
   }

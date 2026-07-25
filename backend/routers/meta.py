@@ -5,7 +5,7 @@ from functools import lru_cache
 from fastapi import APIRouter
 
 import config
-from core.xp import ArrayBackend, resolve_devices
+from core.xp import ArrayBackend, devices_allowed, resolve_devices
 
 router = APIRouter()
 
@@ -20,21 +20,23 @@ def _probe_backend():
     through SessionCreate.device.
 
     `devices` is the POOL — what a default session spreads its workers over.
-    `choices` is what the Setup panel offers, which is the pool PLUS cpu: the
-    CPU backend is always a legal target (and a useful one — a float64 sanity
-    run, or keeping a session off a card you need elsewhere), but on a CUDA
-    host `resolve_devices("auto")` returns GPUs only, so it would never appear
-    in a list built from the pool alone."""
+    `choices` is what the Setup panel offers and what POST /api/sessions
+    accepts: `xp.devices_allowed`, i.e. the pool plus cpu. Both come from that
+    one helper deliberately — an offered device the API then refuses (or the
+    reverse) is a form that lies about what it can do."""
     def _probe(d):
         b = ArrayBackend(device=d)
         return {"spec": d, "device": b.name, "is_gpu": b.is_gpu,
                 "fft_provider": b.fft_provider}
     try:
-        infos = [_probe(d) for d in resolve_devices(config.DEVICE)]
-        choices = list(infos)
-        if not any(c["spec"] == "cpu" for c in choices):
-            choices.append(_probe("cpu"))
-        return {**infos[0], "devices": infos, "choices": choices,
+        pool = resolve_devices(config.DEVICE)
+        allowed = devices_allowed(config.DEVICE)
+        # probe each device ONCE: _probe builds a real ArrayBackend, and every
+        # pool device appears in both lists
+        probed = {d: _probe(d) for d in allowed}
+        infos = [probed[d] for d in pool]
+        return {**infos[0], "devices": infos,
+                "choices": [probed[d] for d in allowed],
                 "pool": config.DEVICE, "precision": config.PRECISION}
     except Exception as e:
         return {"device": "unavailable", "is_gpu": False,

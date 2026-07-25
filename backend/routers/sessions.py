@@ -17,7 +17,7 @@ from core import describe
 from core import session as sessions
 from core.potential import PotentialError, compile_potential
 from core.protocol import VARIANTS, SessionCreate
-from core.xp import resolve_devices
+from core.xp import devices_allowed, resolve_devices
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -70,9 +70,23 @@ async def create_session(cfg: SessionCreate, request: Request):
         # construction — and so this except cannot swallow an unrelated
         # ValueError raised later by the grid or the IC.
         try:
-            resolve_devices(cfg.device)
+            want = resolve_devices(cfg.device)
         except (ValueError, RuntimeError) as e:
             raise HTTPException(422, "device %r: %s" % (cfg.device, e))
+        # Existing-and-resolvable is not the same as allowed. Without this a
+        # host pinned to WIGNERF_DEVICE=cuda:1 (or to cpu, to keep its cards
+        # free for something else) could be overridden by any client that asked
+        # for another device, which makes the env var a suggestion rather than
+        # a policy. `allowed` is the exact list /api/device advertises as
+        # `choices`, so the Setup panel can never offer a device this refuses.
+        allowed = devices_allowed(config.DEVICE)
+        outside = [d for d in want if d not in allowed]
+        if outside:
+            raise HTTPException(
+                422, "device %r: %s not available to sessions on this host — "
+                "WIGNERF_DEVICE=%s allows %s"
+                % (cfg.device, ", ".join(outside), config.DEVICE,
+                   ", ".join(allowed)))
     s = sessions.create_session(
         cfg, cp, device=device,
         fft_threads=_fft_threads(len(cfg.variants)),

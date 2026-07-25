@@ -15,7 +15,12 @@ const emit = defineEmits<{
 const extent = computed(() => props.status?.record_extent ?? [-1, -1])
 
 // in-RAM history usage vs the WIGNERF_HISTORY_MB cap — the retained
-// (scrubbable) window IS this buffer, so the timeline is its natural home
+// (scrubbable) window IS this buffer, so the timeline is its natural home.
+// The DEVICES ride along: both are steady-state facts about the running
+// session, and this readout already costs a line that is drawn anyway. The
+// Setup panel used to repeat them in a standing "running on …, history cap …"
+// paragraph, which spent vertical space in a narrow column to say what is
+// visible here for free.
 const hist = computed(() => {
   const st = props.status
   if (!st || st.history_cap_bytes == null) return ''
@@ -23,7 +28,8 @@ const hist = computed(() => {
     const g = b / 2 ** 30
     return g >= 10 ? g.toFixed(0) : g >= 0.1 ? g.toFixed(1) : g.toFixed(2)
   }
-  return `hist ${gib(st.history_bytes)} / ${gib(st.history_cap_bytes)} GiB`
+  const dev = st.devices?.length ? `  ·  dev: ${st.devices.join(', ')}` : ''
+  return `hist ${gib(st.history_bytes)} / ${gib(st.history_cap_bytes)} GiB${dev}`
 })
 // Frame rate, polled off the perf counters. TWO numbers, because at large
 // grids they diverge and the difference is the point: painted/s is what the
@@ -88,7 +94,7 @@ function click(ev: MouseEvent) {
     <div class="absolute left-1 top-0 text-[11px] leading-4 font-medium text-neutral-300
                 tabular-nums [text-shadow:0_1px_2px_rgb(0_0_0/0.85)]"
          v-if="hist"
-         title="in-RAM frame history used / cap (WIGNERF_HISTORY_MB) — the oldest records evict when full, shrinking the scrubbable window">
+         title="in-RAM frame history used / cap (this session's history_mb, bounded by WIGNERF_HISTORY_MB) — the oldest records evict when full, shrinking the scrubbable window. dev: the device(s) this session's variant workers run on.">
       {{ hist }}
     </div>
   </div>

@@ -152,31 +152,80 @@ def test_pick_device_refuses_a_build_that_would_not_fit():
     assert pv._pick_device(1 << 40) is None
 
 
-def test_preview_releases_all_device_memory():
-    """The peak is 5.5 GiB at 8192^2, so it has to come back — and it only
-    does because _build_frame's device arrays die with its frame before
-    _release() runs (free_all_blocks frees only what is already FREE)."""
+def _gpu_preview_spec():
+    """The device a preview of CAT2 would pick, or a skip. Every test below
+    needs the same three guards."""
     cupy = pytest.importorskip("cupy")
     if cupy.cuda.runtime.getDeviceCount() == 0:
         pytest.skip("no CUDA device")
     import routers.preview as pv
-    if pv._pick_device(GRID["Nx"]*GRID["Np"]) is None:
+    spec = pv._pick_device(GRID["Nx"]*GRID["Np"])
+    if spec is None:
         pytest.skip("no CUDA device with room")
-    pool = cupy.get_default_memory_pool()
-    assert client.post("/api/preview/wigner", json=CAT2).status_code == 200
-    assert pool.used_bytes() == 0
-    assert pool.total_bytes() == 0
+    return cupy, pv, spec
+
+
+def test_preview_releases_all_device_memory():
+    """The peak is 5.5 GiB at 8192^2, so it has to come back — and it only
+    does because _build_frame's device arrays die with its frame before
+    _release() runs (free_all_blocks frees only what is already FREE).
+
+    Also: it comes back out of the preview's OWN pool. The default pool is
+    shared with every solver worker in the process, so releasing THAT one
+    handed their cached blocks back to the driver on every IC keystroke — the
+    opposite of what _pick_device's free-VRAM check is for. The seeded block
+    below stands in for a running worker's cache and must survive untouched."""
+    cupy, pv, spec = _gpu_preview_spec()
+    default = cupy.get_default_memory_pool()
+    with cupy.cuda.Device(int(spec.split(":")[1])):
+        cached = cupy.zeros((1 << 20,), dtype=cupy.float64)   # 8 MiB
+        del cached                       # now a FREE block in the DEFAULT pool
+        seeded = default.total_bytes()
+        assert seeded > 0, "the fixture failed to seed a cached block"
+        assert client.post("/api/preview/wigner", json=CAT2).status_code == 200
+        assert pv._pools[spec].used_bytes() == 0
+        assert pv._pools[spec].total_bytes() == 0
+        assert default.total_bytes() == seeded, \
+            "the preview evicted a worker's cached blocks"
+        default.free_all_blocks()
+
+
+def test_preview_releases_device_memory_when_the_build_fails():
+    """The path the CPU fallback exists for. While the exception propagates its
+    traceback still references _build_frame's frame — hence every device array
+    in it — so the release in the `finally` frees nothing, and a release inside
+    the `except` would not either (the exception is live for the whole
+    handler). Measured at 128 MiB: `finally` alone left all of it reserved.
+    Without the second release a preview that OOMs at 8192^2 parks GiB on the
+    card until the next SUCCESSFUL preview."""
+    cupy, pv, spec = _gpu_preview_spec()
+    saved = pv._build_frame
+
+    def allocate_then_fail(b, req):
+        if not b.is_gpu:
+            return saved(b, req)
+        # enter the device exactly as the real _build_frame does, or the block
+        # lands in another device's arena and the release looks like a pass
+        with b.device():
+            hold = b.xp.zeros((1 << 21,), dtype=b.xp.float64)   # 16 MiB
+            raise RuntimeError("simulated mid-build OOM, holding %d bytes"
+                               % hold.nbytes)
+
+    pv._build_frame = allocate_then_fail
+    try:
+        # the preview still comes back, on the CPU
+        assert client.post("/api/preview/wigner", json=CAT2).status_code == 200
+    finally:
+        pv._build_frame = saved
+    with cupy.cuda.Device(int(spec.split(":")[1])):
+        assert pv._pools[spec].used_bytes() == 0
+        assert pv._pools[spec].total_bytes() == 0
 
 
 def test_preview_gpu_and_cpu_agree():
     """Same frame and same diagnostics either way — the device is a speed
     choice, never a physics one."""
-    cupy = pytest.importorskip("cupy")
-    if cupy.cuda.runtime.getDeviceCount() == 0:
-        pytest.skip("no CUDA device")
-    import routers.preview as pv
-    if pv._pick_device(GRID["Nx"]*GRID["Np"]) is None:
-        pytest.skip("no CUDA device with room")
+    _cupy, pv, _spec = _gpu_preview_spec()
     gpu = client.post("/api/preview/wigner", json=CAT2)
     saved = pv._pick_device
     pv._pick_device = lambda cells: None

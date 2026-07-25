@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import Colorbar from './Colorbar.vue'
 import GridOverlay from './GridOverlay.vue'
 import type { Frame } from '../lib/protocol'
 import { variantName } from '../lib/protocol'
@@ -22,6 +23,11 @@ const props = defineProps<{
 
 const canvas = ref<HTMLCanvasElement | null>(null)
 const title = ref(props.label ?? '')
+// This panel's OWN colour range, for its overlaid colorbar. Per panel because
+// the renderer autoscales per frame from exactly these two numbers (q = [wmin,
+// wmax]), and the four variants drift apart as they evolve — see Colorbar.vue.
+const wmin = ref<number | null>(null)
+const wmax = ref<number | null>(null)
 const glError = ref('')
 const panning = ref(false)
 const renderer = new WignerRenderer()
@@ -87,6 +93,8 @@ onMounted(() => {
     const v = f.variants[props.variantIndex]
     if (!v) return
     if (!props.label) title.value = variantName(v.vid)
+    wmin.value = v.wmin
+    wmax.value = v.wmax
     renderer.upload(v, f.Nx, f.Np)
     renderer.render()
   })
@@ -122,6 +130,8 @@ onBeforeUnmount(() => {
     <div class="absolute top-1 left-2 text-xs text-white bg-black/75 px-1.5 py-0.5 rounded">
       {{ title }}
     </div>
+    <!-- this panel's own colour scale; overlaid, so it costs no drawing area -->
+    <Colorbar :min="wmin" :max="wmax" />
     <div v-if="glError" class="absolute inset-0 grid place-items-center text-red-400 text-sm p-4">
       {{ glError }}
     </div>

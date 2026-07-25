@@ -61,6 +61,42 @@ def test_bad_specs_rejected(monkeypatch):
         xp.resolve_devices("cuda:0")                 # cuda without cupy
 
 
+def test_bare_cuda_is_canonicalized(monkeypatch):
+    """A bare "cuda" means device 0 — ArrayBackend has always defaulted it that
+    way. It must come back CANONICAL, or devices_allowed's set membership
+    rejects a device the host actually offers."""
+    monkeypatch.setattr(xp, "_import_cupy", lambda: fake_cupy(TWO_GPUS))
+    assert xp.resolve_devices("cuda") == ["cuda:0"]
+    assert xp.resolve_devices("cuda:1,cuda") == ["cuda:1", "cuda:0"]
+    with pytest.raises(ValueError):
+        xp.resolve_devices("cuda,cuda:0")            # one device, named twice
+
+
+# -- devices_allowed ---------------------------------------------------------
+
+def test_allowed_is_the_pool_plus_cpu(monkeypatch):
+    """cpu is always a legal session target but never appears in an "auto" pool
+    on a CUDA host, so it is appended — and never duplicated when the pool
+    already names it."""
+    monkeypatch.setattr(xp, "_import_cupy", lambda: fake_cupy(TWO_GPUS))
+    assert xp.devices_allowed("auto") == ["cuda:1", "cuda:0", "cpu"]
+    assert xp.devices_allowed("cuda:0") == ["cuda:0", "cpu"]
+    assert xp.devices_allowed("cuda:1,cpu") == ["cuda:1", "cpu"]
+    assert xp.devices_allowed("cpu") == ["cpu"]
+
+
+def test_allowed_excludes_a_card_outside_the_pool(monkeypatch):
+    """The point of the whole helper: a host pinned to one card must not hand a
+    session the other one."""
+    monkeypatch.setattr(xp, "_import_cupy", lambda: fake_cupy(TWO_GPUS))
+    assert "cuda:0" not in xp.devices_allowed("cuda:1")
+
+
+def test_allowed_on_a_cpu_only_host(monkeypatch):
+    monkeypatch.setattr(xp, "_import_cupy", lambda: None)
+    assert xp.devices_allowed("auto") == ["cpu"]
+
+
 # -- assign_devices ----------------------------------------------------------
 
 def test_four_variants_two_gpus_rel_on_fast():

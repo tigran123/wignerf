@@ -1,6 +1,5 @@
 <script setup lang="ts">
-/** The diagnostics column: colorbar, marginals, E(t), ΔX·ΔP(t), purity γ(t). */
-import Colorbar from './Colorbar.vue'
+/** The diagnostics column: marginals, E(t), ΔX·ΔP(t), purity γ(t). */
 import MarginalsPlot from './MarginalsPlot.vue'
 import SeriesPlot from './SeriesPlot.vue'
 import type { Frame } from '../lib/protocol'
@@ -27,7 +26,11 @@ defineProps<{
     <div class="flex flex-col gap-2 transition-opacity"
          :class="batchComputing ? 'opacity-20 grayscale pointer-events-none' : ''"
          :title="batchComputing ? 'batch mode streams no frames while computing — press Play when done to review' : undefined">
-      <Colorbar :last-frame="lastFrame" />
+      <!-- The colour scale used to head this column. It has moved INTO each W
+           plot: it is a per-panel fact (every panel autoscales to its own
+           range) and one shared bar mislabelled the rest, and this is the
+           tallest of the three portrait columns, so a row spent here is a row
+           the panels start later by. See Colorbar.vue. -->
       <MarginalsPlot :key="'r' + plotsKey" :frame-source="frameSource"
                      :variants="variants" which="rho" :show-grid="showGrid"
                      :a1="grid.x1" :a2="grid.x2" :n="grid.Nx" />

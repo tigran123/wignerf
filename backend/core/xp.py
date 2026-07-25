@@ -58,9 +58,14 @@ def _gpu_speed_key(cupy, i):
 
 
 def resolve_devices(spec):
-    """Expand a WIGNERF_DEVICE spec into an ordered list of concrete device
+    """Expand a WIGNERF_DEVICE spec into an ordered list of CANONICAL device
     strings ("cuda:N" / "cpu"), fastest first. An explicit comma list is
-    trusted as written — its order is the speed ranking."""
+    trusted as written — its order is the speed ranking.
+
+    Canonical means a bare "cuda" comes back as "cuda:0". It used to be
+    returned verbatim, which worked only because ArrayBackend defaults the
+    index the same way — and would silently fail a set-membership test against
+    a pool of "cuda:N" strings (see devices_allowed)."""
     parts = [p.strip() for p in spec.split(",") if p.strip()]
     if not parts:
         raise ValueError("empty device spec %r" % spec)
@@ -74,8 +79,10 @@ def resolve_devices(spec):
         return ["cuda:%d" % i for i in order]
     if len(set(parts)) != len(parts):
         raise ValueError("duplicate devices in %r" % spec)
+    out = []
     for p in parts:
         if p == "cpu":
+            out.append(p)
             continue
         if p == "auto":
             raise ValueError("'auto' cannot appear in a device list")
@@ -87,7 +94,24 @@ def resolve_devices(spec):
         idx = int(p.split(":")[1]) if ":" in p else 0
         if idx >= cupy.cuda.runtime.getDeviceCount():
             raise RuntimeError("CUDA device %d does not exist" % idx)
-    return parts
+        out.append("cuda:%d" % idx)
+    if len(set(out)) != len(out):
+        # "cuda,cuda:0" survives the check above but names one device twice
+        raise ValueError("duplicate devices in %r" % spec)
+    return out
+
+
+def devices_allowed(pool_spec):
+    """The device specs a session may ASK for on this host: the pool, plus cpu.
+
+    cpu is always a legal target — a float64 sanity run, or keeping a session
+    off a card you need for something else — but `resolve_devices("auto")`
+    returns GPUs only on a CUDA host, so it would never appear in a list built
+    from the pool alone. routers/meta.py builds /api/device's `choices` from
+    this and routers/sessions.py validates against it, so what the Setup panel
+    offers and what the API accepts cannot drift apart."""
+    pool = resolve_devices(pool_spec)
+    return pool if "cpu" in pool else pool + ["cpu"]
 
 
 PRECISIONS = ("float64", "float32")

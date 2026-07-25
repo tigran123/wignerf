@@ -302,8 +302,12 @@ class VariantFrame:
     p_std: float
     purity: float          # gamma = 2*pi*hbar_eff * int W^2 dx dp
     dt: float
-    rho: numpy.ndarray     # float32/float64 (Nx,), natural order
-    phi: numpy.ndarray     # float32/float64 (Np,), natural order
+    # float64 (Nx,)/(Np,), natural order — in BOTH precision modes: the
+    # observable reductions accumulate and leave in double whatever the solver
+    # works in (see core/observables.py), which is what keeps history.py's byte
+    # accounting and the <f4 wire codec identical either way.
+    rho: numpy.ndarray
+    phi: numpy.ndarray
 
 
 @dataclass

@@ -76,6 +76,61 @@ describe('precision provenance', () => {
     m.resetToDefaults(cfg)
     expect(cfg.precision).toBe('float64')
   })
+
+  it('an IMPORTED precision counts as a choice, so it is sent', async () => {
+    // Otherwise the payload omits it, the session runs at the host default,
+    // and the form shows a float32 that never happened behind a "restart to
+    // apply" no restart can clear (status.precision never CHANGES, so the
+    // sync watcher never fires). This is the setup-document round trip.
+    const { m, cfg } = await load(undefined)
+    expect(m.precisionIsUserChosen()).toBe(false)
+    m.importConfig(cfg, { config: { ...BASE, precision: 'float32' } })
+    expect(cfg.precision).toBe('float32')
+    expect(m.precisionIsUserChosen()).toBe(true)
+    expect(m.precisionForPayload(cfg)).toBe('float32')
+  })
+
+  it('and still counts after "reset to defaults" un-chose it', async () => {
+    const { m, cfg } = await load({ ...BASE, precision: 'float64' })
+    m.resetToDefaults(cfg)                      // un-chooses, by design
+    m.importConfig(cfg, { config: { ...BASE, precision: 'float32' } })
+    expect(m.precisionForPayload(cfg)).toBe('float32')
+  })
+
+  it('an OLD file without the key leaves the host deciding', async () => {
+    const { m, cfg } = await load(undefined)
+    m.importConfig(cfg, { config: BASE })
+    expect(m.precisionIsUserChosen()).toBe(false)
+    expect(m.precisionForPayload(cfg)).toBeNull()
+  })
+})
+
+describe('precisionForPayload', () => {
+  it('omits an unchosen precision so the host decides', async () => {
+    const { m, cfg } = await load(undefined)
+    expect(m.precisionForPayload(cfg)).toBeNull()
+  })
+
+  it('sends a chosen one', async () => {
+    const { m, cfg } = await load({ ...BASE, precision: 'float32' })
+    expect(m.precisionForPayload(cfg)).toBe('float32')
+  })
+
+  it('sends float64 explicitly when auto-expand is on but unchosen', async () => {
+    // The float32-host + failed-/device-probe trap: deferring the precision
+    // while asking for auto-expand requests a pair the schema refuses, and
+    // every session create 422s. auto-expand IS a request for float64.
+    const { m, cfg } = await load({ ...BASE, auto_expand: true })
+    expect(m.precisionIsUserChosen()).toBe(false)
+    expect(cfg.auto_expand).toBe(true)
+    expect(m.precisionForPayload(cfg)).toBe('float64')
+  })
+
+  it('goes back to deferring once auto-expand is off', async () => {
+    const { m, cfg } = await load({ ...BASE, auto_expand: true })
+    cfg.auto_expand = false
+    expect(m.precisionForPayload(cfg)).toBeNull()
+  })
 })
 
 describe('float32 invariants', () => {
@@ -98,5 +153,24 @@ describe('float32 invariants', () => {
     const { m, cfg } = await load({ ...BASE, precision: 'float64', auto_expand: true })
     m.applyPrecisionInvariants(cfg)
     expect(cfg.auto_expand).toBe(true)
+  })
+
+  it('raises a sub-floor tol — the other combination the backend refuses', async () => {
+    // A stored tol of 1e-8 is perfectly good in float64 and unreachable in
+    // float32 (adjust_step's full-vs-two-half-steps residual has a ~7e-7
+    // roundoff floor there), so it 422s at create and is popped on the live
+    // path. The form must not be able to hold it.
+    const { m, cfg } = await load({ ...BASE, precision: 'float32', tol: 1e-8 })
+    expect(cfg.tol).toBe(m.TOL_MIN_F32)
+  })
+
+  it('leaves a tol at or above the floor untouched', async () => {
+    const { cfg } = await load({ ...BASE, precision: 'float32', tol: 0.01 })
+    expect(cfg.tol).toBe(0.01)
+  })
+
+  it('leaves a sub-floor tol alone in float64', async () => {
+    const { cfg } = await load({ ...BASE, precision: 'float64', tol: 1e-8 })
+    expect(cfg.tol).toBe(1e-8)
   })
 })

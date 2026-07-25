@@ -146,6 +146,13 @@ class FrameFigure:
     # fixed dpi would shrink all text to half its relative size at 4K).
     REF_WIDTH = 1920.0
 
+    # The metadata block: anchored here with va="top", so it grows DOWNWARD out
+    # of the strip the gridspecs leave below the plots (bottom=0.235).
+    META_TOP = 0.185
+    META_FONTSIZE = 8.0
+    META_LINESPACING = 1.6
+    META_MIN_FONTSIZE = 5.0    # below this it is decoration, not information
+
     def __init__(self, variants, stats, meta_lines, width=1920, height=1080,
                  show_grid=True):
         self.variants = list(variants)
@@ -257,13 +264,22 @@ class FrameFigure:
                                            color="#f472b6", lw=1.0, alpha=0.9))
         ax.set_xlabel("t (a.u.)", color=MUTED, fontsize=8)   # bottom plot only
 
-        # ---- metadata block: everything needed to reproduce the run
+        # ---- metadata block: everything needed to reproduce the run.
+        # It grows downward from a fixed anchor with nothing stopping it, so it
+        # used to run off the bottom of the figure in silence. Measured at 16:9
+        # (the figure is always 19.2x10.8 in — dpi carries the resolution):
+        # 11 lines fit, and a 4-variant cat run with 4 live parameter changes is
+        # already 10 in float64, 11 with the float32 PREVIEW line. Fit it
+        # instead of clipping it — one size for both columns so they stay
+        # visually matched.
         left, right = meta_lines
-        self.fig.text(0.012, 0.185, "\n".join(left), color=MUTED, fontsize=8,
-                      va="top", linespacing=1.6, family="DejaVu Sans")
-        self.fig.text(0.335, 0.185, "\n".join(right), color=MUTED,
-                      fontsize=8, va="top", linespacing=1.6,
-                      family="DejaVu Sans")
+        fs = self._meta_fontsize(max(len(left), len(right)))
+        left, right = self._meta_fit(left, fs), self._meta_fit(right, fs)
+        for x, col in ((0.012, left), (0.335, right)):
+            self.fig.text(x, self.META_TOP, "\n".join(col), color=MUTED,
+                          fontsize=fs, va="top",
+                          linespacing=self.META_LINESPACING,
+                          family="DejaVu Sans")
 
         self._geom = None
         self._xax = self._pax = numpy.zeros(0)
@@ -281,6 +297,34 @@ class FrameFigure:
         self._bg = self.canvas.copy_from_bbox(self.fig.bbox)
 
     # ------------------------------------------------------------------
+    def _meta_lines_that_fit(self, fontsize):
+        """How many lines of `fontsize` fit between META_TOP and the bottom
+        edge. Derived from the figure's own height rather than hard-coded, so a
+        non-16:9 export (a taller figure, hence more room) keeps the full
+        size instead of being shrunk to a 16:9 budget."""
+        advance = fontsize*self.META_LINESPACING/72.0        # inches
+        return int(self.META_TOP*self.fig.get_figheight()/advance)
+
+    def _meta_fontsize(self, nlines):
+        """The largest size at or below META_FONTSIZE that fits `nlines`,
+        floored at META_MIN_FONTSIZE (past which _meta_fit elides instead)."""
+        if nlines <= 0:
+            return self.META_FONTSIZE
+        budget = self.META_TOP*self.fig.get_figheight()*72.0/self.META_LINESPACING
+        return max(self.META_MIN_FONTSIZE,
+                   min(self.META_FONTSIZE, budget/nlines))
+
+    def _meta_fit(self, lines, fontsize):
+        """Truncate a column that does not fit even at the minimum size, and
+        SAY so — every one of these facts is also in the mp4's `comment` tag
+        (describe.config_json), so the pointer is real and not an apology."""
+        room = self._meta_lines_that_fit(fontsize)
+        if len(lines) <= room or room < 1:
+            return lines
+        return list(lines[:room - 1]) + [
+            "… +%d more lines — full detail in the mp4 comment tag"
+            % (len(lines) - room + 1)]
+
     def _rebuild_dynamic(self):
         """order IS draw order: the panel grid comes after the images so it
         stays visible over the heatmap, exactly as GridOverlay.vue sits above

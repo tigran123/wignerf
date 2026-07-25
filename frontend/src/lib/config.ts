@@ -108,11 +108,32 @@ export function precisionIsUserChosen() {
   return precisionWasStored
 }
 
-/** Call when the user actually operates the precision control — NOT for the
- *  programmatic adoptions (host probe, status sync), which must stay
- *  overridable by the server. */
+/** Call when the user actually operates the precision control, or when an
+ *  IMPORT supplies one — NOT for the programmatic adoptions (host probe,
+ *  status sync), which must stay overridable by the server. */
 export function markPrecisionChosen() {
   precisionWasStored = true
+}
+
+/**
+ * The `precision` to put in a create payload, or null to omit the field and let
+ * the host's WIGNERF_PRECISION decide.
+ *
+ * Omitting is the default and the point: it is the only way a float32 host can
+ * win when the SPA could not read its default, and a hard-coded float64 sent as
+ * though it were a decision is exactly how such a host got silently overridden.
+ *
+ * auto-expand is the exception. It is float64-only (the backend's
+ * MSG_EXPAND_F32: in single precision a contained state's own noise passes the
+ * edge trigger and the support scan reads the whole axis), so a form asking for
+ * it IS asking for float64 — say so rather than defer, or a float32 host plus
+ * this payload is a 422 the user never chose. Only reachable when the /device
+ * probe failed: a probe that succeeded has already cleared auto_expand through
+ * applyPrecisionInvariants.
+ */
+export function precisionForPayload(c: SimConfig): SimConfig['precision'] | null {
+  if (precisionWasStored || c.auto_expand) return c.precision
+  return null
 }
 
 /**
@@ -155,20 +176,37 @@ export function mergeConfig(target: SimConfig, s: unknown) {
 }
 
 /**
- * The backend refuses float32 + auto-expand (in single precision the edge
- * detector's noise floor is above its own trigger, and the support scan it
- * would size the new domain from is worse still). Reaching that combination
- * from a stale localStorage entry, an imported setup, or a host default
- * adopted AFTER the merge would leave Restart failing with a 422 the user
- * never chose — so drop the response and keep the precision.
+ * The float32 floor on the adaptive-step tolerance. Mirrors the backend's
+ * `core/protocol.py:TOL_MIN_F32`, which refuses anything below it at create AND
+ * on the live path: adjust_step compares one full step against two half steps,
+ * and in single precision that difference has a roundoff floor near 7e-7, so a
+ * smaller tol makes the controller shrink dt every 20 steps without ever
+ * converging. Move both sides together.
+ */
+export const TOL_MIN_F32 = 1e-5
+
+/**
+ * The two things float32 cannot do, applied to the config rather than argued
+ * with at Restart time. The backend refuses both combinations outright, so
+ * reaching one from a stale localStorage entry, an imported setup, or a host
+ * default adopted AFTER the merge would leave Restart failing with a 422 the
+ * user never chose:
  *
- * It lives here rather than only in the Setup panel's watcher because it is a
+ *  - auto-expand, because in single precision a contained state's own spectral
+ *    noise passes the 1e-6 edge trigger and the 1e-8 support scan it would size
+ *    the new domain from reads the whole axis;
+ *  - a tol below TOL_MIN_F32, for the reason recorded on that constant.
+ *
+ * It lives here rather than only in the Setup panel's watchers because it is a
  * property of the config, not of a mounted component: the panel can be hidden,
  * and the adoption path in SimulatorView.probeHost() sets precision from
- * outside it.
+ * outside it. Callers with a LIVE session must also tell it — see the
+ * cfg.precision watcher in SimulatorView, which cannot be done from here.
  */
 export function applyPrecisionInvariants(c: SimConfig) {
-  if (c.precision === 'float32') c.auto_expand = false
+  if (c.precision !== 'float32') return
+  c.auto_expand = false
+  if (!(c.tol >= TOL_MIN_F32)) c.tol = TOL_MIN_F32   // NaN-safe
 }
 
 /** Load the persisted setup (merged over defaults) — a hard reload must
@@ -213,6 +251,17 @@ export function importConfig(target: SimConfig, doc: unknown) {
       && !cfg.variants.some((v: string) => (ALL_KEYS as readonly string[]).includes(v)))
     throw new Error('no known variants in the file')
   mergeConfig(target, cfg)
+  // An imported document's precision IS a decision — it is the run someone
+  // exported, and reproducing it is the whole point of the setup document (and
+  // of the same JSON in an mp4's comment tag). Without this the payload omits
+  // the field, the session is built at the HOST default, and the form is left
+  // showing a float32 that never happened behind a "restart to apply" that no
+  // restart can resolve — status.precision never CHANGES, so SimulatorView's
+  // sync watcher never fires. Gated on the key being present, exactly as
+  // loadConfig gates on the stored blob: an older file has no precision, and
+  // marking THAT chosen would turn mergeConfig's deliberate "absent keys land
+  // on float64, the safe direction" into a decision overriding a float32 host.
+  if (cfg.precision != null) markPrecisionChosen()
 }
 
 export function saveConfig(c: SimConfig) {

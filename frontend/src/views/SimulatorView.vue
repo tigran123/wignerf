@@ -19,8 +19,9 @@ import PlotsColumn from '../components/PlotsColumn.vue'
 import SetupPanel from '../components/SetupPanel.vue'
 import Timeline from '../components/Timeline.vue'
 import { useSession } from '../composables/useSession'
-import { applyPrecisionInvariants, loadConfig, precisionIsUserChosen,
-         saveConfig, setHostPrecision } from '../lib/config'
+import { applyPrecisionInvariants, loadConfig, precisionForPayload,
+         precisionIsUserChosen, saveConfig, setHostPrecision } from '../lib/config'
+import { apiErrorText } from '../lib/apierror'
 import { displayInterval } from '../lib/perf'
 import { transportAction } from '../lib/transport'
 import { ALL_VARIANTS, VARIANT_META, type VariantKey } from '../lib/variants'
@@ -82,6 +83,16 @@ let unsub: (() => void) | null = null
 let userPaused = false     // survives a reconnect; see recover()
 
 function payload() {
+  // The form must be self-consistent BEFORE it is serialized, and this is the
+  // last place that can be guaranteed. The invariants are normally applied at
+  // the point of change, but a restart can happen in the SAME flush as the
+  // change that triggered it (the watcher below calls syncFreshSessionToForm,
+  // and it runs before the Setup panel's own watchers — a child's setup runs
+  // during the parent's render, so the parent's watchers flush first). A
+  // payload built from a half-fixed config asked for float32 + auto-expand and
+  // came back a 422 naming a pair the user never chose. Idempotent, so this
+  // costs nothing when the fix-up has already run.
+  applyPrecisionInvariants(cfg)
   const p: Record<string, unknown> = JSON.parse(JSON.stringify(cfg))
   if (cfg.mode === 'interactive') delete p.t2
   // '' / 0 are the form's way of saying "whatever the host is configured for";
@@ -90,12 +101,12 @@ function payload() {
   if (!cfg.device) delete p.device
   if (!cfg.history_mb) delete p.history_mb
   // Same idea, and load-bearing: until the user picks a precision, DON'T send
-  // one — let WIGNERF_PRECISION decide. cfg.precision is only a placeholder
-  // then, seeded from a probe that is allowed to fail; sending it as though it
-  // were a decision is how a hard-coded float64 would override a float32 host
-  // whenever GET /device was unreachable. The session's real precision comes
-  // back in `status` and the watcher below syncs the form to it.
-  if (!precisionIsUserChosen()) delete p.precision
+  // one — let WIGNERF_PRECISION decide (the one exception being auto-expand,
+  // which only float64 can provide; see precisionForPayload). The session's
+  // real precision comes back in `status` and the watcher below syncs the form.
+  const prec = precisionForPayload(cfg)
+  if (prec === null) delete p.precision
+  else p.precision = prec
   // delay 0 is the dial's "one frame per display refresh" position: the
   // server needs honest seconds, and a fresh session must not flood
   p.delay = Math.max(cfg.delay, displayInterval())
@@ -124,8 +135,7 @@ async function restart() {
                              p1: f.p1, p2: f.p2, Np: f.Np }
     })
   } catch (e: unknown) {
-    const err = e as { response?: { data?: { detail?: string } } }
-    createError.value = err.response?.data?.detail ?? String(e)
+    createError.value = apiErrorText(e)
   }
 }
 
@@ -227,7 +237,7 @@ function runKeyOf(mode: string, t2: number | null, record_dt: number,
 const formRunKey = () =>
   runKeyOf(cfg.mode, cfg.t2, cfg.record_dt, cfg.precision)
 
-// A run-defining field (mode / t₂ / Δτ rec) is SessionCreate-only. On a FRESH
+// A run-defining field (mode / t₂ / Δt rec) is SessionCreate-only. On a FRESH
 // session — connected, idle, nothing computed beyond the initial IC record —
 // silently adopt the change by re-creating the session, so switching e.g. to
 // interactive before you have computed anything just takes effect (no stale
@@ -296,6 +306,20 @@ watch(() => session.status.value?.precision, (v) => {
     cfg.precision = v
     applyPrecisionInvariants(cfg)
   }
+})
+// float32 forbids auto-expand, and applyPrecisionInvariants has already cleared
+// the FORM. Make the LIVE session agree, because nothing else can: the watcher
+// above cannot (status.auto_expand does not CHANGE, so it never fires), the
+// checkbox is disabled in float32, and auto_expand is not in LivePhysics so
+// there is no amber marker either — a session left quietly expanding behind an
+// unchecked, unreachable box. Keyed on PRECISION, not on cfg.auto_expand, so it
+// never duplicates the checkbox's own apply-live; that path leaves precision
+// alone. Covers the select, an import and probeHost's adoption in one place.
+// send() no-ops on a closed socket, so this is safe before a session exists.
+watch(() => cfg.precision, () => {
+  if (cfg.precision === 'float32' && session.status.value?.auto_expand
+      && session.connected.value)
+    applyLive({ auto_expand: false })
 })
 // Live parameter changes: the Physics fields apply on change (blur/Enter)
 // with no other confirmation anywhere, which reads as "nothing happened" —
@@ -455,6 +479,11 @@ const onPageHide = (e: PageTransitionEvent) => { if (!e.persisted) session.beaco
 // exists. A stored device this backend does not have stays in the list as a
 // flagged entry rather than silently disappearing — see SetupPanel.
 const deviceOptions = ref<{ spec: string; device: string }[] | null>(null)
+// The POOL, as distinct from the choices: what a session gets when the form's
+// device is '' (= "the host's default"). The Setup panel needs it to tell
+// whether a form device of '' still matches the RUNNING session's devices — a
+// restart-only field with no live counterpart to compare against otherwise.
+const hostPool = ref<string[] | null>(null)
 const historyCapMb = computed(() => {
   const b = session.status.value?.history_cap_bytes
   return b == null ? null : Math.round(b/(1024*1024))
@@ -483,9 +512,11 @@ const historyCapMb = computed(() => {
 async function probeHost() {
   try {
     const { data } = await api.get<{ choices: { spec: string; device: string }[]
+                                     devices?: { spec: string }[]
                                      precision?: string }>(
       '/device', { timeout: 5000 })
     deviceOptions.value = data.choices ?? []
+    hostPool.value = data.devices?.map((d) => d.spec) ?? null
     // Install the host's default so "Reset setup to defaults" agrees with the
     // server, and adopt it if this browser has never chosen a precision.
     setHostPrecision(data.precision)
@@ -619,7 +650,7 @@ onBeforeUnmount(() => {
                     :live-run="liveRun" :has-run="hasRun"
                     :max-grid="session.status.value?.max_grid ?? 4096"
                     :live-devices="session.status.value?.devices ?? null"
-                    :device-options="deviceOptions"
+                    :device-options="deviceOptions" :host-pool="hostPool"
                     :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
                     v-model:show-grid="showGrid"
                     @dirty="restartNeeded = true" @restart="requestRestart"
@@ -656,7 +687,7 @@ onBeforeUnmount(() => {
                     :live-run="liveRun" :has-run="hasRun"
                     :max-grid="session.status.value?.max_grid ?? 4096"
                     :live-devices="session.status.value?.devices ?? null"
-                    :device-options="deviceOptions"
+                    :device-options="deviceOptions" :host-pool="hostPool"
                     :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
                     v-model:show-grid="showGrid"
                       @dirty="restartNeeded = true" @restart="requestRestart"
