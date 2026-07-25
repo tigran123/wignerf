@@ -1,6 +1,8 @@
 """
-Frame quantization: float64 W -> uint16 + (Wmin, Wmax). Runs on the device
-(the cast happens before the PCIe download on GPU backends).
+Frame quantization: real W -> uint16 + (Wmin, Wmax). Runs on the device
+(the cast happens before the PCIe download on GPU backends). Dtype-agnostic:
+65535 levels need 16 bits, which float32 carries exactly, so a float32
+session quantizes to the same frame a float64 one would.
 """
 
 

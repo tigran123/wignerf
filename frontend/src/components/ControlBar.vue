@@ -157,22 +157,28 @@ function commitT() {
   const k = Math.min(Math.max(k0 + Math.round((tv - t0) / step), k0), k1)
   emit('command', { type: 'seek', record: k })
 }
-const eHa = computed(() => {
+/**
+ * Observables of the FIRST active variant, normalized across the two sources.
+ * Batch compute streams no frames, so `lastFrame` is stale or absent for the
+ * whole run — but the frontier record's scalars ride the progress report
+ * (which is already being sent), exactly as `t` does above. Without this the
+ * readouts sat at "—" while the series plots two panels away were live.
+ */
+const obs = computed<{ E: number; uncert: number; purity: number } | null>(() => {
+  if (batchComputing.value) {
+    const v = props.progress?.per_variant[0]
+    if (!v || v.E == null || v.x_std == null || v.p_std == null
+        || v.purity == null) return null
+    return { E: v.E, uncert: v.x_std*v.p_std, purity: v.purity }
+  }
   const v = props.lastFrame?.variants[0]
-  return v ? v.E.toPrecision(6) : '—'
+  return v ? { E: v.E, uncert: v.xStd*v.pStd, purity: v.purity } : null
 })
-const eEv = computed(() => {
-  const v = props.lastFrame?.variants[0]
-  return v ? (v.E*AU_ENERGY_EV).toFixed(3) : '—'
-})
-const uncert = computed(() => {
-  const v = props.lastFrame?.variants[0]
-  return v ? (v.xStd * v.pStd).toFixed(4) : '—'
-})
-const purity = computed(() => {
-  const v = props.lastFrame?.variants[0]
-  return v ? v.purity.toFixed(6) : '—'
-})
+const eHa = computed(() => obs.value ? obs.value.E.toPrecision(6) : '—')
+const eEv = computed(() =>
+  obs.value ? (obs.value.E*AU_ENERGY_EV).toFixed(3) : '—')
+const uncert = computed(() => obs.value ? obs.value.uncert.toFixed(4) : '—')
+const purity = computed(() => obs.value ? obs.value.purity.toFixed(6) : '—')
 const stepInfo = computed(() => {
   // Tag each variant with its device only when the pool actually has
   // more than one device — single-device setups keep the compact form.

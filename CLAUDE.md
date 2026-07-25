@@ -98,11 +98,14 @@ source) is what keeps startup fast. See `README.md`.
   ALWAYS on — every record, each worker sums the outer edge band of the
   ρ/φ marginals it already computed (host-side, O(Nx+Np), no extra device
   sync) and `session.report_edge` posts a `boundary` WS event on state
-  change (band = max(4, N/32) cells/side, trigger 1e-6 — expansion
+  change (band = max(4, N/32) cells/side, trigger 1e-6 in float64 and 1e-4
+  in float32 via `EDGE_THRESHOLD_BY_PRECISION` — expansion
   prevents wrap, it cannot repair it, so it must fire while edge mass is
   negligible). The `auto_expand` toggle (SessionCreate field AND
   live-appliable via ParamChange) governs only the RESPONSE: an exact
-  fixed-lattice regrid. dx/dp and the lattice anchor are FROZEN at session
+  fixed-lattice regrid. **It is refused outright in float32** — single
+  precision cannot supply the measurements it needs; see the float64/float32
+  gotcha for the numbers. dx/dp and the lattice anchor are FROZEN at session
   creation (`GridState`, integer window arithmetic; extents materialize as
   anchor + integer·dx, and `Grid` takes explicit dx/dp + anchors so overlap
   lattice points are bitwise-identical across regrids); move = whole-cell
@@ -238,8 +241,10 @@ source) is what keeps startup fast. See `README.md`.
   burst by up to seconds after a pause, and seeding the range from it
   silently exported half the history.
 - **Parameter policy**: U(x), c, mass, hbar_eff, tol, dt_sign, auto_expand
-  apply live at the frontier; grid/IC/variant-set changes require a session
-  restart (auto-expand moves the LIVE grid; the Setup panel shows it and
+  apply live at the frontier; grid/IC/variant-set and the whole COMPUTE group
+  (precision, device, history_mb — the Setup panel's third section) require a
+  session restart, because each of them is fixed at worker construction (FFT
+  plan dtype, `ArrayBackend` device, `FrameHistory` cap) (auto-expand moves the LIVE grid; the Setup panel shows it and
   offers "adopt" to copy it into the form).
   `apply_params` compares against what is LIVE and drops the fields that
   did not change — no worker command, no `param_log` entry, no
@@ -265,13 +270,20 @@ source) is what keeps startup fast. See `README.md`.
   computes flat-out until t2 and streams NO frames while computing — the
   heatmaps + marginals dim and the streamer sends only a throttled
   (`PROGRESS_PERIOD` = 0.25 s) JSON `progress` message (record, t, percent,
-  per-variant steps/s; ~300 bytes). This is for heavy runs where transferring
+  per-variant steps/s, AND the frontier record's per-variant observables —
+  E/x_std/p_std/purity; ~400 bytes). This is for heavy runs where transferring
   hundreds of MiB/record of live preview measurably slowed compute and hit the
   browser-receive ceiling; the progress report is ~1000× cheaper on the event
   loop and the workers are untouched. Batch's `status` carries `computing`
   (`running and not stop_at_frontier`) which drives the frontend dimming; the
   observable SERIES (E/ΔX·ΔP/γ) stay LIVE during batch compute because they
-  poll `GET /sessions/{id}/series` (cheap, frame-independent). Batch's live
+  poll `GET /sessions/{id}/series` (cheap, frame-independent), and so do the
+  control bar's numeric readouts, from the progress message above — that is
+  why the observables ride it. They cost nothing (the worker computed them at
+  emit; `history.get` returns references, no array copies) and without them the
+  bar read "—" for a whole batch run while the plots two panels away were live:
+  the same data on screen, just missing from the one place showing its CURRENT
+  value. Batch's live
   branch never sends a frame (computing OR paused-at-frontier) — you review a
   finished batch run via explicit playback (seek + sequential replay, which DO
   stream frames). Its t2 auto-stop is NOT delivery-gated (unlike playback):
@@ -325,7 +337,27 @@ RTX 3090: ~2400 steps/s at 512², ~550 at 1024², ~134 at 2048²; 2080 Ti:
 ~390 at 1024²; CPU (pyfftw): ~75 at 512². Measured 4-worker lockstep at
 1024²: 135 steps/s all-on-3090 vs 191 split 2+2 across the pair (+41%,
 and 2+2 beats 3+1's 181 — the even chunk is right); 2 workers: 270 vs
-376 (+39%). Previews always run on CPU by design. Workers release CuPy
+376 (+39%). **The IC preview runs on a GPU too, and hands the VRAM straight
+back** (`routers/preview.py`). It used to be CPU-only "to keep the GPU free
+for sessions", which was the right instinct and the wrong trade: the preview
+is built at the SESSION's grid, so at 8192² it is the same 67M-cell array the
+solver evolves — measured **25.9 s on the CPU vs 0.50 s on the 3090**, paid on
+every page reload AND every IC edit, while the main W panel showed the
+identical array in 1.4 s because a GPU worker built it. (That asymmetry is the
+tell if it ever regresses: big panel instant, small IC panel slow, and — since
+`preview.py` owns its own float64 CPU backend — identical at either session
+precision.) What matters is the transient PEAK, not the steady state:
+**88 bytes per grid cell** (0.34 GiB at 2048², 1.38 at 4096², 5.50 at 8192²;
+64 for one cat component, plateauing at 88 from three up, since `cat_wigner`
+reuses its temporaries per pair). So `_pick_device` takes the CUDA device with
+the most FREE VRAM and only if the build fits with 1.4× headroom — free memory
+as reported by the driver, which already accounts for running sessions and
+other processes — GPU previews are serialized (`_gpu_lock`) so two peaks cannot
+stack, and ANY failure (OOM above all, since a session can claim the card
+between the check and the build) falls back to the CPU, which is slow but
+always correct. The release works only because `_build_frame` keeps every
+device array in its own frame, so they die on return before `free_all_blocks()`
+— measured back to **0.000 GiB** after each call. Workers release CuPy
 pool blocks back to the driver on session close (nvidia-smi "used" while
 running is pool recycling, not a leak).
 
@@ -333,14 +365,15 @@ running is pool recycling, not a leak).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). |
+| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and the list of choices**; `SessionCreate.device` (Setup → Compute, restart-only) overrides it per session with any spec this host resolves — an unknown one is a 422, not a worker that dies on start. `GET /api/device` returns BOTH `devices` (the pool) and `choices` (the pool **plus cpu**), because CPU is always a legal target but never appears in an `auto` pool on a CUDA host; the Setup select is built from `choices`. |
 | `WIGNERF_PORT` | `8010` | Backend port (8000 belongs to urantia-library). Used by start.sh; `uvicorn --port` otherwise. |
-| `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. |
+| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster and ~58% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`'s `default_factory` — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing. **The SPA defers rather than guesses**: until the user operates the precision control the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. |
+| `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` (Setup → Compute) may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long 1440p exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
-| `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` encoder if a runtime probe succeeds (dedicated encoder block, ~3× faster at 4K, frees CPU for the render pool), else `libx264 -preset veryfast`. `cpu` forces libx264, `nvenc` forces the GPU. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to our rawvideo input). |
+| `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` encoder if a runtime probe succeeds (dedicated encoder block, ~3× faster at 4K, frees CPU for the render pool), else `libx264 -preset veryfast`. `cpu` forces libx264, `nvenc` forces the GPU. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to our rawvideo input). The host default; `ExportSpec.encoder` (the Export panel's encoder select) overrides it per JOB, which is the right granularity — the best choice depends on what else is competing for cores at that moment. |
 | `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering a frame (matplotlib/Agg) dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` (spawn, not fork: the backend has CUDA up) while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`) uses all of these; a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
-| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it (status carries `max_grid`). Lower it on VRAM-constrained hosts. Measured peak per variant worker: 160 MiB at 1024², 672 MiB at 2048², 2.7 GiB at 4096², 10.0 GiB at 8192² (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~5.4 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~20 GiB/card, which fits the 3090 and does NOT fit the 2080 Ti — cap by variant count, not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
+| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it (status carries `max_grid`). Lower it on VRAM-constrained hosts. Measured peak per variant worker: 160 MiB at 1024², 672 MiB at 2048², 2.7 GiB at 4096², 10.0 GiB at 8192² (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~5.4 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~20 GiB/card, which fits the 3090 and does NOT fit the 2080 Ti — cap by variant count, not just by grid. In a **float32** session those peaks fall to ~58% (measured arena: 448 MiB at 2048², 1.79 GiB at 4096², 7.0 GiB at 8192²), so 4 variants at 8192² is ~12 GiB/card at 2+2 — comfortable on the 3090, still too much for the 2080 Ti. float32 moves that line; it does not remove it. At the cap the session warns and keeps computing (moves still allowed). |
 
 ## Commands
 
@@ -352,8 +385,10 @@ cd backend && .venv/bin/pytest
 .venv/bin/uvicorn main:app --port 8010 --ws-per-message-deflate false &
 .venv/bin/python scripts/ws_smoke.py
 
-# throughput benchmark
+# throughput benchmark (add --precision both to reproduce the float32 speedup,
+# -N to sweep other grids)
 .venv/bin/python scripts/bench.py [cpu] [cuda:1]
+.venv/bin/python scripts/bench.py --precision both -N 1024,2048,4096 cuda:1
 
 # frontend: decoder golden test + typecheck + build
 cd frontend && npm run test && npm run build
@@ -425,23 +460,69 @@ grids) and the measured refresh interval.
   across threads; each worker owns its backend.
 - Relativistic variants: mc² cancels inside the propagator; observables
   subtract it from displayed E.
-- **The solver is float64 and stays float64 — this was measured, not
-  assumed.** float32 saves nothing where it looks like it would: the frame
-  history (`WIGNERF_HISTORY_MB`, the big RAM number) is already uint16 via
-  `core/quantize.py`, so the solver dtype buys zero extra records. float64
-  lives only in the per-worker device working set. And complex64 stepping
-  costs the diagnostics that this project navigates by: measured over 2000
-  steps at 256², Δpurity −2.4e-4 and ΔE +9.4e-4, both SECULAR — i.e. exactly
-  the boundary-wrap signature in the gotcha below, from a perfectly contained
-  state — with ΔX·ΔP noise of 1.3e-3, 150× the ~7e-6 relativistic shear that
-  `test_relativistic_uncertainty_shear` pins. (float64 for comparison:
-  +6.7e-13, bounded +4.2e-5, +5.1e-8.) Exponent construction could not be
-  float32 even in a mixed scheme: relativistic `dT` built in float32 has max
-  abs error 455 against max |dT| = 228 — 200% — because mc² cancels inside a
-  difference of ~1.9e4-magnitude terms. If throughput is ever the goal,
-  complex64 cuFFT is genuinely ~5× faster and could be an explicit opt-in
-  "preview" mode, but it must never be the default and never the setting a
-  physics claim is made from.
+- **The solver is float64 BY DEFAULT and float32 only when explicitly asked
+  — and the difference was measured, not assumed.** `SessionCreate.precision`
+  (`float64` | `float32`, host default `WIGNERF_PRECISION`) is restart-only and
+  picks the SPECTRAL working dtype. float32 must never be the default and never
+  the setting a physics claim is made from; the UI badges it permanently and
+  every exported mp4 says so on its own metadata line.
+  - **What it costs.** complex64 stepping destroys the diagnostics this project
+    navigates by: over 2000 steps at 256², Δpurity −2.4e-4 and ΔE +9.4e-4, both
+    SECULAR — exactly the boundary-wrap signature in the gotcha below, from a
+    perfectly contained state — with ΔX·ΔP noise of 1.3e-3, 150× the ~7e-6
+    relativistic shear that `test_relativistic_uncertainty_shear` pins. (float64
+    for comparison: +6.7e-13, bounded +4.2e-5, +5.1e-8.)
+  - **What it buys, measured 2026-07-25 with `scripts/bench.py --precision both`
+    on the real propagator, RTX 3090: 3.84× at 1024², 3.39× at 2048², 3.29× at
+    4096².** NOT the "~5×" this file used to quote, and there is no "4.8×" —
+    reproduce it from the repo rather than citing a session log. The 2080 Ti
+    lands in the same 3.3-3.7× band. **On CPU it buys nothing**: pyFFTW through
+    the `builders` API `fft_pair` actually uses measures 6.01 ms (c128) vs
+    5.80 ms (c64) at 1024². This is a CUDA feature.
+  - **It is a MIXED scheme, and that is not a compromise — it is required and
+    it is free.** Only the spectral working array and the exponent PHASES are
+    single; the grid meshes, both `qd()` evaluations, `dU_im`/`dT_im` and `H`
+    stay float64. Required, because relativistic `dT` built in float32 has max
+    abs error 455 against max |dT| = 228 (200%: mc² cancels inside a difference
+    of ~1.9e4-magnitude terms) — and because keeping construction double is what
+    lets `_rate_mesh`'s 1e-13 gate and the frozen-lattice regrid arithmetic stay
+    exact with no dtype-scaled tolerances anywhere. Free, because the FFTs are
+    the cost: mixed measures 3.72/3.62/3.22× against 3.80/3.69/3.27× for float32
+    everywhere. `test_precision.py` asserts the rate meshes are BITWISE
+    identical between the two modes, relativistic variants included.
+  - **Two failure modes are invisible in results, so they are pinned by DTYPE
+    assertions.** A complex64 array handed to a complex128 pyFFTW plan is
+    silently upcast by `auto_align_input` (correct answer, complex128 speed);
+    and `B *= expT` with B complex64 and expT complex128 is legal in both numpy
+    and cupy (correct answer, via a full complex128 temporary). No physics
+    assertion can catch either. Hence `fft_pair` takes an explicit dtype and
+    `exponents()` casts.
+  - **Memory drops to ~58%, not 50%** — `dU_im`/`dT_im`/`H` stay float64 and are
+    irreducible (24 B/cell = 1.5 GiB at 8192²). Measured per-worker CuPy arena
+    on the 3090: 768 → 448 MiB at 2048², 3072 → 1792 MiB at 4096², 12.0 → 7.0
+    GiB at 8192². Note the frame history is NOT affected: it is already uint16
+    via `core/quantize.py`, so `WIGNERF_HISTORY_MB` buys the same record count
+    either way.
+  - **float32 REFUSES auto-expand, and `tol` below 1e-5** (`protocol.py`
+    `MSG_EXPAND_F32` / `MSG_TOL_F32`, enforced at create AND on the live
+    ParamChange path, because both fields are reachable live). Auto-expand,
+    because single-precision noise passes its own detector: measured at 256²
+    with a coherent state parked at the ORIGIN (true band mass ~1e-15), edge
+    mass climbs 1.8e-15 → 6.1e-7 (step 200) → 1.6e-6 (step 600, TRIGGERED),
+    while the 1e-8 support scan reads the WHOLE axis by step 200 against an
+    exact [43, 214) in float64 — so the planner would size a new domain from
+    noise. Detection still WARNS, on a raised threshold
+    (`boundary.EDGE_THRESHOLD_BY_PRECISION`, 1e-4 for float32; at that band
+    mass the mass actually at the seam is still ~1e-6, so it remains an early
+    warning). `tol`, because `adjust_step`'s full-step-vs-two-half-steps
+    residual has a measured float32 floor of ~7.4e-7 (flat in dt, and larger at
+    larger grids) against 1.6e-15 in float64 — below that the controller shrinks
+    dt through all 15 tries every 20 steps and never converges.
+  - **Do NOT "optimize" `exponents()` by casting the ANGLE instead of the
+    result.** `exp(1j*θ).astype(complex64)` is safe for any finite θ because the
+    modulus is 1; `exp(1j*θ.astype(float32))` is NaN for θ ~ 1e91, which a steep
+    U on the extended Bopp range reaches at large grids — and `worker._finite`
+    checks the float64 rate meshes, so nothing would see it.
 - The exponent generators dU, dT are EXACTLY purely imaginary (max|Re| = 0
   in all four variants), so they are stored as the real rate meshes
   `dU_im`/`dT_im` and `exponents()` rebuilds the phase — half the bytes,

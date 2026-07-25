@@ -9,7 +9,7 @@ instance. Units are Hartree atomic units (hbar = m_e = e = 1); c is a
 parameter (C_AU by default, c=1 reproduces the old natural-unit runs) and
 hbar_eff scales the quantum differential for classical-limit studies.
 
-State convention: W is (Nx, Np) float64, fftshifted along both axes.
+State convention: W is (Nx, Np) real, fftshifted along both axes.
 One step is the Strang splitting expT * expU * expT where dT already
 carries the factor 1/2 (exactly as in solve.py).
 
@@ -23,6 +23,23 @@ as the real angular-rate meshes dU_im, dT_im (the generator being 1j times
 them) — half the device bytes of the complex128 arrays they replace, and
 exponents() reproduces the old phases bitwise. _rate_mesh refuses a generator
 with a real part rather than let it silently break norm stability.
+
+PRECISION. The backend's complex_dtype ("float64" -> complex128, the default;
+"float32" -> complex64, the opt-in preview mode) applies to exactly two things:
+the spectral working array B in solve_spectral, and the phase arrays exponents()
+hands it. Everything the exponents are BUILT from — the grid meshes, the two
+qd() evaluations of U, the dU_im/dT_im rate meshes, H — stays float64 in both
+modes. That split is not a compromise, it is the whole design:
+
+  - it is REQUIRED. Relativistic dT built in float32 has max abs error 455
+    against max |dT| = 228 (200%), because mc^2 cancels inside a difference of
+    ~1.9e4-magnitude terms. Keeping construction double also keeps _rate_mesh's
+    1e-13 real-part gate and the frozen-lattice regrid arithmetic exact, so
+    neither needs a dtype-scaled tolerance.
+  - and it is FREE. Measured on an RTX 3090, 2026-07-25: mixed (float64
+    construction, complex64 stepping) runs at 3.72x/3.62x/3.22x the double
+    speed at 1024^2/2048^2/4096^2, against 3.80x/3.69x/3.27x for float32
+    everywhere. The FFTs are the cost; the meshes are built once per rebuild().
 """
 
 import logging
@@ -51,6 +68,7 @@ class Propagator:
         self.U = U
         self.dUdx = dUdx
 
+        self.cdtype = self.backend.complex_dtype
         self._fft0, self._ifft0 = self.backend.fft_pair((grid.Nx, grid.Np), axis=0)
         self._fft1, self._ifft1 = self.backend.fft_pair((grid.Nx, grid.Np), axis=1)
         self.rebuild()
@@ -147,15 +165,30 @@ class Propagator:
     def exponents(self, dt):
         """exp(1j*dt*w) for the real rate meshes — bitwise what exp(dt*1j*w)
         gave when the generators were stored complex (exp of a zero real part
-        is exactly 1.0, so the phase is untouched)."""
+        is exactly 1.0, so the phase is untouched).
+
+        The phase is always COMPUTED in double (dU_im/dT_im are float64) and
+        then rounded to the working dtype. The cast is not optional in float32
+        mode: `B *= expT` with B complex64 and expT complex128 is silently
+        legal in both numpy and cupy, yielding a correct complex64 B via a full
+        complex128 temporary — right answer, double the exponent-slot bytes,
+        most of the speedup gone, and nothing in the physics to reveal it."""
         xp = self.xp
-        return xp.exp(1j*(dt*self.dU_im)), xp.exp(1j*(dt*self.dT_im))
+        # copy=False: xp.exp already returns a fresh complex128 mesh, so in
+        # float64 mode the cast must be a no-op. Without it astype copies
+        # regardless — 1 GiB allocated and 2.5 ms burned per mesh at 8192^2,
+        # twice per call, in the DEFAULT precision, to produce the array we
+        # already had.
+        return (xp.exp(1j*(dt*self.dU_im)).astype(self.cdtype, copy=False),
+                xp.exp(1j*(dt*self.dT_im)).astype(self.cdtype, copy=False))
 
     def solve_spectral(self, W, expU, expT):
         """One Strang step (solve.py:130-140). W in shifted order; returns a
-        fresh real array (never a view into an FFT plan buffer)."""
+        fresh real array (never a view into an FFT plan buffer). The result's
+        dtype follows the working precision, so W is float32 from the first
+        step of a float32 session."""
         xp = self.xp
-        B = xp.asarray(W, dtype=xp.complex128)
+        B = xp.asarray(W, dtype=self.cdtype)
         B = self._fft0(B)   # (x,p) -> (lambda,p)
         B *= expT
         B = self._ifft0(B)  # (lambda,p) -> (x,p)
@@ -179,7 +212,11 @@ class Propagator:
             W1 = self.solve_spectral(W, expU, expT)
             expUn, expTn = self.exponents(0.5*dt)
             W2 = self.solve_spectral(self.solve_spectral(W, expUn, expTn), expUn, expTn)
-            rel = float(xp.sum(xp.abs(W1 - W2))/xp.sum(xp.abs(W1)))
+            # float64 accumulators: a no-op in double mode, but in float32 mode
+            # these are sums over up to 16.7M elements and the controller's
+            # decision must not be roundoff.
+            rel = float(xp.sum(xp.abs(W1 - W2), dtype=xp.float64)
+                        / xp.sum(xp.abs(W1), dtype=xp.float64))
             if rel < self.tol:
                 break
             if tries > maxtries:

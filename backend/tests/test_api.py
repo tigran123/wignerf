@@ -89,3 +89,114 @@ def test_wigner_preview_mixture_requires_sigma_p():
         "components": [{"x0": 0.0, "p0": 0.0, "sigma_x": 0.5}],
     })
     assert r.status_code == 422
+
+
+# -- Wigner preview device selection -------------------------------------
+#
+# The preview is built at the SESSION's grid, so at 8192^2 it is the same
+# 67M-cell array the solver evolves — 25.9 s on the CPU against 0.50 s on an
+# RTX 3090, on every reload AND every IC edit, while the main W panel showed
+# the identical array in 1.4 s because a GPU worker built it. It now runs on a
+# GPU when one has room and gives the VRAM straight back. These tests pin the
+# parts that must hold with or without CUDA.
+
+CAT2 = {"type": "cat", "grid": GRID,
+        "components": [{"x0": -2.0, "p0": 0.0, "sigma_x": 0.5},
+                       {"x0": 2.0, "p0": 0.0, "sigma_x": 0.5}]}
+
+
+def test_preview_falls_back_to_cpu_when_the_device_path_fails():
+    """A device that vanishes between the free-memory check and the build (a
+    session claiming the card, an OOM, a driver hiccup) must still produce a
+    preview — slower, never a 500. Naming a device that cannot exist drives
+    the same path without needing CUDA."""
+    import routers.preview as pv
+    saved = pv._pick_device
+    pv._pick_device = lambda cells: "cuda:99"
+    try:
+        r = client.post("/api/preview/wigner", json=CAT2)
+        assert r.status_code == 200
+        assert _decode(r).variants[0].wmin < 0        # a real cat frame
+    finally:
+        pv._pick_device = saved
+
+
+def test_preview_bad_ic_is_422_not_a_cpu_retry():
+    """A malformed IC is not a device problem: it must 422 from the GPU path
+    rather than fall through and be rebuilt on the CPU just to fail again."""
+    import routers.preview as pv
+    calls = []
+    saved_build, saved_pick = pv._build_frame, pv._pick_device
+    pv._pick_device = lambda cells: "cpu"       # _backend("cpu") always works
+
+    def counting(b, req):
+        calls.append(b)
+        return saved_build(b, req)
+
+    pv._build_frame = counting
+    try:
+        r = client.post("/api/preview/wigner", json={
+            "type": "mixture", "grid": GRID,
+            "components": [{"x0": 0.0, "p0": 0.0, "sigma_x": 0.5}]})
+        assert r.status_code == 422
+        assert len(calls) == 1, "the IC error was retried on the CPU"
+    finally:
+        pv._build_frame, pv._pick_device = saved_build, saved_pick
+
+
+def test_pick_device_refuses_a_build_that_would_not_fit():
+    """The guard is free VRAM, so a grid too large for any card falls to the
+    CPU instead of OOMing a running solver. 2^20 cells per axis is beyond any
+    GPU made; on a CPU-only host this returns None for every size anyway."""
+    import routers.preview as pv
+    assert pv._pick_device(1 << 40) is None
+
+
+def test_preview_releases_all_device_memory():
+    """The peak is 5.5 GiB at 8192^2, so it has to come back — and it only
+    does because _build_frame's device arrays die with its frame before
+    _release() runs (free_all_blocks frees only what is already FREE)."""
+    cupy = pytest.importorskip("cupy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("no CUDA device")
+    import routers.preview as pv
+    if pv._pick_device(GRID["Nx"]*GRID["Np"]) is None:
+        pytest.skip("no CUDA device with room")
+    pool = cupy.get_default_memory_pool()
+    assert client.post("/api/preview/wigner", json=CAT2).status_code == 200
+    assert pool.used_bytes() == 0
+    assert pool.total_bytes() == 0
+
+
+def test_preview_gpu_and_cpu_agree():
+    """Same frame and same diagnostics either way — the device is a speed
+    choice, never a physics one."""
+    cupy = pytest.importorskip("cupy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("no CUDA device")
+    import routers.preview as pv
+    if pv._pick_device(GRID["Nx"]*GRID["Np"]) is None:
+        pytest.skip("no CUDA device with room")
+    gpu = client.post("/api/preview/wigner", json=CAT2)
+    saved = pv._pick_device
+    pv._pick_device = lambda cells: None
+    try:
+        cpu = client.post("/api/preview/wigner", json=CAT2)
+    finally:
+        pv._pick_device = saved
+    assert gpu.status_code == cpu.status_code == 200
+    # The QUANTIZED frame is bitwise identical — that is the strong statement,
+    # and it is what the panel draws.
+    g, c = _decode(gpu).variants[0], _decode(cpu).variants[0]
+    assert np.array_equal(g.wq, c.wq)
+    assert g.purity == pytest.approx(c.purity, rel=1e-9)
+    # The same warnings fire (qualitative, so exact).
+    assert gpu.headers["X-Wignerf-Warnings"] == cpu.headers["X-Wignerf-Warnings"]
+    # The norm deficit is a global sum, so cuFFT's reduction order and numpy's
+    # pairwise summation disagree in the last digits — measured 4.463e-13 vs
+    # 4.461e-13. Both are machine noise; asserting the printed STRING would be
+    # pinning the summation order, not the physics.
+    dg = float(gpu.headers["X-Wignerf-Norm-Deficit"])
+    dc = float(cpu.headers["X-Wignerf-Norm-Deficit"])
+    assert dg < 1e-9 and dc < 1e-9
+    assert dg == pytest.approx(dc, rel=1e-3)

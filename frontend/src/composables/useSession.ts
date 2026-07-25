@@ -82,6 +82,10 @@ export interface SessionStatus {
   grid: GridCfg
   auto_expand: boolean
   max_grid: number
+  // restart-only, so this is the run's own precision — the header badges
+  // 'float32' because every diagnostic on screen is preview-grade in it
+  precision: 'float64' | 'float32'
+  history_mb_max: number
   boundary: BoundaryState
   per_variant: VariantStatus[]
 }
@@ -111,7 +115,12 @@ export interface ProgressEvent {
   t1: number
   t2: number
   percent: number
-  per_variant: { variant: string; steps_per_sec: number; steps_total: number }[]
+  // the frontier record's observables ride along (free — the worker already
+  // computed them), so the control bar's E / ΔX·ΔP / γ stay live through a
+  // batch run that streams no frames. Absent until the first record lands.
+  per_variant: { variant: string; steps_per_sec: number; steps_total: number
+                 E?: number; x_std?: number; p_std?: number
+                 purity?: number }[]
 }
 
 export interface SessionInfo {

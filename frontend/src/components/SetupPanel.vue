@@ -4,10 +4,10 @@
  * grid geometry + grid-lines display toggle, run mode. The IC editor is a
  * separate component so the portrait layout can place it in its own column.
  */
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import PotentialEditor from './PotentialEditor.vue'
-import { resetToDefaults, type GridCfg, type LivePhysics,
-         type LiveRun, type SimConfig } from '../lib/config'
+import { markPrecisionChosen, resetToDefaults, type GridCfg,
+         type LivePhysics, type LiveRun, type SimConfig } from '../lib/config'
 
 const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
                             liveGrid?: GridCfg | null; maxGrid?: number
@@ -15,7 +15,15 @@ const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
                             liveRun?: LiveRun | null
                             // true once the session has COMPUTED records — before
                             // that there is no meaningful "run mode" to diverge from
-                            hasRun?: boolean }>()
+                            hasRun?: boolean
+                            // host facts for the Compute section: the resolved
+                            // device pool of the RUNNING session, the pool this
+                            // backend offers, and the history cap it granted
+                            // against the ceiling it enforces
+                            liveDevices?: string[] | null
+                            deviceOptions?: { spec: string; device: string }[] | null
+                            historyCapMb?: number | null
+                            historyMbMax?: number | null }>()
 
 /**
  * RUN fields are SessionCreate-only, so editing one changes NOTHING about the
@@ -40,7 +48,34 @@ function runDiffers(field: keyof LiveRun) {
   return (lr[field] ?? null) !== (props.cfg[field] ?? null)
 }
 const runStale = computed(() =>
-  (['mode', 't2', 'record_dt'] as const).some(runDiffers))
+  (['mode', 't2', 'record_dt', 'precision'] as const).some(runDiffers))
+
+// The backend refuses float32 + auto-expand: in single precision a contained
+// state's own spectral noise passes the 1e-6 edge trigger within a few hundred
+// steps and the 1e-8 support scan reads the whole axis, so the domain would
+// double for no physical reason. Say that where the checkbox is, and clear the
+// checkbox rather than let Restart fail with a 422.
+const f32 = computed(() => props.cfg.precision === 'float32')
+watch(f32, (on) => { if (on && props.cfg.auto_expand) props.cfg.auto_expand = false })
+
+/** 0 means "the host's default"; anything else is a real cap the API bounds at
+ *  64 MiB. Snap the dead zone between them here rather than let Restart come
+ *  back with a schema error about a field the form let you type. */
+function clampHistory() {
+  const v = props.cfg.history_mb
+  if (!Number.isFinite(v) || v <= 0) props.cfg.history_mb = 0
+  else if (v < 64) props.cfg.history_mb = 64
+  else if (props.historyMbMax && v > props.historyMbMax)
+    props.cfg.history_mb = props.historyMbMax
+}
+
+// A device this backend does not offer (a setup file carried over from the
+// workstation to the VPS, a stored 'cuda:1' after a card is pulled) must stay
+// visible and named rather than silently reverting to the default — the run
+// would then quietly land somewhere else.
+const deviceMissing = computed(() =>
+  !!props.cfg.device && !!props.deviceOptions
+  && !props.deviceOptions.some((d) => d.spec === props.cfg.device))
 
 /** Physics fields apply on `@change` (blur/Enter), so a typed-but-not-yet-
  *  committed value is otherwise invisible — mark it, and say so in the note
@@ -164,7 +199,8 @@ function adoptLive() {
                own t₂ (2026-07-23: a run "in batch t₂=100" was really the
                old interactive session, and computed straight past t=100). -->
           m, c, ℏ, tol, t dir and auto-expand apply live at the frontier;
-          grid, IC, variants and RUN (mode, t₂, Δt rec) need a restart.
+          grid, IC, variants, RUN (mode, t₂, Δt rec) and COMPUTE
+          (precision, device, history) need a restart.
         </template>
       </p>
     </section>
@@ -198,12 +234,19 @@ function adoptLive() {
             <option v-for="n in sizeOptions" :key="n" :value="n">{{ n }}</option>
           </select>
         </label>
-        <label class="flex items-center gap-1 col-span-2 cursor-pointer select-none"
+        <label class="flex items-center gap-1 col-span-2 select-none"
+               :class="f32 ? 'cursor-not-allowed' : 'cursor-pointer'"
                title="when W(x,p,t) approaches a domain edge, move or double the domain automatically at the frontier (exact — the lattice spacing is frozen, values are never interpolated). Applies live; detection and its warning run either way.">
-          <input type="checkbox" v-model="props.cfg.auto_expand"
+          <input type="checkbox" v-model="props.cfg.auto_expand" :disabled="f32"
                  @change="emit('apply-live', { auto_expand: props.cfg.auto_expand })" />
-          <span class="text-neutral-400">auto-expand domain</span>
+          <span :class="f32 ? 'text-neutral-600' : 'text-neutral-400'">auto-expand domain</span>
         </label>
+        <!-- never a bare disabled control: say why, here, not in a tooltip -->
+        <p v-if="f32" class="col-span-2 text-xs text-neutral-500 -mt-0.5">
+          unavailable in float32: a contained state's own single-precision noise
+          passes the edge trigger within a few hundred steps, so the domain would
+          double for no physical reason. Detection still warns you.
+        </p>
         <label class="flex items-center gap-1 col-span-2 cursor-pointer select-none"
                title="axis grid lines on all plots, the W panels and the IC preview">
           <input type="checkbox" v-model="showGrid" />
@@ -252,7 +295,66 @@ function adoptLive() {
       <p v-if="runStale" class="text-xs text-amber-400">
         running: {{ liveRun!.mode === 'batch'
                     ? `batch, t₂ = ${liveRun!.t2}` : 'interactive (no t₂)' }},
-        Δτ rec = {{ liveRun!.record_dt }} — restart to apply the values above
+        Δτ rec = {{ liveRun!.record_dt }}, {{ liveRun!.precision }}
+        — restart to apply the values above
+      </p>
+    </section>
+
+    <section class="space-y-1.5">
+      <h3 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Compute</h3>
+      <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
+        <label class="flex items-center gap-1 col-span-2"
+               title="spectral working precision. float64 is the physics setting. float32 is a PREVIEW mode: ~3.3-3.8× faster and ~58% of the VRAM on CUDA (no speedup on CPU), but purity and energy drift by ~1e-4 with the same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the relativistic shear. The exponents are built in double either way.">
+          <span class="w-14 text-neutral-500">precision</span>
+          <!-- markPrecisionChosen: until the user operates THIS control the
+               form only holds a placeholder and the create payload omits
+               precision so the host's WIGNERF_PRECISION decides. Operating it
+               is the decision, and from here on it is sent explicitly. -->
+          <select v-model="props.cfg.precision" class="wf-num"
+                  :class="runDiffers('precision') ? 'text-amber-400' : ''"
+                  @change="markPrecisionChosen()">
+            <option value="float64">float64</option>
+            <option value="float32">float32</option>
+          </select>
+        </label>
+        <!-- Only while the choice is PENDING. Once the session is actually
+             running in float32 the header badge carries it permanently, and
+             two standing warnings for one fact is one too many. -->
+        <p v-if="f32 && runDiffers('precision')"
+           class="col-span-2 text-xs text-amber-400/90 -mt-0.5">
+          single precision mode
+        </p>
+        <label class="flex items-center gap-1 col-span-2"
+               title="which device(s) this session's variant workers run on. Default spreads them over the host's whole WIGNERF_DEVICE pool, costliest variant to the fastest card; pick one device to keep a session off a card you need for something else.">
+          <span class="w-14 text-neutral-500">device</span>
+          <select v-model="props.cfg.device" class="wf-num flex-1" @change="emit('dirty')">
+            <option value="">default (host pool)</option>
+            <option v-for="d in props.deviceOptions ?? []" :key="d.spec" :value="d.spec">
+              {{ d.device }}
+            </option>
+            <option v-if="deviceMissing" :value="props.cfg.device">
+              {{ props.cfg.device }} — not on this server
+            </option>
+          </select>
+        </label>
+        <p v-if="deviceMissing" class="col-span-2 text-xs text-amber-400">
+          this backend has no {{ props.cfg.device }} — Restart will be refused
+          until you pick another.
+        </p>
+        <label class="flex items-center gap-1 col-span-2"
+               title="in-RAM frame history for this session (scrub/replay depth). 0 = the host's WIGNERF_HISTORY_MB, which is also the ceiling — a session can ask for less, never more.">
+          <span class="w-14 text-neutral-500">history</span>
+          <input v-model.number.lazy="props.cfg.history_mb" type="number" step="64" min="0"
+                 :max="props.historyMbMax ?? undefined" class="wf-num"
+                 @change="clampHistory(); emit('dirty')" />
+          <span class="text-neutral-500">MiB
+            <template v-if="props.historyMbMax">(0 = host max {{ props.historyMbMax }})</template>
+          </span>
+        </label>
+      </div>
+      <p v-if="props.liveDevices?.length" class="text-xs text-neutral-500">
+        running on {{ props.liveDevices.join(', ') }}<template
+          v-if="props.historyCapMb">, history cap {{ props.historyCapMb }} MiB</template>
       </p>
       <button class="w-full py-1.5 rounded bg-sky-800 hover:bg-sky-700 font-medium"
               @click="emit('restart')">Restart session</button>

@@ -14,6 +14,11 @@ concrete device.
   "cpu"           - NumPy; FFT provider chain: pyfftw -> scipy.fft -> numpy.fft.
   "cuda:N"        - CuPy on CUDA device N.
   "cuda:1,cuda:0" - explicit pool; the written order IS the speed ranking.
+
+A backend also carries the SPECTRAL working precision ("float64" default,
+"float32" for the opt-in preview mode). It governs complex_dtype and the FFT
+plan dtype and nothing else: every array the propagator's exponents are BUILT
+from stays float64 either way.
 """
 
 from contextlib import nullcontext
@@ -85,9 +90,25 @@ def resolve_devices(spec):
     return parts
 
 
+PRECISIONS = ("float64", "float32")
+
+
 class ArrayBackend:
-    def __init__(self, device="auto", fft_threads=1):
+    def __init__(self, device="auto", fft_threads=1, precision="float64"):
         self.fft_threads = max(1, int(fft_threads))
+        if precision not in PRECISIONS:
+            raise ValueError("unknown precision %r (expected one of %s)"
+                             % (precision, ", ".join(PRECISIONS)))
+        self.precision = precision
+        # The SPECTRAL working dtype only. Everything that CONSTRUCTS the
+        # propagator's exponents (the grid meshes, the Bopp/qd evaluation,
+        # the dU_im/dT_im rate meshes, H) stays float64 in both modes — see
+        # the Propagator docstring for why that is not negotiable and why it
+        # is also free.
+        self.complex_dtype = (numpy.complex64 if precision == "float32"
+                              else numpy.complex128)
+        self.real_dtype = (numpy.float32 if precision == "float32"
+                           else numpy.float64)
         self.xp = numpy
         self.is_gpu = False
         self.device_index = None
@@ -157,10 +178,21 @@ class ArrayBackend:
 
     # -- FFT plan factory --------------------------------------------------
 
-    def fft_pair(self, shape, axis):
-        """Return (fft, ifft) callables for complex128 arrays of the given
-        shape along the given axis. pyFFTW plans/buffers are owned by this
-        backend instance and must not be called from two threads at once."""
+    def fft_pair(self, shape, axis, dtype=None):
+        """Return (fft, ifft) callables for complex arrays of the given shape
+        along the given axis, in this backend's complex_dtype unless `dtype`
+        overrides it. pyFFTW plans/buffers are owned by this backend instance
+        and must not be called from two threads at once.
+
+        The dtype is NOT cosmetic. A pyFFTW builder is planned for one dtype:
+        hand a complex64 array to a complex128 plan and auto_align_input
+        silently copies it up, returning a correct complex128 result with the
+        whole point of single precision quietly gone. The other three providers
+        dispatch on the INPUT dtype and hold no plan to get wrong: cupy, scipy
+        and — since numpy 2.0 added native single-precision transforms —
+        numpy.fft all return complex64 for complex64 (verified against the
+        pinned numpy 2.5.1), so they ignore the argument by construction."""
+        dtype = numpy.dtype(dtype or self.complex_dtype)
         if self.fft_provider == "cupy":
             xp = self.xp
             return (lambda a: xp.fft.fft(a, axis=axis),
@@ -171,9 +203,9 @@ class ArrayBackend:
                       planner_effort="FFTW_ESTIMATE",
                       overwrite_input=False, auto_align_input=True,
                       auto_contiguous=True, avoid_copy=False)
-            a = pyfftw.empty_aligned(shape, dtype="complex128")
+            a = pyfftw.empty_aligned(shape, dtype=dtype)
             fwd = pyfftw.builders.fft(a, **kw)
-            b = pyfftw.empty_aligned(shape, dtype="complex128")
+            b = pyfftw.empty_aligned(shape, dtype=dtype)
             bwd = pyfftw.builders.ifft(b, **kw)
             return fwd, bwd
         if self.fft_provider == "scipy":

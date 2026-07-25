@@ -42,6 +42,15 @@ export interface SimConfig {
   // boundary watch response: detection always runs server-side; this only
   // decides whether the domain auto-moves/doubles (live-toggleable)
   auto_expand: boolean
+  // Spectral working precision. float32 is an explicit PREVIEW mode: ~3.3-3.8x
+  // faster and ~58% of the working set on CUDA, at the cost of the diagnostics
+  // (purity/energy drift ~1e-4). Restart-only, and refused together with
+  // auto_expand — see the backend's protocol.MSG_EXPAND_F32.
+  precision: 'float64' | 'float32'
+  // Per-session overrides of the host's defaults. '' / 0 mean "use the host's"
+  // (WIGNERF_DEVICE / WIGNERF_HISTORY_MB); payload() strips them.
+  device: string
+  history_mb: number
 }
 
 /** The subset of SimConfig that applies LIVE (status reports it back): the
@@ -53,14 +62,58 @@ export type LivePhysics = Pick<SimConfig,
  *  These are SessionCreate-only (absent from ParamChange), so a form value
  *  that differs from these is not pending — it is inert until a restart, and
  *  the panel marks it amber to say so. */
-export type LiveRun = Pick<SimConfig, 'mode' | 'record_dt'>
+export type LiveRun = Pick<SimConfig, 'mode' | 'record_dt' | 'precision'>
   // t2 is NULL in interactive mode — not merely absent. A form t2 sitting
   // beside a live null is the exact mismatch this type exists to expose, so
   // it must not be narrowed to SimConfig's `number`.
   & { t2: number | null }
+  // `precision` is here for the same reason as `mode`, with a worse payload.
+  // The 2026-07-23 incident was a run believed to be "batch, t₂=100" that was
+  // really the previous interactive session; a form reading float64 over a
+  // session actually computing in float32 is that trap carrying a physics
+  // claim — the E/ΔX·ΔP/purity curves on screen would be preview-grade and
+  // nothing would say so.
 
 const STORAGE_KEY = 'wignerf.cfg'
 const ALL_KEYS = ['qn', 'qr', 'cn', 'cr'] as const
+
+/**
+ * The HOST's default precision (WIGNERF_PRECISION, reported by GET /device).
+ * The form cannot know it synchronously — `loadConfig()` runs at module setup,
+ * long before any request — so it starts at the safe value and the view
+ * installs the real one when the probe returns. `defaultConfig()` reads it, so
+ * "Reset setup to defaults" restores the HOST's default rather than a literal
+ * that would silently disagree with the server on a float32 host.
+ */
+let hostPrecision: SimConfig['precision'] = 'float64'
+let precisionWasStored = false
+
+export function setHostPrecision(p: unknown) {
+  if (p === 'float64' || p === 'float32') hostPrecision = p
+}
+
+/**
+ * Whether the precision in the form is the USER's choice rather than a
+ * placeholder. False on a first-ever load (and for a setup stored before the
+ * field existed), true once they pick one — or once a stored config carries
+ * it, so someone who deliberately chose float64 on a float32 host is not
+ * overridden on every reload.
+ *
+ * This is what decides whether `precision` is SENT at all. An unchosen form
+ * omits it, which is the only way the host's WIGNERF_PRECISION can win when
+ * the SPA could not read it: the probe can fail, and a hard-coded float64 sent
+ * as though it were a decision would silently override a float32 host.
+ */
+export function precisionIsUserChosen() {
+  return precisionWasStored
+}
+
+/** Call when the user actually operates the precision control — NOT for the
+ *  programmatic adoptions (host probe, status sync), which must stay
+ *  overridable by the server. */
+export function markPrecisionChosen() {
+  precisionWasStored = true
+}
 
 /**
  * Merge a loosely-typed config (localStorage, an imported setup file, an
@@ -80,9 +133,12 @@ export function mergeConfig(target: SimConfig, s: unknown) {
                                 ...src.ic.components.map(
                                   (c: Record<string, unknown>) => ({ ...c })))
   }
+  // An older setup file or mp4 has no `precision` key; absent keys are
+  // skipped, so an import of one lands on float64 — the safe direction.
   for (const k of ['potential', 'mass', 'c', 'hbar_eff', 'tol',
                    'record_dt', 'delay', 'mode', 't2',
-                   'auto_expand'] as const) {
+                   'auto_expand', 'precision', 'device',
+                   'history_mb'] as const) {
     if (k in src && src[k] != null)
       (target as unknown as Record<string, unknown>)[k] = src[k]
   }
@@ -95,6 +151,24 @@ export function mergeConfig(target: SimConfig, s: unknown) {
   // imported setup so it is not rejected by the backend's mode literal.
   if ((target as unknown as Record<string, unknown>).mode === 'runahead')
     target.mode = 'batch'
+  applyPrecisionInvariants(target)
+}
+
+/**
+ * The backend refuses float32 + auto-expand (in single precision the edge
+ * detector's noise floor is above its own trigger, and the support scan it
+ * would size the new domain from is worse still). Reaching that combination
+ * from a stale localStorage entry, an imported setup, or a host default
+ * adopted AFTER the merge would leave Restart failing with a 422 the user
+ * never chose — so drop the response and keep the precision.
+ *
+ * It lives here rather than only in the Setup panel's watcher because it is a
+ * property of the config, not of a mounted component: the panel can be hidden,
+ * and the adoption path in SimulatorView.probeHost() sets precision from
+ * outside it.
+ */
+export function applyPrecisionInvariants(c: SimConfig) {
+  if (c.precision === 'float32') c.auto_expand = false
 }
 
 /** Load the persisted setup (merged over defaults) — a hard reload must
@@ -103,7 +177,9 @@ export function mergeConfig(target: SimConfig, s: unknown) {
 export function loadConfig(): SimConfig {
   const d = defaultConfig()
   try {
-    mergeConfig(d, JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null'))
+    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
+    precisionWasStored = !!raw && typeof raw === 'object' && raw.precision != null
+    mergeConfig(d, raw)
   } catch { /* corrupted storage -> defaults */ }
   return d
 }
@@ -163,6 +239,12 @@ export function resetToDefaults(c: SimConfig) {
   c.mode = d.mode
   c.t2 = d.t2
   c.auto_expand = d.auto_expand
+  c.precision = d.precision
+  c.device = d.device
+  c.history_mb = d.history_mb
+  // "reset to defaults" un-chooses: the form goes back to deferring to the
+  // host, which is what the default IS.
+  precisionWasStored = false
 }
 
 export function defaultConfig(): SimConfig {
@@ -188,5 +270,8 @@ export function defaultConfig(): SimConfig {
     mode: 'interactive',
     t2: 20.0,
     auto_expand: false,
+    precision: hostPrecision,   // the host's WIGNERF_PRECISION once probed
+    device: '',             // '' = the host's WIGNERF_DEVICE pool
+    history_mb: 0,          // 0 = the host's WIGNERF_HISTORY_MB
   }
 }

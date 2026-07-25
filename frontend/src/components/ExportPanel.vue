@@ -60,19 +60,30 @@ interface ExportForm {
   // changes over time and a stale index would silently pick another size
   width: number
   variants: VariantKey[]
+  // '' = the host's WIGNERF_EXPORT_ENCODER. Per JOB, not per session: the
+  // right choice depends on what else is running, since nvenc's real benefit
+  // is freeing CPU cores for the parallel frame RENDER (the bottleneck).
+  encoder: '' | 'auto' | 'cpu' | 'nvenc'
 }
+
+const ENCODERS = [
+  { value: '', label: 'default (host)' },
+  { value: 'nvenc', label: 'GPU (h264_nvenc)' },
+  { value: 'cpu', label: 'CPU (libx264)' },
+] as const
 
 const STORAGE_KEY = 'wignerf.export'
 
 function loadForm(): ExportForm {
   const d: ExportForm = { k0: 0, k1: 0, stride: 1, fps: 30, width: 1920,
-                          variants: [...props.variants] }
+                          variants: [...props.variants], encoder: '' }
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
     if (s && typeof s === 'object') {
       for (const k of ['stride', 'fps'] as const)
         if (typeof s[k] === 'number') d[k] = s[k]
       if (RESOLUTIONS.some((r) => r.width === s.width)) d.width = s.width
+      if (ENCODERS.some((e) => e.value === s.encoder)) d.encoder = s.encoder
     }
   } catch { /* corrupted storage -> defaults */ }
   return d
@@ -83,9 +94,10 @@ const resolution = computed(() =>
   RESOLUTIONS.find((r) => r.width === form.width) ?? RESOLUTIONS[0])
 // the RANGE is never persisted (it belongs to this session's history), only
 // the encoding preferences
-watch(() => [form.stride, form.fps, form.width], () => {
+watch(() => [form.stride, form.fps, form.width, form.encoder], () => {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(
-    { stride: form.stride, fps: form.fps, width: form.width }))
+    { stride: form.stride, fps: form.fps, width: form.width,
+      encoder: form.encoder }))
 })
 
 const open = ref(false)
@@ -233,7 +245,8 @@ async function start() {
       `/sessions/${props.sessionId}/export`,
       { k0: form.k0, k1: form.k1, stride: form.stride, fps: form.fps,
         width: r.width, height: r.height, variants: form.variants,
-        show_grid: props.showGrid })
+        show_grid: props.showGrid,
+        ...(form.encoder ? { encoder: form.encoder } : {}) })
     job.value = data
     startPoll(data.job_id)
   } catch (e: unknown) {
@@ -422,6 +435,17 @@ onBeforeUnmount(() => clearInterval(poll))
                        export to take about four times as long as FHD">
           <option v-for="r in RESOLUTIONS" :key="r.label" :value="r.width">
             {{ r.label }}
+          </option>
+        </select>
+
+        <span class="text-neutral-500">encoder</span>
+        <select v-model="form.encoder" class="wf-num w-40"
+                title="the bottleneck is rendering the frames, not encoding them,
+                       so this mostly decides how many CPU cores are left for the
+                       render pool. Default probes for a working h264_nvenc and
+                       falls back to libx264.">
+          <option v-for="e in ENCODERS" :key="e.value" :value="e.value">
+            {{ e.label }}
           </option>
         </select>
 

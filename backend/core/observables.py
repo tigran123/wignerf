@@ -2,6 +2,13 @@
 Observables of a propagator state: norm, marginals, energy and phase-space
 moments. All reductions run on the device; only the results cross to the
 host. Input W is in the propagator's fftshifted order.
+
+Every reduction accumulates in float64 and every result LEAVES in float64,
+whatever the solver's working precision. In double mode that is what already
+happened; in a float32 session it is what keeps E/purity/moments worth reading
+(these are sums over up to 16.7M elements) and what keeps rho/phi identical in
+dtype to before — history.py's byte accounting and the wire's <f4 codec then
+behave the same in both modes.
 """
 
 from dataclasses import dataclass
@@ -26,18 +33,19 @@ class Observables:
 def _base(W, grid, hbar_eff):
     b = grid.backend
     xp = b.xp
+    f8 = xp.float64
     dxdp = grid.dx*grid.dp
-    Xm = float(xp.sum(grid.X*W))*dxdp
-    X2 = float(xp.sum(grid.X**2*W))*dxdp
-    Pm = float(xp.sum(grid.P*W))*dxdp
-    P2 = float(xp.sum(grid.P**2*W))*dxdp
+    Xm = float(xp.sum(grid.X*W, dtype=f8))*dxdp
+    X2 = float(xp.sum(grid.X**2*W, dtype=f8))*dxdp
+    Pm = float(xp.sum(grid.P*W, dtype=f8))*dxdp
+    P2 = float(xp.sum(grid.P**2*W, dtype=f8))*dxdp
     return dict(
-        norm=float(xp.sum(W))*dxdp,
+        norm=float(xp.sum(W, dtype=f8))*dxdp,
         x_mean=Xm, x_std=float(numpy.sqrt(abs(X2 - Xm*Xm))),
         p_mean=Pm, p_std=float(numpy.sqrt(abs(P2 - Pm*Pm))),
-        purity=2.*pi*float(hbar_eff)*float(xp.sum(W*W))*dxdp,
-        rho=b.asnumpy(b.ifftshift(xp.sum(W, axis=1)))*grid.dp,
-        phi=b.asnumpy(b.ifftshift(xp.sum(W, axis=0)))*grid.dx,
+        purity=2.*pi*float(hbar_eff)*float(xp.sum(W*W, dtype=f8))*dxdp,
+        rho=b.asnumpy(b.ifftshift(xp.sum(W, axis=1, dtype=f8)))*grid.dp,
+        phi=b.asnumpy(b.ifftshift(xp.sum(W, axis=0, dtype=f8)))*grid.dx,
     )
 
 
@@ -45,7 +53,9 @@ def compute(W, prop):
     """Full observables for a propagator state (uses its H and rest energy)."""
     g = prop.grid
     d = _base(W, g, prop.hbar_eff)
-    E = float(g.backend.xp.sum(prop.H*W))*g.dx*g.dp - prop.rest_energy*d["norm"]
+    xp = g.backend.xp
+    E = float(xp.sum(prop.H*W, dtype=xp.float64))*g.dx*g.dp \
+        - prop.rest_energy*d["norm"]
     return Observables(E=E, **d)
 
 

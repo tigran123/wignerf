@@ -37,6 +37,7 @@ from typing import Annotated, Literal, Optional, Union
 import numpy
 from pydantic import BaseModel, Field, model_validator
 
+import config
 from .xp import C_AU
 
 MAGIC = 0x57
@@ -112,6 +113,36 @@ class ICSpec(BaseModel):
     components: list[ICComponent] = Field(min_length=1, max_length=8)
 
 
+# adjust_step shrinks |dt| until one full step and two half steps agree to a
+# RELATIVE tol. In complex64 that difference has a roundoff floor near 1e-7, so
+# a smaller tol is unreachable: the controller would burn all 15 shrink attempts
+# every 20 steps, drive dt to nothing, and hand back a run slower than the
+# float64 one it was chosen to beat. Refuse the combination instead of silently
+# stalling — the fix is either a larger tol or float64, and the user must pick.
+TOL_MIN_F32 = 1e-5
+MSG_TOL_F32 = ("tol = %g is below the float32 roundoff floor: the adaptive step "
+               "controller compares a full step against two half steps, which "
+               "in single precision agree only to ~7e-7 (measured at 256², and "
+               "larger at larger grids), so it would shrink dt without ever "
+               "converging. Use tol >= 1e-5, or precision float64.")
+
+# Auto-expand needs measurements a float32 run cannot supply. Its 1e-6 edge
+# trigger and its 1e-8 support scan both sit BELOW the spectral noise of a
+# perfectly contained float32 state (measured 2026-07-25 at 256²: edge mass
+# 1.6e-6 and a support scan covering the whole axis by step 600, against
+# 1.5e-15 and an exact [43, 214) in float64 — see core/boundary.py). The
+# detector's own warning survives on a raised threshold; the exact regrid does
+# not, because it would size the new window from noise. Refuse rather than
+# expand a domain for no reason.
+MSG_EXPAND_F32 = (
+    "auto-expand is not available in float32: it fires on edge-band mass at "
+    "1e-6 and sizes the new domain from a 1e-8 support scan, and a contained "
+    "float32 state's own spectral noise exceeds both within a few hundred "
+    "steps, so the domain would double for no physical reason. Boundary "
+    "DETECTION still runs (at a raised threshold) and will warn you. Use "
+    "precision float64 to auto-expand, or size the domain by hand.")
+
+
 class SessionCreate(BaseModel):
     grid: GridSpec
     potential: str
@@ -130,6 +161,26 @@ class SessionCreate(BaseModel):
     auto_expand: bool = False
     delay: float = Field(default=0.0, ge=0)  # seconds injected between played-back
                                              # frames; 0 = as fast as the client renders
+    # Spectral working precision. float32 is an explicit PREVIEW mode: ~3.3-3.8x
+    # faster and ~58% of the working set on CUDA, at the cost of the diagnostics
+    # this project navigates by (secular purity/energy drift ~1e-4, uncertainty
+    # noise 150x the relativistic shear). Restart-only — it decides the FFT plan
+    # dtype at worker construction — and never inferred, always chosen.
+    #
+    # The default is the HOST's WIGNERF_PRECISION, not a literal: a hard-coded
+    # "float64" here made that env var decorative — `/api/device` advertised it
+    # while every session that omitted the field silently ran float64.
+    # default_factory (not a module-level constant) so a test or an embedder
+    # that patches config.PRECISION is honoured, and validate_default so a bad
+    # value is caught here as well as in config._precision().
+    precision: Literal["float64", "float32"] = Field(
+        default_factory=lambda: config.PRECISION, validate_default=True)
+    # Per-session overrides of the host defaults. None = use the host's
+    # (WIGNERF_DEVICE / WIGNERF_HISTORY_MB). A session may NARROW the host's
+    # policy, never widen it: history_mb is clamped to the host ceiling, and an
+    # unavailable device is a 422 (see routers/sessions.py).
+    device: Optional[str] = Field(default=None, max_length=200)
+    history_mb: Optional[int] = Field(default=None, ge=64)
 
     @model_validator(mode="after")
     def _check(self):
@@ -144,6 +195,10 @@ class SessionCreate(BaseModel):
             raise ValueError("mass = 0 requires exclusively relativistic "
                              "variants (non-relativistic T = p²/2m "
                              "diverges)")
+        if self.precision == "float32" and self.tol < TOL_MIN_F32:
+            raise ValueError(MSG_TOL_F32 % self.tol)
+        if self.precision == "float32" and self.auto_expand:
+            raise ValueError(MSG_EXPAND_F32)
         return self
 
 
@@ -163,6 +218,10 @@ class ExportSpec(BaseModel):
     # wignerf.grid, default on) — one setting for every plot in the frame,
     # W heatmaps included
     show_grid: bool = True
+    # None = the host's WIGNERF_EXPORT_ENCODER. Per-JOB, not per-session: the
+    # right choice depends on what else is running (nvenc frees cores for the
+    # render pool, which is the actual bottleneck).
+    encoder: Optional[Literal["auto", "cpu", "nvenc"]] = None
 
     @model_validator(mode="after")
     def _check(self):

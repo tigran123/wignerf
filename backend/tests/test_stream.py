@@ -613,6 +613,17 @@ def test_batch_starts_paused_and_stops_at_t2():
                     saw_progress = True
                     max_pct = max(max_pct, d["percent"])
                     assert d["t2"] == 0.5
+                    # The frontier record's observables ride the progress
+                    # report — batch streams no frames, so without them the
+                    # control bar's E / ΔX·ΔP / γ read "—" for the whole run
+                    # while the series plots beside them are live. Free: the
+                    # worker already computed them and history.get returns
+                    # references. Only once a record exists (record 0 is the
+                    # Cauchy data, so that is immediately).
+                    if d["record"] >= 0:
+                        v = d["per_variant"][0]
+                        assert {"E", "x_std", "p_std", "purity"} <= set(v), v
+                        assert v["purity"] > 0.9 and v["E"] > 0.0
                 elif d["type"] == "status" and not d["running"] and saw_progress:
                     done = True
                     break

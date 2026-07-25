@@ -369,7 +369,7 @@ class ExportJob(threading.Thread):
 
     def _spawn_ffmpeg(self):
         cfg = self.session.cfg
-        enc = choose_encoder()
+        enc = choose_encoder(self.spec.encoder)
         comment = describe.config_json(
             cfg, self.session.param_log, at_record=self.k0,
             export={"records": [self.k0, self.k1], "stride": self.spec.stride,

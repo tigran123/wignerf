@@ -38,7 +38,7 @@ from . import boundary, videoexport
 from .grid import GridState
 from .history import FrameHistory
 from .potential import PotentialError, compile_potential
-from .protocol import VARIANTS
+from .protocol import MSG_EXPAND_F32, MSG_TOL_F32, TOL_MIN_F32, VARIANTS
 from .worker import SolverWorker
 from .xp import resolve_devices
 
@@ -265,7 +265,7 @@ class SessionClock:
 
 class SimSession:
     def __init__(self, cfg, compiled_potential, loop, device, fft_threads,
-                 history_bytes, max_grid=4096):
+                 history_bytes, max_grid=4096, history_mb_max=None):
         self.id = uuid.uuid4().hex[:12]
         self.cfg = cfg
         self.compiled_potential = compiled_potential
@@ -279,6 +279,10 @@ class SimSession:
         # toggleable like tol (session-level policy, no worker involvement)
         self.auto_expand = cfg.auto_expand
         self.max_grid = int(max_grid)
+        # the host's history ceiling, reported so the Setup panel can bound its
+        # own field the way max_grid bounds the Nx/Np selects
+        self.history_mb_max = int(history_mb_max if history_mb_max is not None
+                                  else history_bytes//(1024*1024))
         self._edge_lock = threading.Lock()
         self._edge = {}              # slot -> latest EdgeState
         self._edge_posted = []       # axes signature of the last boundary msg
@@ -494,6 +498,26 @@ class SimSession:
             diff(f, getattr(change, f), getattr(self.cfg, f))
         diff("dt_sign", change.dt_sign, self.clock.sign)
         diff("auto_expand", change.auto_expand, self.auto_expand)
+        # tol is live-changeable, so the float32 floor SessionCreate enforces
+        # has to be enforced here too — otherwise the one combination the
+        # schema refuses is reachable in two clicks, and the symptom (a run
+        # that grinds to a halt with dt shrinking every 20 steps) looks like a
+        # solver bug rather than a setting.
+        if "tol" in new and self.cfg.precision == "float32" \
+           and new["tol"] < TOL_MIN_F32:
+            self.post_msg({"type": "error", "code": "bad_tol",
+                           "message": MSG_TOL_F32 % new["tol"]})
+            new.pop("tol")
+            old.pop("tol")
+        # auto_expand is live-toggleable, so the schema's float32 refusal is
+        # otherwise two clicks away — and the failure it prevents (a domain
+        # doubling on nothing but roundoff) is one the user would read as the
+        # solver going wrong, not as a setting they were allowed to pick.
+        if new.get("auto_expand") and self.cfg.precision == "float32":
+            self.post_msg({"type": "error", "code": "bad_auto_expand",
+                           "message": MSG_EXPAND_F32})
+            new.pop("auto_expand")
+            old.pop("auto_expand")
         if not new:
             return
         if "U" not in new:
@@ -613,6 +637,10 @@ class SimSession:
                      "p1": gs.p1, "p2": gs.p2, "Np": gs.Np},
             "auto_expand": self.auto_expand,
             "max_grid": self.max_grid,
+            # restart-only, so this is the run's own precision, not a live
+            # value that can drift from the form. The SPA badges float32.
+            "precision": self.cfg.precision,
+            "history_mb_max": self.history_mb_max,
             "boundary": self.boundary_state,
             "per_variant": [{"variant": w.key, "dt": w.dt,
                              "device": w.device,
@@ -653,10 +681,11 @@ class SimSession:
 
 
 def create_session(cfg, compiled_potential, device, fft_threads, history_bytes,
-                   max_grid=4096):
+                   max_grid=4096, history_mb_max=None):
     loop = asyncio.get_running_loop()
     s = SimSession(cfg, compiled_potential, loop, device, fft_threads,
-                   history_bytes, max_grid=max_grid)
+                   history_bytes, max_grid=max_grid,
+                   history_mb_max=history_mb_max)
     with _LOCK:
         SESSIONS[s.id] = s
     s.start()

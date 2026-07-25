@@ -19,7 +19,8 @@ import PlotsColumn from '../components/PlotsColumn.vue'
 import SetupPanel from '../components/SetupPanel.vue'
 import Timeline from '../components/Timeline.vue'
 import { useSession } from '../composables/useSession'
-import { loadConfig, saveConfig } from '../lib/config'
+import { applyPrecisionInvariants, loadConfig, precisionIsUserChosen,
+         saveConfig, setHostPrecision } from '../lib/config'
 import { displayInterval } from '../lib/perf'
 import { transportAction } from '../lib/transport'
 import { ALL_VARIANTS, VARIANT_META, type VariantKey } from '../lib/variants'
@@ -83,6 +84,18 @@ let userPaused = false     // survives a reconnect; see recover()
 function payload() {
   const p: Record<string, unknown> = JSON.parse(JSON.stringify(cfg))
   if (cfg.mode === 'interactive') delete p.t2
+  // '' / 0 are the form's way of saying "whatever the host is configured for";
+  // the API wants the field absent, not an empty string or a zero it would
+  // reject against its own ge=64 bound.
+  if (!cfg.device) delete p.device
+  if (!cfg.history_mb) delete p.history_mb
+  // Same idea, and load-bearing: until the user picks a precision, DON'T send
+  // one — let WIGNERF_PRECISION decide. cfg.precision is only a placeholder
+  // then, seeded from a probe that is allowed to fail; sending it as though it
+  // were a decision is how a hard-coded float64 would override a float32 host
+  // whenever GET /device was unreachable. The session's real precision comes
+  // back in `status` and the watcher below syncs the form to it.
+  if (!precisionIsUserChosen()) delete p.precision
   // delay 0 is the dial's "one frame per display refresh" position: the
   // server needs honest seconds, and a fresh session must not flood
   p.delay = Math.max(cfg.delay, displayInterval())
@@ -194,7 +207,8 @@ const livePhysics = computed(() => {
 const liveRun = computed(() => {
   const st = session.status.value
   if (!st || !session.connected.value) return null
-  return { mode: st.mode, t2: st.t2, record_dt: st.record_dt }
+  return { mode: st.mode, t2: st.t2, record_dt: st.record_dt,
+           precision: st.precision }
 })
 // Whether the session has COMPUTED anything beyond the initial IC record.
 // Until it has, there is no meaningful "run mode" — the form is the sole
@@ -205,10 +219,13 @@ const hasRun = computed(() =>
 
 // Serialized identity of the run-defining fields (t₂ only matters in batch),
 // used to tell whether a FRESH session still matches the form.
-function runKeyOf(mode: string, t2: number | null, record_dt: number) {
-  return JSON.stringify([mode, mode === 'batch' ? t2 : null, record_dt])
+function runKeyOf(mode: string, t2: number | null, record_dt: number,
+                  precision: string) {
+  return JSON.stringify([mode, mode === 'batch' ? t2 : null, record_dt,
+                         precision])
 }
-const formRunKey = () => runKeyOf(cfg.mode, cfg.t2, cfg.record_dt)
+const formRunKey = () =>
+  runKeyOf(cfg.mode, cfg.t2, cfg.record_dt, cfg.precision)
 
 // A run-defining field (mode / t₂ / Δτ rec) is SessionCreate-only. On a FRESH
 // session — connected, idle, nothing computed beyond the initial IC record —
@@ -234,7 +251,8 @@ async function syncFreshSessionToForm() {
       || (st.record_extent?.[1] ?? -1) > 0) return   // a real run exists: don't touch
   autoRestarting = true
   try {
-    let sent = runKeyOf(st.mode, st.t2, st.record_dt)  // the live session's config
+    let sent = runKeyOf(st.mode, st.t2, st.record_dt,  // the live session's config
+                        st.precision)
     while (sent !== formRunKey()) {
       sent = formRunKey()
       await restart()                     // restart() reads cfg as it stands NOW
@@ -243,7 +261,8 @@ async function syncFreshSessionToForm() {
     autoRestarting = false
   }
 }
-watch(() => [cfg.mode, cfg.t2, cfg.record_dt], () => { void syncFreshSessionToForm() })
+watch(() => [cfg.mode, cfg.t2, cfg.record_dt, cfg.precision],
+      () => { void syncFreshSessionToForm() })
 
 // Boundary watch surfacing: a dismissible amber warning while W sits in
 // the edge band (the server posts an all-clear that removes it), and a
@@ -264,6 +283,19 @@ const boundaryText = computed(() => {
 // pattern): a reattach to a surviving session must not show a stale box
 watch(() => session.status.value?.auto_expand, (v) => {
   if (typeof v === 'boolean' && v !== cfg.auto_expand) cfg.auto_expand = v
+})
+// Same pattern for precision, and it is what makes a failed /device probe
+// harmless: an unchosen form omits `precision` from the create payload, so the
+// SERVER picks, and its answer comes straight back in status. Syncing to it
+// keeps the form honest and stops `runDiffers('precision')` from showing a
+// phantom "restart to apply" against a difference the user never made and
+// could not resolve. A user who HAS chosen is never overwritten — their
+// pending choice is exactly what the amber marker is for.
+watch(() => session.status.value?.precision, (v) => {
+  if (v && !precisionIsUserChosen() && v !== cfg.precision) {
+    cfg.precision = v
+    applyPrecisionInvariants(cfg)
+  }
 })
 // Live parameter changes: the Physics fields apply on change (blur/Enter)
 // with no other confirmation anywhere, which reads as "nothing happened" —
@@ -416,10 +448,64 @@ function onKey(ev: KeyboardEvent) {
 // disqualifies bfcache anyway. This is distinct from recover() (a live-tab
 // socket drop), which is never a pagehide.
 const onPageHide = (e: PageTransitionEvent) => { if (!e.persisted) session.beaconDestroy() }
+
+// The host's device pool, for the Setup panel's per-session device select.
+// Fetched once (it cannot change without a backend restart) and separately
+// from `status`, because the form needs the CHOICES even before a session
+// exists. A stored device this backend does not have stays in the list as a
+// flagged entry rather than silently disappearing — see SetupPanel.
+const deviceOptions = ref<{ spec: string; device: string }[] | null>(null)
+const historyCapMb = computed(() => {
+  const b = session.status.value?.history_cap_bytes
+  return b == null ? null : Math.round(b/(1024*1024))
+})
+
+/**
+ * Host facts the form needs before it can create anything: the device
+ * `choices` (the pool PLUS cpu, which is always a legal target but never
+ * appears in an "auto" pool on a CUDA host) and WIGNERF_PRECISION.
+ *
+ * Awaited before the FIRST restart so the form shows the right default at once
+ * and no session is created only to be recreated. The cost is a cached
+ * round-trip: measured 758 ms cold (two CUDA contexts) and ~1 ms warm,
+ * `lru_cache`d server-side, so only the first page load after a backend start
+ * pays — and it is bounded by an explicit timeout, because awaiting an
+ * endpoint with axios's default (none) would let a hung backend stall the
+ * whole app at startup.
+ *
+ * It is NOT load-bearing for correctness. Precision is omitted from the create
+ * payload until the user chooses one, so a probe that times out, 404s or
+ * returns junk costs a device list and a briefly-stale form value — never the
+ * wrong precision. That is deliberate: this used to send a hard-coded float64
+ * as though it were a decision, silently overriding a float32 host whenever
+ * this call failed.
+ */
+async function probeHost() {
+  try {
+    const { data } = await api.get<{ choices: { spec: string; device: string }[]
+                                     precision?: string }>(
+      '/device', { timeout: 5000 })
+    deviceOptions.value = data.choices ?? []
+    // Install the host's default so "Reset setup to defaults" agrees with the
+    // server, and adopt it if this browser has never chosen a precision.
+    setHostPrecision(data.precision)
+    if (!precisionIsUserChosen() && data.precision
+        && data.precision !== cfg.precision) {
+      cfg.precision = data.precision as typeof cfg.precision
+      // mergeConfig already enforced this at load, but the host default lands
+      // AFTER that — a stored auto_expand would otherwise ride into a float32
+      // session and 422 on a combination the user never picked.
+      applyPrecisionInvariants(cfg)
+    }
+  } catch {
+    deviceOptions.value = []
+  }
+}
+
 onMounted(() => {
   window.addEventListener('keydown', onKey)
   window.addEventListener('pagehide', onPageHide)
-  void restart()
+  void probeHost().then(restart)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey)
@@ -496,6 +582,15 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <!-- Persistent, not a flash: every number on screen (E, ΔX·ΔP, purity)
+           is preview-grade for as long as this session lives, and the one
+           thing that must never happen is a physics claim made from a run
+           whose reduced precision had scrolled off the header. -->
+      <span v-if="session.status.value?.precision === 'float32'"
+            class="text-amber-400 text-xs border border-amber-700/60 rounded px-1.5 py-0.5"
+            title="This session's spectral working precision is float32 — a fast PREVIEW mode. Purity and energy drift by ~1e-4 with the same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the relativistic shear. Restart in float64 before reading any of these curves as physics.">
+        float32 · preview — single precision mode
+      </span>
       <span v-if="restartNeeded" class="text-amber-400 text-xs">
         setup changed —
         <button class="underline" @click="requestRestart">restart</button> to apply
@@ -522,7 +617,11 @@ onBeforeUnmount(() => {
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
-                    :max-grid="session.status.value?.max_grid ?? 4096" v-model:show-grid="showGrid"
+                    :max-grid="session.status.value?.max_grid ?? 4096"
+                    :live-devices="session.status.value?.devices ?? null"
+                    :device-options="deviceOptions"
+                    :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
+                    v-model:show-grid="showGrid"
                     @dirty="restartNeeded = true" @restart="requestRestart"
                     @apply-live="applyLive"
                     @potential-validity="(v: boolean) => potentialValid = v" />
@@ -555,7 +654,11 @@ onBeforeUnmount(() => {
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
-                    :max-grid="session.status.value?.max_grid ?? 4096" v-model:show-grid="showGrid"
+                    :max-grid="session.status.value?.max_grid ?? 4096"
+                    :live-devices="session.status.value?.devices ?? null"
+                    :device-options="deviceOptions"
+                    :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
+                    v-model:show-grid="showGrid"
                       @dirty="restartNeeded = true" @restart="requestRestart"
                       @apply-live="applyLive"
                       @potential-validity="(v: boolean) => potentialValid = v" />

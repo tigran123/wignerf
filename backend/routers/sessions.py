@@ -17,6 +17,7 @@ from core import describe
 from core import session as sessions
 from core.potential import PotentialError, compile_potential
 from core.protocol import VARIANTS, SessionCreate
+from core.xp import resolve_devices
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -57,11 +58,26 @@ async def create_session(cfg: SessionCreate, request: Request):
         raise HTTPException(422, "Nx/Np may not exceed WIGNERF_MAX_GRID=%d "
                             "on this host" % config.MAX_GRID)
     cp = await compile_for(cfg.grid, cfg.potential, cfg.hbar_eff, cfg.variants)
+    # Per-session overrides NARROW the host's policy, never widen it: the
+    # history cap is clamped to WIGNERF_HISTORY_MB (a client must not be able
+    # to ask for more RAM than the box has), and an unknown/absent device is a
+    # 422 rather than a worker that dies on start.
+    history_mb = min(cfg.history_mb or config.HISTORY_MB, config.HISTORY_MB)
+    device = cfg.device or config.DEVICE
+    if cfg.device:
+        # Resolve HERE, not inside SimSession, so a bad spec is a clean 422
+        # naming the device instead of an exception from somewhere in session
+        # construction — and so this except cannot swallow an unrelated
+        # ValueError raised later by the grid or the IC.
+        try:
+            resolve_devices(cfg.device)
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(422, "device %r: %s" % (cfg.device, e))
     s = sessions.create_session(
-        cfg, cp, device=config.DEVICE,
+        cfg, cp, device=device,
         fft_threads=_fft_threads(len(cfg.variants)),
-        history_bytes=config.HISTORY_MB*1024*1024,
-        max_grid=config.MAX_GRID)
+        history_bytes=history_mb*1024*1024,
+        max_grid=config.MAX_GRID, history_mb_max=config.HISTORY_MB)
     # Prefix the WS path with the app's root_path so it inherits the nginx
     # prefix (uvicorn --root-path /wignerf, from APP_ROOT_PATH). Empty in dev.
     root_path = request.scope.get("root_path", "").rstrip("/")

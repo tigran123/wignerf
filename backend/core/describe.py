@@ -141,6 +141,13 @@ def param_lines(cfg, param_log=(), k0=None, k1=None):
            ("  t₂ = %s" % _num(cfg.t2)) if cfg.t2 is not None else "",
            "on" if at("auto_expand") else "off"),
     ]
+    # A line of its own, and only when it applies. Tacked onto the line above
+    # it would be the least conspicuous thing there, and this is the one fact
+    # about a preview run that a viewer must not miss — the video outlives the
+    # session that could have told them.
+    if getattr(cfg, "precision", "float64") == "float32":
+        lines.append("precision: float32 — PREVIEW run, reduced accuracy "
+                     "(purity/energy drift and uncertainty noise ~1e-4)")
     changes = [e for e in param_log
                if (k0 is None or e["at_record"] >= k0)
                and (k1 is None or e["at_record"] <= k1)]

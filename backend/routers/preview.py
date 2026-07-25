@@ -7,10 +7,25 @@ Preview endpoints:
   so the frontend reuses its decoder and WebGL panel for IC editing.
   Diagnostics travel in X-Wignerf-* headers.
 
-Previews always run on the CPU backend: they are cheap, deterministic, and
-keep the GPU free for running sessions.
+The Wigner preview runs on a GPU when one has room, and hands the VRAM
+straight back (it used to be CPU-only "to keep the GPU free for sessions",
+which was the right instinct and the wrong trade: the CPU build is 52x slower
+and the preview is not small — it is built at the SESSION's grid, so at 8192^2
+it was 25.9 s of CPU against 0.50 s on an RTX 3090, on every reload AND every
+IC edit, while the main W panel — same array, same size, built by a GPU worker
+— appeared in 1.4 s).
+
+The transient peak is what matters, not the steady state: 5.50 GiB at 8192^2
+(measured; 88 bytes per cell, plateauing there from three cat components up).
+So a device is chosen only if it currently has that much free with headroom,
+GPU previews are serialized so two peaks cannot stack, the build's device
+arrays all die with its frame, and the pool is released immediately after.
+Anything unexpected — OOM above all — falls back to the CPU, which is slow but
+always correct.
 """
 
+import logging
+import threading
 from typing import Optional
 from urllib.parse import quote
 
@@ -18,22 +33,81 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+import config
 from core import initial, observables, protocol
 from core.potential import PotentialError, compile_potential, sample_potential
 from core.protocol import GridSpec, ICSpec
 from core.quantize import quantize
-from core.xp import ArrayBackend
+from core.xp import ArrayBackend, resolve_devices
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
-_cpu_backend = None
+# Measured on an RTX 3090, 2026-07-25: the transient peak of a cat IC build is
+# 88 bytes per grid cell — 0.34 GiB at 2048^2, 1.38 at 4096^2, 5.50 at 8192^2 —
+# and it plateaus there (64 for a single component, 88 from three up, unchanged
+# at eight), because cat_wigner reuses its temporaries per pair rather than
+# accumulating them.
+PREVIEW_BYTES_PER_CELL = 88
+PREVIEW_HEADROOM = 1.4     # never take the last of a card a session is using
+
+_backends = {}                    # device spec -> ArrayBackend (contexts are
+_backends_lock = threading.Lock()  # expensive; make each one once)
+# One GPU preview at a time. The client debounces, but two concurrent 8192^2
+# builds would want 11 GiB between them and the second would OOM a card that
+# comfortably fits either alone.
+_gpu_lock = threading.Lock()
 
 
-def _backend():
-    global _cpu_backend
-    if _cpu_backend is None:
-        _cpu_backend = ArrayBackend(device="cpu")
-    return _cpu_backend
+def _backend(spec="cpu"):
+    with _backends_lock:
+        b = _backends.get(spec)
+        if b is None:
+            b = _backends[spec] = ArrayBackend(device=spec)
+        return b
+
+
+def _pick_device(cells):
+    """The CUDA device with the most free VRAM, if this build comfortably fits
+    in it; otherwise None, meaning use the CPU. Asking the driver for free
+    memory (rather than tracking our own sessions) is what keeps a preview from
+    evicting a running solver: whatever else is on the card, including another
+    process entirely, is already reflected."""
+    need = PREVIEW_BYTES_PER_CELL*cells*PREVIEW_HEADROOM
+    try:
+        import cupy
+        specs = [s for s in resolve_devices(config.DEVICE) if s.startswith("cuda")]
+    except Exception:
+        return None
+    best, best_free = None, 0
+    for spec in specs:
+        try:
+            with cupy.cuda.Device(int(spec.split(":")[1])) as d:
+                free = d.mem_info[0]
+        except Exception:
+            continue
+        if free > need and free > best_free:
+            best, best_free = spec, free
+    return best
+
+
+def _release(b):
+    """Give the build's VRAM back to the driver. Call this only once the
+    arrays are unreachable — free_all_blocks() frees blocks that are already
+    FREE, so one surviving reference keeps the whole 5.5 GiB resident (the
+    lesson _release_gpu_pool records in core/worker.py)."""
+    if not b.is_gpu:
+        return
+    try:
+        with b.device():
+            xp = b.xp
+            try:
+                xp.fft.config.get_plan_cache().clear()
+            except Exception:
+                log.debug("preview: plan cache clear failed", exc_info=True)
+            xp.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        log.debug("preview: pool release failed", exc_info=True)
 
 
 class PotentialPreviewIn(BaseModel):
@@ -74,25 +148,61 @@ class WignerPreviewIn(ICSpec):
     hbar_eff: float = Field(default=1.0, gt=0)
 
 
-@router.post("/preview/wigner")
-def preview_wigner(req: WignerPreviewIn):
-    b = _backend()
-    try:
+def _build_frame(b, req):
+    """Build the preview bundle on `b`. EVERY device array is a local of this
+    function, so all of them die when it returns — which is precisely what lets
+    the caller's _release() hand the VRAM back. Keeping the build in its own
+    frame is the point, not a style choice: the same structural reason
+    session._sweep_idle exists (a name still bound to a device array outlives
+    the work and pins gigabytes).
+
+    Returns only host data: `wq` comes back through backend.asnumpy inside
+    quantize, and rho/phi likewise out of observables."""
+    with b.device():
         g, W, warns = initial.from_spec(req.grid, req, req.hbar_eff, b)
-    except ValueError as e:
-        raise HTTPException(422, str(e))
-    deficit = abs(1.0 - float(W.sum())*g.dx*g.dp)
-    Ws = g.shift2d(W)
-    wq, wmin, wmax = quantize(Ws, b)
-    obs = observables.compute_basic(Ws, g, req.hbar_eff)
-    vf = protocol.VariantFrame(
-        vid=0, wq=wq, wmin=wmin, wmax=wmax, E=0.0,
-        x_mean=obs.x_mean, x_std=obs.x_std, p_mean=obs.p_mean, p_std=obs.p_std,
-        purity=obs.purity, dt=0.0, rho=obs.rho, phi=obs.phi)
-    payload = protocol.pack_frame(0, 0.0, g.geom(), [vf],
-                                  flags=protocol.FLAG_LIVE_PREVIEW)
+        deficit = abs(1.0 - float(W.sum())*g.dx*g.dp)
+        Ws = g.shift2d(W)
+        wq, wmin, wmax = quantize(Ws, b)
+        obs = observables.compute_basic(Ws, g, req.hbar_eff)
+        vf = protocol.VariantFrame(
+            vid=0, wq=wq, wmin=wmin, wmax=wmax, E=0.0,
+            x_mean=obs.x_mean, x_std=obs.x_std,
+            p_mean=obs.p_mean, p_std=obs.p_std,
+            purity=obs.purity, dt=0.0, rho=obs.rho, phi=obs.phi)
+        payload = protocol.pack_frame(0, 0.0, g.geom(), [vf],
+                                      flags=protocol.FLAG_LIVE_PREVIEW)
+    return payload, deficit, warns
+
+
+def _respond(payload, deficit, warns):
     # HTTP headers are latin-1 only: percent-encode so warnings can carry
     # Unicode (sigma, hbar, rho...); the client decodeURIComponent()s it.
     return Response(content=payload, media_type="application/octet-stream",
                     headers={"X-Wignerf-Norm-Deficit": "%.3e" % deficit,
                              "X-Wignerf-Warnings": quote(" | ".join(warns))})
+
+
+@router.post("/preview/wigner")
+def preview_wigner(req: WignerPreviewIn):
+    spec = _pick_device(req.grid.Nx*req.grid.Np)
+    if spec is not None:
+        try:
+            b = _backend(spec)
+            with _gpu_lock:
+                try:
+                    return _respond(*_build_frame(b, req))
+                finally:
+                    _release(b)
+        except ValueError as e:
+            # a bad IC spec, not a device problem — the CPU would reject it too
+            raise HTTPException(422, str(e))
+        except Exception:
+            # OOM above all (another session can claim the card between the
+            # free-memory check and the build), but anything device-shaped
+            # lands here: the preview must still come back, just slower.
+            log.warning("preview: GPU build on %s failed, falling back to CPU",
+                        spec, exc_info=True)
+    try:
+        return _respond(*_build_frame(_backend("cpu"), req))
+    except ValueError as e:
+        raise HTTPException(422, str(e))

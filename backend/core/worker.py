@@ -84,9 +84,10 @@ class SolverWorker(threading.Thread):
         # the CPU backend these are host RAM (1 GiB at 4096^2) held just as long.
         # free_all_blocks() returns only blocks that are FREE in the pool, and
         # _run's locals (W, prop) are gone by now but ATTRIBUTES are not: the two
-        # exponent slots still hold 4 complex128 meshes — 256 MiB at 2048^2, 1.0
-        # GiB at 4096^2, 4.0 GiB at 8192^2 — so without this the release leaves
-        # exactly that much behind. It then returns to the pool only when the
+        # exponent slots still hold 4 complex meshes — at complex128, 256 MiB at
+        # 2048^2, 1.0 GiB at 4096^2, 4.0 GiB at 8192^2 (half that in a float32
+        # session) — so without this the release leaves exactly that much
+        # behind. It then returns to the pool only when the
         # worker is collected (the session<->worker cycle, so: not by
         # refcounting) and to the DRIVER only at some later worker's
         # free_all_blocks() — which is why VRAM used to come back on the SECOND
@@ -112,7 +113,8 @@ class SolverWorker(threading.Thread):
     def _run(self):
         cfg = self.session.cfg
         backend = ArrayBackend(device=self.device,
-                               fft_threads=self.session.fft_threads)
+                               fft_threads=self.session.fft_threads,
+                               precision=cfg.precision)
         self._backend = backend
         with backend.device():
             # the worker's window mirrors the session's GridState (same
@@ -128,7 +130,13 @@ class SolverWorker(threading.Thread):
             if not self._finite(prop, backend):
                 raise ValueError("non-finite propagator exponents "
                                  "(check U(x), mass, c)")
-            W = g.shift2d(Wnat)
+            # The IC is built in float64 (initial.py is precision-independent);
+            # adopt the working dtype HERE so record 0 is measured on the same
+            # footing as every record after it. solve_spectral would do it at
+            # step 1 anyway, which would leave record 0 — the Cauchy data every
+            # later record is compared against — as the one frame with
+            # double-precision observables.
+            W = g.shift2d(Wnat).astype(backend.real_dtype, copy=False)
             t = cfg.t1
             self.dt = cfg.record_dt/8.
             self._emit(0, t, W, prop, backend)      # record 0 = the Cauchy data
@@ -230,7 +238,8 @@ class SolverWorker(threading.Thread):
         # observables already brought over — no extra device sync
         self.session.report_edge(
             self.slot, k,
-            boundary.edge_report(obs.rho, obs.phi, prop.grid.dx, prop.grid.dp))
+            boundary.edge_report(obs.rho, obs.phi, prop.grid.dx, prop.grid.dp,
+                                 backend.precision))
         self.session.notify_frame()
         # a landing record may open the skew gate for waiting siblings
         self.session.clock.kick()

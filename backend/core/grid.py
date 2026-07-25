@@ -166,8 +166,10 @@ def embed_window(Wn, old, new, xp):
     natural-order W on window `new` (GridStates on one lattice). Overlap
     cells are COPIED by global cell index (bitwise, no interpolation);
     entering cells are zero; leaving cells are dropped (the trigger
-    threshold bounds their mass)."""
-    Wnew = xp.zeros((new.Nx, new.Np), dtype=xp.float64)
+    threshold bounds their mass). The result takes W's own dtype so a
+    float32 session's regrid neither upcasts nor loses the copy's bitwise
+    exactness."""
+    Wnew = xp.zeros((new.Nx, new.Np), dtype=Wn.dtype)
     gx0, gx1 = max(old.ox, new.ox), min(old.ox + old.Nx, new.ox + new.Nx)
     gp0, gp1 = max(old.op, new.op), min(old.op + old.Np, new.op + new.Np)
     if gx1 > gx0 and gp1 > gp0:

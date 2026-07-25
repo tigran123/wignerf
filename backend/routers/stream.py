@@ -115,19 +115,33 @@ def _pack_record(s, k, live):
 def _progress_msg(s, lc):
     """A tiny, throttled progress report for BATCH compute — no frames. The
     heavy live-preview bundle (tens/hundreds of MiB per record) is replaced
-    by this ~300-byte JSON: current time, percent toward t2, the frontier
-    record, and per-variant throughput. Built on the sender's event-loop
-    task, never on the worker threads."""
+    by this ~400-byte JSON: current time, percent toward t2, the frontier
+    record, per-variant throughput, and the frontier record's OBSERVABLES.
+
+    The observables ride along because they are free: the worker computed them
+    when it emitted the record, history.get returns references (no array
+    copies), and this message is already being sent at PROGRESS_PERIOD. Without
+    them the control bar's E / ΔX·ΔP / γ readouts sat at "—" for the whole of a
+    batch run while the series plots beside them were live from their own REST
+    poll — the data was on screen, just not in the one place that shows the
+    current value. Built on the sender's event-loop task, never on the worker
+    threads."""
     c = s.clock
     t = c.t_of(lc) if lc >= 0 else c.t1
     span = (c.t2 - c.t1) or 1.0
     pct = max(0.0, min(1.0, (t - c.t1) / span)) * 100.0   # sign-agnostic
+    rec = s.history.get(lc) if lc >= 0 else None
+    obs = {v.vid: v for v in rec[2]} if rec else {}
+    out = []
+    for w in s.workers:
+        e = {"variant": w.key, "steps_per_sec": round(w.steps_per_sec, 2),
+             "steps_total": w.steps_total}
+        v = obs.get(protocol.variant_id(**w.flavor))
+        if v is not None:
+            e.update(E=v.E, x_std=v.x_std, p_std=v.p_std, purity=v.purity)
+        out.append(e)
     return {"type": "progress", "record": lc, "t": t, "t1": c.t1, "t2": c.t2,
-            "percent": pct,
-            "per_variant": [{"variant": w.key,
-                             "steps_per_sec": round(w.steps_per_sec, 2),
-                             "steps_total": w.steps_total}
-                            for w in s.workers]}
+            "percent": pct, "per_variant": out}
 
 
 async def _guard_send(coro):
