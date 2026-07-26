@@ -25,7 +25,8 @@ import { apiErrorText } from '../lib/apierror'
 import { importConfig, type SimConfig } from '../lib/config'
 import { extractWignerfDoc } from '../lib/mp4meta'
 import { fmtTime } from '../lib/units'
-import { VARIANT_META, type VariantKey } from '../lib/variants'
+import { theme, type ThemeName } from '../lib/theme'
+import { VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
 
 const props = defineProps<{
   status: SessionStatus | null
@@ -72,6 +73,13 @@ const ENCODERS = [
   { value: 'nvenc', label: 'GPU (h264_nvenc)' },
   { value: 'cpu', label: 'CPU (libx264)' },
 ] as const
+
+// The frame's light/dark theme. Deliberately NOT persisted alongside the
+// encoding prefs: it FOLLOWS the app theme (re-seeded whenever the panel
+// opens, below), and a remembered value would silently stop tracking it.
+// The override is per job because filming a dark video out of a light
+// session is a legitimate thing to want.
+const jobTheme = ref<ThemeName>(theme.value)
 
 const STORAGE_KEY = 'wignerf.export'
 
@@ -187,6 +195,7 @@ watch(open, async (v) => {
   if (!v) return
   await refreshExtent()
   useAll()
+  jobTheme.value = theme.value   // follow the app unless overridden below
   form.variants = form.variants.filter((k) => props.variants.includes(k))
   if (!form.variants.length) form.variants = [...props.variants]
   // a FINISHED job is kept: rendering continues while the popover is
@@ -246,7 +255,7 @@ async function start() {
       `/sessions/${props.sessionId}/export`,
       { k0: form.k0, k1: form.k1, stride: form.stride, fps: form.fps,
         width: r.width, height: r.height, variants: form.variants,
-        show_grid: props.showGrid,
+        show_grid: props.showGrid, theme: jobTheme.value,
         ...(form.encoder ? { encoder: form.encoder } : {}) })
     job.value = data
     startPoll(data.job_id)
@@ -311,7 +320,7 @@ const buttonClass = computed(() => {
   if (s === 'error') return 'bg-red-800 hover:bg-red-700 text-white'
   if (s === 'running' || s === 'queued')
     return 'bg-sky-800 hover:bg-sky-700 text-white'
-  return 'bg-neutral-800 hover:bg-neutral-700'
+  return 'bg-raised hover:bg-raised-hover'
 })
 const buttonTitle = computed(() => {
   const j = job.value
@@ -336,6 +345,13 @@ const setupUrl = computed(() =>
 const fileInput = ref<HTMLInputElement | null>(null)
 const importMsg = ref('')
 const importOk = ref(false)
+// The message tells you to restart, and a new session id IS that restart —
+// so it must stop being on screen the moment the advice has been taken. It
+// used to clear only at the top of the NEXT import, which left "press
+// Restart session to run it" standing over a session already running the
+// imported setup. Deliberately NOT cleared when the panel closes/reopens:
+// an import you have not acted on yet is still actionable.
+watch(() => props.sessionId, () => { importMsg.value = '' })
 
 async function onImportFile(ev: Event) {
   const input = ev.target as HTMLInputElement
@@ -365,8 +381,12 @@ async function onImportFile(ev: Event) {
     importConfig(props.cfg, doc)
     emit('dirty')
     importOk.value = true
-    importMsg.value = `imported ${file.name} — press "Restart session" `
-      + '(or Solve) to run it'
+    // "Restart session", NOT "or Solve": an import moves grid/IC/variants,
+    // which are SessionCreate-only, so Solve would compute the old ones
+    // behind the header's amber "setup changed" (the auto-restart in
+    // SimulatorView.syncFreshSessionToForm only fires when the document
+    // also moves mode/t₂/Δt rec/precision on a fresh idle session).
+    importMsg.value = `imported ${file.name} — press "Restart session" to run it`
   } catch (e: unknown) {
     importOk.value = false
     importMsg.value = e instanceof Error ? e.message : String(e)
@@ -387,49 +407,49 @@ onBeforeUnmount(() => clearInterval(poll))
     </button>
     <div v-if="open" class="fixed inset-0 z-40" @click="open = false"></div>
     <div v-if="open"
-         class="absolute left-0 top-full mt-2 z-50 w-[26rem] rounded border border-neutral-700
-                bg-neutral-900 shadow-xl p-3 text-xs space-y-2">
-      <h4 class="font-semibold text-neutral-300">Export</h4>
+         class="absolute left-0 top-full mt-2 z-50 w-[26rem] rounded border border-line
+                bg-panel shadow-xl p-3 text-xs space-y-2">
+      <h4 class="font-semibold text-fg-2">Export</h4>
 
-      <h5 class="text-neutral-500 uppercase tracking-wider text-[11px] pt-1">
+      <h5 class="text-muted uppercase tracking-wider text-[11px] pt-1">
         Video (mp4) — the computed range
       </h5>
 
       <div class="grid grid-cols-[3.5rem_1fr] gap-x-2 gap-y-1.5 items-center">
-        <span class="text-neutral-500">records</span>
+        <span class="text-muted">records</span>
         <div class="flex items-center gap-1">
           <input v-model.number="form.k0" type="number" class="wf-num w-20"
                  :min="extent[0]" :max="extent[1]"
                  @input="rangeTouched = true" />
-          <span class="text-neutral-600">…</span>
+          <span class="text-dim">…</span>
           <input v-model.number="form.k1" type="number" class="wf-num w-20"
                  :min="extent[0]" :max="extent[1]"
                  @input="rangeTouched = true" />
-          <button class="px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 whitespace-nowrap"
+          <button class="px-1.5 py-0.5 rounded bg-raised hover:bg-raised-hover whitespace-nowrap"
                   title="the whole retained history"
                   @click="refreshExtent().then(useAll)">all</button>
-          <button class="px-1.5 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 whitespace-nowrap"
+          <button class="px-1.5 py-0.5 rounded bg-raised hover:bg-raised-hover whitespace-nowrap"
                   title="from the current time position to the frontier"
                   @click="refreshExtent().then(useFromHere)">here →</button>
         </div>
 
-        <span class="text-neutral-500">t</span>
-        <div class="text-neutral-400 tabular-nums truncate"
+        <span class="text-muted">t</span>
+        <div class="text-fg-3 tabular-nums truncate"
              :title="'physical time of the first and last exported record'">
           {{ tOf(form.k0) }} → {{ tOf(form.k1) }}
         </div>
 
-        <span class="text-neutral-500">every</span>
+        <span class="text-muted">every</span>
         <div class="flex items-center gap-1">
           <input v-model.number="form.stride" type="number" min="1" max="1000"
                  class="wf-num w-16" />
-          <span class="text-neutral-400">record(s)</span>
-          <span class="ml-2 text-neutral-500">fps</span>
+          <span class="text-fg-3">record(s)</span>
+          <span class="ml-2 text-muted">fps</span>
           <input v-model.number="form.fps" type="number" min="1" max="120"
                  class="wf-num w-16" />
         </div>
 
-        <span class="text-neutral-500">size</span>
+        <span class="text-muted">size</span>
         <select v-model.number="form.width" class="wf-num w-40"
                 title="4K renders ~4× more pixels per frame — expect the
                        export to take about four times as long as FHD">
@@ -438,7 +458,7 @@ onBeforeUnmount(() => clearInterval(poll))
           </option>
         </select>
 
-        <span class="text-neutral-500">encoder</span>
+        <span class="text-muted">encoder</span>
         <select v-model="form.encoder" class="wf-num w-40"
                 title="the bottleneck is rendering the frames, not encoding them,
                        so this mostly decides how many CPU cores are left for the
@@ -449,49 +469,59 @@ onBeforeUnmount(() => clearInterval(poll))
           </option>
         </select>
 
-        <span class="text-neutral-500">panels</span>
+        <span class="text-muted">theme</span>
+        <select v-model="jobTheme" class="wf-num w-40"
+                title="the frame's colour scheme. Defaults to the app's own
+                       theme every time this panel opens, so the video reads
+                       like the screen; override it to film a dark video from
+                       a light session or vice versa. The W heatmap (bwr,
+                       white at W = 0) is the same either way.">
+          <option value="light">light</option>
+          <option value="dark">dark</option>
+        </select>
+
+        <span class="text-muted">panels</span>
         <div class="flex items-center gap-2">
           <label v-for="v in props.variants" :key="v"
                  class="flex items-center gap-1 cursor-pointer select-none"
                  :title="VARIANT_META[v].label">
             <input type="checkbox" :checked="form.variants.includes(v)"
                    @change="toggleVariant(v)" />
-            <span :style="{ color: VARIANT_META[v].color }">{{ v.toUpperCase() }}</span>
+            <span :style="{ color: variantColor(v) }">{{ v.toUpperCase() }}</span>
           </label>
         </div>
       </div>
 
-      <p class="text-neutral-400">
-        {{ frames }} frames → {{ duration.toFixed(1) }} s of video, grid lines
-        {{ showGrid ? 'on' : 'off' }} (follows the setup panel).
+      <p class="text-fg-3">
+        {{ frames }} frames → {{ duration.toFixed(1) }} s of video, {{ jobTheme }}
+        theme, grid lines {{ showGrid ? 'on' : 'off' }} (follows the setup panel).
         Each frame carries the panels, the marginals, the E/ΔX·ΔP/γ series
         and the parameters + IC needed to reproduce the run.
       </p>
 
-      <p v-if="running" class="text-amber-400">
+      <p v-if="running" class="text-warn">
         The session is still computing. Rendering needs a paused session —
         Render will pause it first (computation resumes with Solve).
       </p>
 
-      <p v-if="error" class="text-red-400">{{ error }}</p>
+      <p v-if="error" class="text-error">{{ error }}</p>
 
       <div v-if="job" class="space-y-1">
-        <div class="h-2 rounded bg-neutral-800 overflow-hidden">
+        <div class="h-2 rounded bg-raised overflow-hidden">
           <div class="h-full bg-sky-600 transition-[width] duration-200"
                :style="{ width: pct + '%' }"></div>
         </div>
-        <p class="text-neutral-400 tabular-nums">
+        <p class="text-fg-3 tabular-nums">
           {{ job.state }} — {{ job.done }}/{{ job.total }} frames
           <span v-if="job.state === 'done'">
             ({{ (job.bytes/2**20).toFixed(1) }} MiB)
           </span>
-          <span v-if="job.error" class="text-red-400">{{ job.error }}</span>
+          <span v-if="job.error" class="text-error">{{ job.error }}</span>
         </p>
       </div>
 
       <div class="flex items-center gap-2 pt-1">
-        <button class="px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 font-medium
-                       disabled:opacity-40 disabled:cursor-not-allowed"
+        <button class="wf-solid px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 font-medium"
                 :disabled="busy || frames < 1
                            || job?.state === 'running' || job?.state === 'queued'"
                 @click="start">{{ running ? 'Pause &amp; render' : 'Render' }}</button>
@@ -500,15 +530,15 @@ onBeforeUnmount(() => clearInterval(poll))
           ⤓ download
         </a>
         <button v-if="job?.state === 'running' || job?.state === 'queued'"
-                class="px-2 py-1 rounded bg-neutral-800 hover:bg-neutral-700"
+                class="px-2 py-1 rounded bg-raised hover:bg-raised-hover"
                 @click="cancel">Cancel</button>
       </div>
 
-      <h5 class="text-neutral-500 uppercase tracking-wider text-[11px] pt-2
-                 border-t border-neutral-800">
+      <h5 class="text-muted uppercase tracking-wider text-[11px] pt-2
+                 border-t border-line-soft">
         Setup — the initial conditions
       </h5>
-      <p class="text-neutral-400">
+      <p class="text-fg-3">
         The state this run STARTED from: grid, U(x), the IC, variants,
         m/c/ℏ/tol and the run mode. Live parameter changes and auto-expand
         are not part of it — they belong to the run, and the video's
@@ -516,11 +546,11 @@ onBeforeUnmount(() => clearInterval(poll))
       </p>
       <div class="flex items-center gap-2">
         <a v-if="setupUrl" :href="setupUrl"
-           class="px-2 py-1 rounded bg-neutral-800 hover:bg-neutral-700"
+           class="px-2 py-1 rounded bg-raised hover:bg-raised-hover"
            title="download this simulation's initial conditions as a .json file">
           ⤓ download setup
         </a>
-        <button class="px-2 py-1 rounded bg-neutral-800 hover:bg-neutral-700"
+        <button class="px-2 py-1 rounded bg-raised hover:bg-raised-hover"
                 title="load a setup from a .json file, or straight from an mp4
                        exported here (it carries the same document)"
                 @click="fileInput?.click()">⤒ import setup…</button>
@@ -528,12 +558,12 @@ onBeforeUnmount(() => clearInterval(poll))
                accept=".json,.mp4,application/json,video/mp4"
                @change="onImportFile" />
       </div>
-      <p v-if="importMsg" :class="importOk ? 'text-emerald-400' : 'text-red-400'">
+      <p v-if="importMsg" :class="importOk ? 'text-ok' : 'text-error'">
         {{ importMsg }}
       </p>
 
       <div class="flex pt-1">
-        <button class="ml-auto px-2 py-1 rounded bg-neutral-800 hover:bg-neutral-700"
+        <button class="ml-auto px-2 py-1 rounded bg-raised hover:bg-raised-hover"
                 @click="open = false">Close</button>
       </div>
     </div>

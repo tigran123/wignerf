@@ -123,7 +123,9 @@ onBeforeUnmount(() => {
        @wheel.prevent="onWheel"
        @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp"
        @pointercancel="onUp" @dblclick="onDblClick">
-    <canvas ref="canvas" class="w-full h-full block bg-black"></canvas>
+    <!-- the shader covers every pixel, so this only shows before the first
+         draw — a black flash on a light page, hence a themed surface -->
+    <canvas ref="canvas" class="w-full h-full block bg-panel"></canvas>
     <GridOverlay v-if="viewDomain && showGrid"
                  :x1="viewDomain.x1" :x2="viewDomain.x2"
                  :p1="viewDomain.p1" :p2="viewDomain.p2" />
@@ -132,7 +134,7 @@ onBeforeUnmount(() => {
     </div>
     <!-- this panel's own colour scale; overlaid, so it costs no drawing area -->
     <Colorbar :min="wmin" :max="wmax" />
-    <div v-if="glError" class="absolute inset-0 grid place-items-center text-red-400 text-sm p-4">
+    <div v-if="glError" class="absolute inset-0 grid place-items-center text-error text-sm p-4">
       {{ glError }}
     </div>
   </div>

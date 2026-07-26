@@ -185,6 +185,73 @@ def test_show_grid_covers_charts_and_w_panels():
     assert on[2] != off[2], "the rendered frames are identical"
 
 
+def test_theme_repaints_the_frame_but_not_the_heatmap():
+    """ExportSpec.theme must reach every piece of chrome — figure face, axes
+    face, titles, ticks and the variant curve colours — while leaving the
+    heatmap alone: "bwr" with white at W = 0 is the physics convention and is
+    identical in both themes on screen too."""
+    # the wire contract: light by default (as in the SPA), both names
+    # accepted, nothing else
+    assert protocol.ExportSpec().theme == "light"
+    assert protocol.ExportSpec(theme="dark").theme == "dark"
+    with pytest.raises(ValueError):
+        protocol.ExportSpec(theme="solarized")
+
+    cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
+                                 variants=["qn"])
+    geom = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
+    stats = _stats()
+    meta = meta_columns(cfg, geom, stats, ["qn"], 0, 2, 3, 30)
+    seen = {}
+    for th in ("dark", "light"):
+        fig = FrameFigure(["qn"], stats, meta, width=320, height=240,
+                          theme=th)
+        try:
+            panel_ax, im = fig.images[0]
+            chart_ax = [a for a in fig.fig.axes
+                        if a.get_title(loc="right") == "E(t)"][0]
+            frame = bytes(fig.update(0, 0.0, geom, [_vframe(1)], 0, 2))
+            seen[th] = dict(
+                bg=fig.fig.get_facecolor(),
+                axbg=chart_ax.get_facecolor(),
+                # NB not chart_ax.title — matplotlib keeps a separate artist
+                # per title loc, and the series titles are loc="right", so
+                # the default centre one stays untouched (and black)
+                spine=chart_ax.spines["bottom"].get_edgecolor(),
+                tick=chart_ax.xaxis.get_ticklabels()[0].get_color(),
+                marg_title=fig.ax_rho.title.get_color(),
+                panel_title=panel_ax.title.get_color(),
+                rho=fig.rho_lines["qn"].get_color(),
+                cmap=im.get_cmap().name,
+                clim=im.get_clim(),
+                frame=frame,
+            )
+        finally:
+            fig.close()
+    d, l = seen["dark"], seen["light"]
+    for k in ("bg", "axbg", "spine", "tick", "marg_title", "panel_title", "rho"):
+        assert d[k] != l[k], f"{k} did not follow the theme"
+    # the data layer is theme-independent, and so is the rendered size
+    assert d["cmap"] == l["cmap"] == "bwr"
+    assert d["clim"] == l["clim"]
+    assert len(d["frame"]) == len(l["frame"])
+    assert d["frame"] != l["frame"], "the two themes rendered identical pixels"
+
+
+def test_unknown_theme_falls_back_to_the_light_default():
+    """The schema only admits dark|light, but FrameFigure is also constructed
+    directly (tests, the render pool) — an unknown name must not KeyError
+    halfway through building a figure. It lands on light, the SPA's own
+    default and ExportSpec.theme's."""
+    stats = _stats()
+    fig = FrameFigure(["qn"], stats, ([], []), width=320, height=240,
+                      theme="chartreuse")
+    try:
+        assert fig.theme == "light"
+    finally:
+        fig.close()
+
+
 def test_axes_follow_the_record_geometry():
     """Auto-expand makes the domain a PER-RECORD fact, and the video follows
     it exactly as the SPA does: freezing the axes at the range union rendered

@@ -14,7 +14,8 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
 import { loadHidden, saveHidden } from '../lib/plotPrefs'
 import { createUplotZoom } from '../lib/uplotZoom'
-import { VARIANT_META, keyOfVid, type VariantKey } from '../lib/variants'
+import { chartPalette, theme } from '../lib/theme'
+import { VARIANT_META, keyOfVid, variantColor, type VariantKey } from '../lib/variants'
 
 const props = defineProps<{
   sessionId: string | null
@@ -130,7 +131,7 @@ function toggle(v: VariantKey) {
 
 /**
  * Time cursor: the vertical line at the PAINTED frame's t, exactly as the
- * mp4 export draws it (same #f472b6). It is a DOM element inside uPlot's
+ * mp4 export draws it (same --wf-cursor). It is a DOM element inside uPlot's
  * `over` layer, not a canvas artist — the frame rate is the display's, and
  * a full u.redraw() per frame to move one line would re-path every series.
  * `over` is the plot rect with overflow hidden, so a cursor outside a
@@ -170,7 +171,11 @@ function placeCursor() {
 }
 
 function makeChart(width: number): uPlot {
-  const grid = { show: props.showGrid ?? true, stroke: '#3f3f46', width: 1 }
+  // axis/grid strokes are construction-time in uPlot, which is why a theme
+  // change rebuilds the chart (see the watch below) exactly as the grid-lines
+  // toggle already does
+  const pal = chartPalette()
+  const grid = { show: props.showGrid ?? true, stroke: pal.grid, width: 1 }
   return new uPlot(
     {
       width,
@@ -198,9 +203,9 @@ function makeChart(width: number): uPlot {
         },
       },
       axes: [
-        { stroke: '#a3a3a3', grid, ticks: { stroke: '#525252' } },
+        { stroke: pal.axis, grid, ticks: { stroke: pal.tick } },
         {
-          stroke: '#a3a3a3', grid, ticks: { stroke: '#525252' },
+          stroke: pal.axis, grid, ticks: { stroke: pal.tick },
           size: 72,
           // enough decimals to distinguish ticks on a tightly-zoomed axis
           // (e.g. purity 0.9998..1.0002 — default formatting prints "1")
@@ -215,7 +220,7 @@ function makeChart(width: number): uPlot {
         {},
         ...props.variants.map((v) => ({
           label: v,
-          stroke: VARIANT_META[v].color,
+          stroke: variantColor(v),
           dash: VARIANT_META[v].dash,
           width: 1.5,
           points: { show: false },
@@ -254,8 +259,9 @@ onMounted(() => {
   watch(() => props.sessionId, reset)
   // per PAINTED frame: one style write, no chart redraw
   watch(() => props.cursorT, placeCursor)
-  // grid-lines toggle: rebuild in place, keeping accumulated data
-  watch(() => props.showGrid, () => {
+  // grid-lines toggle and theme change: rebuild in place, keeping the
+  // accumulated data (both only reach uPlot at construction)
+  watch([() => props.showGrid, theme], () => {
     chart?.destroy()
     chart = makeChart(el.value?.clientWidth || 360)
     addCursorEl(chart)          // the old element died with the old chart
@@ -288,7 +294,7 @@ onBeforeUnmount(() => {
         <input type="checkbox" class="scale-75" :checked="!hidden.has(v)"
                @change="toggle(v)" />
         <span class="text-[9px] leading-none"
-              :style="{ color: VARIANT_META[v].color }">{{ v.toUpperCase() }}</span>
+              :style="{ color: variantColor(v) }">{{ v.toUpperCase() }}</span>
       </label>
     </div>
     <div ref="el" class="wf-plot flex-1 min-w-0"></div>

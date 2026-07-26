@@ -24,7 +24,8 @@ import { applyPrecisionInvariants, loadConfig, precisionForPayload,
 import { apiErrorText } from '../lib/apierror'
 import { displayInterval } from '../lib/perf'
 import { transportAction } from '../lib/transport'
-import { ALL_VARIANTS, VARIANT_META, type VariantKey } from '../lib/variants'
+import { theme, toggleTheme } from '../lib/theme'
+import { ALL_VARIANTS, VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
 
 const session = useSession()
 const currentRecord = ref(0)
@@ -172,10 +173,24 @@ async function requestRestart() {
 /** Transport commands, gated the same way: only a command that will COMPUTE
  *  threatens the render (playback adds no records, so it cannot evict). */
 async function sendCommand(cmd: Record<string, unknown>) {
-  if (cmd.type === 'play'
-      && transportAction(session.status.value,
-                         session.lastFrame.value?.record ?? null) === 'solve'
-      && !(await mayDiscardExport('Computing new records'))) return
+  const willCompute = cmd.type === 'play'
+    && transportAction(session.status.value,
+                       session.lastFrame.value?.record ?? null) === 'solve'
+  if (willCompute && !(await mayDiscardExport('Computing new records'))) return
+  // THE FORM IS AUTHORITATIVE AT THE MOMENT COMPUTATION STARTS. U(x) is the
+  // only live-appliable field with no implicit commit — the numeric Physics
+  // fields apply on blur/Enter, which pressing Solve performs — so without
+  // this a validated edit could sit in the form while the session went on
+  // computing the OLD potential. Measured before the fix: 369 records of
+  // x^2/2 behind a form reading x^2/2 + 5*x^4, the only signal being the
+  // amber input, in a panel that can be hidden. Sent BEFORE the play command
+  // (same WS, handled in order) so the frontier is already under the new U;
+  // the header's "✓ applied U(x)" flash is the confirmation. Playback is
+  // deliberately excluded — it computes nothing, so U is irrelevant to it.
+  const st = session.status.value
+  if (willCompute && potentialValid.value && st
+      && cfg.potential !== st.potential)
+    applyLive({ U: cfg.potential })
   // Remember the user's transport intent across a reconnect (see recover()).
   if (cmd.type === 'pause') userPaused = true
   if (cmd.type === 'play') userPaused = false
@@ -547,9 +562,9 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="h-screen flex flex-col overflow-hidden bg-neutral-950 text-neutral-100">
-    <header class="px-3 py-2 text-sm border-b border-neutral-800 flex items-center gap-4 flex-wrap">
-      <button class="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-xs"
+  <div class="h-screen flex flex-col overflow-hidden bg-app text-fg">
+    <header class="px-3 py-2 text-sm border-b border-line-soft flex items-center gap-4 flex-wrap">
+      <button class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
               @click="showSetup = !showSetup">
         {{ showSetup ? '◀ hide setup' : '▶ setup' }}
       </button>
@@ -561,14 +576,20 @@ onBeforeUnmount(() => {
                :title="VARIANT_META[v].label">
           <input type="checkbox" :checked="cfg.variants.includes(v)"
                  @change="toggleVariant(v)" />
-          <span :style="{ color: VARIANT_META[v].color }">{{ v.toUpperCase() }}</span>
+          <span :style="{ color: variantColor(v) }">{{ v.toUpperCase() }}</span>
         </label>
       </div>
 
-      <button class="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-xs"
+      <button class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
               :title="'toggle landscape/portrait layout'"
               @click="layout = layout === 'landscape' ? 'portrait' : 'landscape'">
         {{ layout === 'landscape' ? '⬒ portrait' : '⬓ landscape' }}
+      </button>
+
+      <button class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
+              :title="`switch to the ${theme === 'dark' ? 'light' : 'dark'} theme`"
+              @click="toggleTheme">
+        {{ theme === 'dark' ? '☀ light' : '☾ dark' }}
       </button>
 
       <ExportPanel :status="session.status.value" :session-id="sessionId"
@@ -578,15 +599,15 @@ onBeforeUnmount(() => {
                    @command="session.send" @dirty="restartNeeded = true" />
 
       <div class="relative">
-        <button class="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 text-xs"
+        <button class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
                 title="keyboard shortcuts and mouse controls"
                 @click="showHelp = !showHelp;
                         (($event as MouseEvent).currentTarget as HTMLElement)?.blur()">? help</button>
         <div v-if="showHelp" class="fixed inset-0 z-40" @click="showHelp = false"></div>
         <div v-if="showHelp"
-             class="absolute left-0 top-full mt-2 z-50 w-96 rounded border border-neutral-700 bg-neutral-900 shadow-xl p-3 text-xs space-y-2">
-          <h4 class="font-semibold text-neutral-300">Keyboard</h4>
-          <div class="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1 text-neutral-300">
+             class="absolute left-0 top-full mt-2 z-50 w-96 rounded border border-line bg-panel shadow-xl p-3 text-xs space-y-2">
+          <h4 class="font-semibold text-fg-2">Keyboard</h4>
+          <div class="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1 text-fg-2">
             <span><kbd class="wf-kbd">Space</kbd></span>
             <span>Solve / Play / Pause (the transport button)</span>
             <span><kbd class="wf-kbd">R</kbd></span>
@@ -597,12 +618,12 @@ onBeforeUnmount(() => {
             <span>while paused: step ONE record back / forward</span>
             <span><kbd class="wf-kbd">Home</kbd> <kbd class="wf-kbd">End</kbd></span>
             <span>while paused: jump to the first record / the frontier</span>
-            <span>click <span class="text-neutral-400">t =</span></span>
+            <span>click <span class="text-fg-3">t =</span></span>
             <span>while paused: type an exact time — <kbd class="wf-kbd">Enter</kbd> seeks to the
               nearest record, <kbd class="wf-kbd">Esc</kbd> cancels</span>
           </div>
-          <h4 class="font-semibold text-neutral-300 pt-1">Mouse (plots &amp; W panels)</h4>
-          <div class="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1 text-neutral-300">
+          <h4 class="font-semibold text-fg-2 pt-1">Mouse (plots &amp; W panels)</h4>
+          <div class="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1 text-fg-2">
             <span>drag</span>
             <span>charts: zoom to selection (x, y or box) · W panels &amp; IC preview: pan</span>
             <span>wheel</span>
@@ -618,33 +639,35 @@ onBeforeUnmount(() => {
            thing that must never happen is a physics claim made from a run
            whose reduced precision had scrolled off the header. -->
       <span v-if="session.status.value?.precision === 'float32'"
-            class="text-amber-400 text-xs border border-amber-700/60 rounded px-1.5 py-0.5"
+            class="text-warn text-xs border border-warn/60 rounded px-1.5 py-0.5"
             title="This session's spectral working precision is float32 — a fast PREVIEW mode. Purity and energy drift by ~1e-4 with the same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the relativistic shear. Restart in float64 before reading any of these curves as physics.">
         float32 · preview — single precision mode
       </span>
-      <span v-if="restartNeeded" class="text-amber-400 text-xs">
+      <span v-if="restartNeeded" class="text-warn text-xs">
         setup changed —
         <button class="underline" @click="requestRestart">restart</button> to apply
       </span>
-      <span v-if="boundaryText" class="text-amber-400 text-xs">
+      <span v-if="boundaryText" class="text-warn text-xs">
         ⚠ {{ boundaryText }}
         <button class="underline" title="dismiss (reappears if the boundary state changes)"
                 @click="session.boundary.value = null">×</button>
       </span>
-      <span v-if="paramFlash" class="text-emerald-400 text-xs">✓ {{ paramFlash }}</span>
-      <span v-if="regridFlash" class="text-sky-400 text-xs">⤢ {{ regridFlash }}</span>
-      <span v-if="reconnecting" class="ml-auto text-amber-400">
+      <span v-if="paramFlash" class="text-ok text-xs">✓ {{ paramFlash }}</span>
+      <span v-if="regridFlash" class="text-info text-xs">⤢ {{ regridFlash }}</span>
+      <span v-if="reconnecting" class="ml-auto text-warn">
         backend disconnected — reconnecting…
       </span>
-      <span v-else-if="!session.connected.value" class="ml-auto text-amber-400">connecting…</span>
+      <span v-else-if="!session.connected.value" class="ml-auto text-warn">connecting…</span>
     </header>
 
-    <div v-if="createError" class="px-3 py-2 text-red-400 text-sm">{{ createError }}</div>
+    <div v-if="createError" class="px-3 py-2 text-error text-sm">{{ createError }}</div>
 
     <!-- ================= landscape ================= -->
     <main v-if="layout === 'landscape'" class="flex-1 min-h-0 flex gap-2 p-2">
       <aside v-if="showSetup" class="w-80 shrink-0 overflow-y-auto space-y-4 pr-1 text-sm">
-        <SetupPanel :cfg="cfg" :live="session.connected.value" :sign="session.status.value?.sign ?? 1"
+        <SetupPanel :cfg="cfg" :live="session.connected.value"
+                    :computing="session.status.value?.computing ?? false"
+                    :sign="session.status.value?.sign ?? 1"
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
@@ -681,7 +704,9 @@ onBeforeUnmount(() => {
     <main v-else class="flex-1 min-h-0 flex flex-col gap-2 p-2">
       <div v-if="showSetup" class="grid grid-cols-3 gap-3 max-h-[46%] min-h-0 text-sm">
         <div class="overflow-y-auto min-h-0 pr-1">
-          <SetupPanel :cfg="cfg" :live="session.connected.value" :sign="session.status.value?.sign ?? 1"
+          <SetupPanel :cfg="cfg" :live="session.connected.value"
+                    :computing="session.status.value?.computing ?? false"
+                    :sign="session.status.value?.sign ?? 1"
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
@@ -717,9 +742,9 @@ onBeforeUnmount(() => {
     </main>
 
     <div v-for="(e, i) in session.errors.value" :key="i"
-         class="px-3 py-1 text-xs text-red-400">
+         class="px-3 py-1 text-xs text-error">
       {{ e }}
-      <button class="underline ml-2 text-red-300" title="dismiss this error"
+      <button class="underline ml-2 text-error" title="dismiss this error"
               @click="session.errors.value.splice(i, 1)">×</button>
     </div>
 

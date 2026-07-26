@@ -218,6 +218,13 @@ class ExportSpec(BaseModel):
     # wignerf.grid, default on) — one setting for every plot in the frame,
     # W heatmaps included
     show_grid: bool = True
+    # the SPA's light/dark theme (localStorage wignerf.theme): the video has
+    # to read like the screen, so the Export panel defaults this to whatever
+    # the app is showing and lets a job override it. "light" matches the SPA's
+    # own default — the panel always sends the field explicitly, so this is
+    # only what a direct API call gets, and it should get the same look a
+    # first-time browser does.
+    theme: Literal["dark", "light"] = "light"
     # None = the host's WIGNERF_EXPORT_ENCODER. Per-JOB, not per-session: the
     # right choice depends on what else is running (nvenc frees cores for the
     # render pool, which is the actual bottleneck).

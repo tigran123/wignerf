@@ -252,7 +252,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="space-y-1.5">
-    <h3 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
+    <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">
       Initial condition
     </h3>
 
@@ -261,8 +261,8 @@ onBeforeUnmount(() => {
         v-for="t in (['mixture', 'cat'] as const)" :key="t"
         class="flex-1 py-1 rounded border"
         :class="ic.type === t
-          ? 'bg-sky-900/60 border-sky-600 text-sky-200'
-          : 'bg-neutral-900 border-neutral-700 text-neutral-400 hover:bg-neutral-800'"
+          ? 'bg-info-soft border-info text-info-fg'
+          : 'bg-panel border-line text-fg-3 hover:bg-raised'"
         :title="t === 'mixture'
           ? 'statistical mixture: W >= 0, independent σₓ, σₚ'
           : 'coherent superposition (cat): interference fringes, σₚ derived'"
@@ -271,8 +271,8 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- phase-space preview with draggable peaks -->
-    <div class="relative aspect-square w-full border border-neutral-700 rounded overflow-hidden">
-      <canvas ref="canvas" class="w-full h-full block bg-black"></canvas>
+    <div class="relative aspect-square w-full border border-line rounded overflow-hidden">
+      <canvas ref="canvas" class="w-full h-full block bg-panel"></canvas>
       <GridOverlay v-if="showGrid ?? true"
                    :x1="viewExtents.x1" :x2="viewExtents.x2"
                    :p1="viewExtents.p1" :p2="viewExtents.p2" />
@@ -280,6 +280,9 @@ onBeforeUnmount(() => {
            :class="panning ? 'cursor-grabbing' : 'cursor-crosshair'"
            @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp"
            @pointercancel="onUp" @wheel.prevent="onWheel" @dblclick="onDblClick">
+        <!-- These rings sit on the bwr HEATMAP, not on the page, and the
+             heatmap is the same in both themes — so they are deliberately
+             not tokenised (same reasoning as GridOverlay's greys). -->
         <div v-for="(c, i) in ic.components" :key="i"
              class="absolute w-3 h-3 -ml-1.5 -mt-1.5 rounded-full border-2 pointer-events-none"
              :class="i === selected ? 'border-yellow-300' : 'border-neutral-400/70'"
@@ -290,26 +293,26 @@ onBeforeUnmount(() => {
            takes the top slot the panels reserve for theirs. -->
       <Colorbar :min="wmin" :max="wmax" place="top-1 left-2" />
     </div>
-    <div v-if="state.error" class="text-[11px] text-red-400">{{ state.error }}</div>
-    <div v-if="deficit" class="text-xs text-neutral-400">
+    <div v-if="state.error" class="text-[11px] text-error">{{ state.error }}</div>
+    <div v-if="deficit" class="text-xs text-fg-3">
       norm deficit on grid: {{ deficit }}
     </div>
-    <div v-for="(w, i) in warnings" :key="i" class="text-[11px] text-amber-400">⚠ {{ w }}</div>
+    <div v-for="(w, i) in warnings" :key="i" class="text-[11px] text-warn">⚠ {{ w }}</div>
 
     <!-- component list -->
     <div class="flex items-center gap-1 text-xs">
       <button v-for="(c, i) in ic.components" :key="i"
               class="px-2 py-0.5 rounded border"
               :class="i === selected
-                ? 'border-yellow-400 text-yellow-300'
-                : 'border-neutral-700 text-neutral-400'"
+                ? 'border-select text-select'
+                : 'border-line text-fg-3'"
               @click="selected = i">{{ i + 1 }}</button>
-      <button class="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700"
+      <button class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover"
               @click="addComponent">+</button>
-      <button class="px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40"
+      <button class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover disabled:opacity-40"
               :disabled="ic.components.length <= 1"
               @click="removeComponent(selected)">−</button>
-      <button class="ml-auto px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700"
+      <button class="ml-auto px-2 py-0.5 rounded bg-raised hover:bg-raised-hover"
               title="reset the IC to the default single Gaussian"
               @click="resetIC">↺ defaults</button>
     </div>
@@ -318,23 +321,23 @@ onBeforeUnmount(() => {
          good values (0.60, drag-placed coordinates, even 1.0) -->
     <div v-if="sel" class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
       <label class="flex items-center gap-1">
-        <span class="w-8 text-neutral-500">x₀</span>
+        <span class="w-8 text-muted">x₀</span>
         <input v-model.number="sel.x0" type="number" step="any"
                class="wf-num" @change="scheduleRefresh()" />
       </label>
       <label class="flex items-center gap-1">
-        <span class="w-8 text-neutral-500">p₀</span>
+        <span class="w-8 text-muted">p₀</span>
         <input v-model.number="sel.p0" type="number" step="any"
                class="wf-num" @change="scheduleRefresh()" />
       </label>
       <label class="flex items-center gap-1">
-        <span class="w-8 text-neutral-500">σₓ</span>
+        <span class="w-8 text-muted">σₓ</span>
         <input v-model.number="sel.sigma_x" type="number" step="any" min="0.01"
                class="wf-num" @change="scheduleRefresh()" />
       </label>
       <label class="flex items-center gap-1" :title="ic.type === 'cat'
                ? 'derived: ℏ/(2σₓ) — a Gaussian wavefunction is a minimal packet' : ''">
-        <span class="w-8 text-neutral-500">σₚ</span>
+        <span class="w-8 text-muted">σₚ</span>
         <input v-if="ic.type === 'mixture'" v-model.number="sel.sigma_p"
                type="number" step="any" min="0.01"
                class="wf-num" @change="scheduleRefresh()" />
@@ -345,13 +348,13 @@ onBeforeUnmount(() => {
              :title="ic.type === 'mixture'
                ? 'relative weight: ensemble probability wⱼ/Σw in ρ = Σ wⱼ ρⱼ'
                : 'relative weight: |cⱼ|² in ψ ∝ Σ cⱼψⱼ, cⱼ = √wⱼ·exp(iφⱼ)'">
-        <span class="w-8 text-neutral-500">w</span>
+        <span class="w-8 text-muted">w</span>
         <input v-model.number="sel.weight" type="number" step="any" min="0.01"
                class="wf-num" @change="scheduleRefresh()" />
       </label>
       <label class="flex items-center gap-1"
              :title="'phase of cⱼ = √wⱼ·exp(iφⱼ) — sets the interference fringe phase (e.g. even/odd cat); meaningless for a mixture (no coherence)'">
-        <span class="w-8 text-neutral-500">φ</span>
+        <span class="w-8 text-muted">φ</span>
         <input v-model.number="sel.phase" type="number" step="any"
                :disabled="ic.type === 'mixture'"
                class="wf-num" :class="{ 'opacity-50': ic.type === 'mixture' }"
@@ -361,13 +364,8 @@ onBeforeUnmount(() => {
   </section>
 </template>
 
-<style>
-.wf-num {
-  width: 100%;
-  background: #171717;
-  border: 1px solid #404040;
-  border-radius: 4px;
-  padding: 2px 6px;
-  font-variant-numeric: tabular-nums;
-}
-</style>
+<!-- NB `.wf-num` used to be defined here in a non-scoped <style>, which made
+     it look local to a component that is only one of its three users (the
+     Setup and Export panels style every input with it too). It now lives in
+     style.css, themed off --wf-input/--wf-line. -->
+

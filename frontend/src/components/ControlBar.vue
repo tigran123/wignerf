@@ -192,9 +192,9 @@ const stepInfo = computed(() => {
 <template>
   <!-- Every readout sits in a FIXED-width box: live-updating text must
        never change the layout (page scrollbars used to flicker). -->
-  <div class="flex items-center gap-4 px-3 py-2 bg-neutral-900 border-t border-neutral-800 text-sm text-neutral-200 whitespace-nowrap overflow-hidden">
+  <div class="flex items-center gap-4 px-3 py-2 bg-panel border-t border-line-soft text-sm text-fg whitespace-nowrap overflow-hidden">
     <button
-      class="w-20 py-1 shrink-0 rounded font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+      class="wf-solid w-20 py-1 shrink-0 rounded font-medium"
       :class="playLabel === 'Solve' ? 'bg-pink-800 hover:bg-pink-700'
                                     : 'bg-sky-700 hover:bg-sky-600'"
       :disabled="solveBlocked"
@@ -210,7 +210,7 @@ const stepInfo = computed(() => {
 
     <label class="flex items-center gap-2 shrink-0"
            :class="running ? 'opacity-40' : ''" :title="delayTitle">
-      <span class="text-neutral-400">delay</span>
+      <span class="text-fg-3">delay</span>
       <input type="range" :min="0" :max="DIAL_STEPS" step="1"
              :disabled="running" :value="dial" @input="setDelay"
              @change="(ev: Event) => (ev.target as HTMLInputElement).blur()"
@@ -219,27 +219,27 @@ const stepInfo = computed(() => {
     </label>
 
     <div class="tabular-nums w-64 truncate shrink-0">
-      <span class="text-neutral-400">t =</span>
+      <span class="text-fg-3">t =</span>
       <input v-if="editingT" ref="tInput" v-model="tDraft"
-             class="w-28 bg-neutral-800 border border-sky-600 rounded px-1 tabular-nums"
+             class="w-28 bg-raised border border-info rounded px-1 tabular-nums"
              @keydown.enter="commitT" @keydown.esc="editingT = false"
              @blur="commitT" />
       <span v-else
-            :class="canEditT ? 'cursor-pointer underline decoration-dotted decoration-neutral-600' : ''"
+            :class="canEditT ? 'cursor-pointer underline decoration-dotted decoration-dim' : ''"
             :title="canEditT ? 'click to type t directly (seeks to the nearest record); ←/→ step ±10%, ↓/↑ one record, Home/End jump to start/end' : ''"
             @click="startEditT"><span class="wf-fixnum w-[7ch]">{{ tAu }}</span>
         a.u. (<span class="wf-fixnum w-[7ch]">{{ tFs }}</span> fs)</span>
     </div>
-    <div v-if="batchPct" class="shrink-0 px-2 py-0.5 rounded bg-amber-900/60 text-amber-300 text-xs tabular-nums"
+    <div v-if="batchPct" class="shrink-0 px-2 py-0.5 rounded bg-warn-soft text-warn-2 text-xs tabular-nums"
          title="batch compute progress toward t₂ — no frames are streamed; press Play when done to review">
       batch {{ batchPct }}</div>
-    <div class="tabular-nums w-64 truncate shrink-0"><span class="text-neutral-400">E =</span>
+    <div class="tabular-nums w-64 truncate shrink-0"><span class="text-fg-3">E =</span>
       <span class="wf-fixnum w-[9ch]">{{ eHa }}</span>
       Ha (<span class="wf-fixnum w-[8ch]">{{ eEv }}</span> eV)</div>
-    <div class="tabular-nums w-36 truncate shrink-0"><span class="text-neutral-400">ΔX·ΔP =</span> {{ uncert }}</div>
+    <div class="tabular-nums w-36 truncate shrink-0"><span class="text-fg-3">ΔX·ΔP =</span> {{ uncert }}</div>
     <div class="tabular-nums w-36 truncate shrink-0"
-         :title="'purity of the first active variant'"><span class="text-neutral-400">γ =</span> {{ purity }}</div>
-    <div class="ml-auto min-w-0 truncate text-right text-xs text-neutral-500 tabular-nums"
+         :title="'purity of the first active variant'"><span class="text-fg-3">γ =</span> {{ purity }}</div>
+    <div class="ml-auto min-w-0 truncate text-right text-xs text-muted tabular-nums"
          :title="stepInfo">{{ stepInfo }}</div>
   </div>
 </template>

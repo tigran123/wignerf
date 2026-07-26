@@ -11,7 +11,8 @@ import { perfStage } from '../lib/perf'
 import { loadHidden, saveHidden } from '../lib/plotPrefs'
 import type { Frame } from '../lib/protocol'
 import { createUplotZoom } from '../lib/uplotZoom'
-import { VARIANT_META, type VariantKey } from '../lib/variants'
+import { chartPalette, theme } from '../lib/theme'
+import { VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
 
 const props = defineProps<{
   frameSource: (h: (f: Frame) => void) => () => void
@@ -61,7 +62,7 @@ function makeChart(width: number) {
     // stay individually visible through the gaps of the ones on top
     ...props.variants.map((v) => ({
       label: v,
-      stroke: VARIANT_META[v].color,
+      stroke: variantColor(v),
       dash: VARIANT_META[v].dash,
       width: 1.5,
       points: { show: false },
@@ -70,7 +71,9 @@ function makeChart(width: number) {
       show: !hidden.value.has(v),
     })),
   ]
-  const grid = { show: props.showGrid ?? true, stroke: '#3f3f46', width: 1 }
+  // construction-time in uPlot, hence the destroy+rebuild on a theme change
+  const pal = chartPalette()
+  const grid = { show: props.showGrid ?? true, stroke: pal.grid, width: 1 }
   return new uPlot(
     {
       width,
@@ -80,8 +83,8 @@ function makeChart(width: number) {
       plugins: [zoom.plugin], // owns the cursor config (drag/wheel/dblclick)
       scales: { x: { time: false } },
       axes: [
-        { stroke: '#a3a3a3', grid, ticks: { stroke: '#525252' } },
-        { stroke: '#a3a3a3', grid, ticks: { stroke: '#525252' } },
+        { stroke: pal.axis, grid, ticks: { stroke: pal.tick } },
+        { stroke: pal.axis, grid, ticks: { stroke: pal.tick } },
       ],
       series,
     },
@@ -118,9 +121,9 @@ onMounted(() => {
     zoom.setData(chart, lastData)
     perfStage('plots', performance.now() - t0)
   })
-  // grid-lines toggle: rebuild the chart in place, keeping the data — a
-  // remount would blank the plot until the next frame arrives
-  watch(() => props.showGrid, () => {
+  // grid-lines toggle and theme change: rebuild the chart in place, keeping
+  // the data — a remount would blank the plot until the next frame arrives
+  watch([() => props.showGrid, theme], () => {
     chart?.destroy()
     chart = makeChart(el.value?.clientWidth || 360)
     if (lastData) zoom.setData(chart, lastData)
@@ -143,20 +146,14 @@ onBeforeUnmount(() => {
         <input type="checkbox" class="scale-75" :checked="!hidden.has(v)"
                @change="toggle(v)" />
         <span class="text-[9px] leading-none"
-              :style="{ color: VARIANT_META[v].color }">{{ v.toUpperCase() }}</span>
+              :style="{ color: variantColor(v) }">{{ v.toUpperCase() }}</span>
       </label>
     </div>
     <div ref="el" class="wf-plot flex-1 min-w-0"></div>
   </div>
 </template>
 
-<style>
-.wf-plot .u-title {
-  color: #d4d4d4;
-  font-size: 12px;
-  font-weight: 500;
-}
-.wf-plot .u-values { color: #d4d4d4; }
-/* drag-select zoom box (uPlot's default is invisible on the dark theme) */
-.wf-plot .u-select { background: rgba(255, 255, 255, 0.12); }
-</style>
+<!-- NB the `.wf-plot .u-*` rules that used to live here were global and
+     styled SeriesPlot and PotentialEditor too; they are now in style.css,
+     themed off --wf-chart-*. -->
+

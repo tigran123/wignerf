@@ -123,12 +123,13 @@ def export_workers():
 _WORKER = {}
 
 
-def _worker_init(variants, stats, meta, width, height, show_grid):
+def _worker_init(variants, stats, meta, width, height, show_grid, theme):
     """One persistent FrameFigure per worker process, reused across records
     (it re-applies the window itself on the rare auto-expand regrid). Building
     it here — once per worker, not once per frame — is what the pool is for."""
     _WORKER["fig"] = render_mpl.FrameFigure(
-        variants, stats, meta, width=width, height=height, show_grid=show_grid)
+        variants, stats, meta, width=width, height=height,
+        show_grid=show_grid, theme=theme)
 
 
 def _worker_render(args):
@@ -230,7 +231,8 @@ class ExportJob(threading.Thread):
                     mp_context=multiprocessing.get_context("spawn"),
                     initializer=_worker_init,
                     initargs=(self.variants, stats, meta, self.spec.width,
-                              self.spec.height, self.spec.show_grid))
+                              self.spec.height, self.spec.show_grid,
+                              self.spec.theme))
                 self._render_parallel(proc, executor, w)
             proc.stdin.close()
             rc = proc.wait(timeout=120)
@@ -286,7 +288,8 @@ class ExportJob(threading.Thread):
         fig = render_mpl.FrameFigure(self.variants, stats, meta,
                                      width=self.spec.width,
                                      height=self.spec.height,
-                                     show_grid=self.spec.show_grid)
+                                     show_grid=self.spec.show_grid,
+                                     theme=self.spec.theme)
         for k in self.records:
             if self.cancel_evt.is_set():
                 raise _Cancelled()

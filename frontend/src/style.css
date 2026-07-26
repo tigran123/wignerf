@@ -1,9 +1,157 @@
 @import "tailwindcss";
 
+/* Class-based dark mode, NOT prefers-color-scheme: the header toggle is the
+   authority and its choice persists (lib/theme.ts, localStorage
+   wignerf.theme).
+
+   NOTHING currently uses a `dark:` utility — the tokens below cover every
+   colour, and the one property Tailwind has no colour utility for is handled
+   by a var() in an arbitrary property ([text-shadow:var(--wf-label-shadow)]
+   in Timeline.vue). This declaration is kept anyway, because Tailwind 4's
+   BUILT-IN `dark:` is @media (prefers-color-scheme: dark): delete this line
+   and the first `dark:` anyone reaches for silently follows the OS instead of
+   the toggle, in an app where those two routinely disagree. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------------------------------------------------------------------
+   THEME TOKENS. CSS is the single source of truth for every UI colour: the
+   values live once per theme in the :root / .dark blocks below, and this
+   `inline` block turns them into real Tailwind utilities (bg-panel, text-fg,
+   border-line, …). `inline` is load-bearing — without it Tailwind copies the
+   VALUE into :root at build time, and overriding --wf-* at runtime would then
+   change nothing.
+
+   Anything the charts need is read from JS instead (lib/theme.chartPalette),
+   so it stays a plain --wf-chart-* property with no utility.
+   backend/core/render_mpl.py mirrors both sets for the mp4 export.
+   --------------------------------------------------------------------------- */
+@theme inline {
+  /* surfaces */
+  --color-app: var(--wf-app);
+  --color-panel: var(--wf-panel);
+  --color-raised: var(--wf-raised);
+  --color-raised-hover: var(--wf-raised-hover);
+  --color-input: var(--wf-input);
+  --color-track: var(--wf-track);
+  --color-scrim: var(--wf-scrim);
+  /* lines */
+  --color-line: var(--wf-line);
+  --color-line-soft: var(--wf-line-soft);
+  /* text, brightest to faintest */
+  --color-fg: var(--wf-fg);
+  --color-fg-2: var(--wf-fg-2);
+  --color-fg-3: var(--wf-fg-3);
+  --color-muted: var(--wf-muted);
+  --color-dim: var(--wf-dim);
+  /* status accents */
+  --color-warn: var(--wf-warn);
+  --color-warn-2: var(--wf-warn-2);
+  --color-warn-soft: var(--wf-warn-soft);
+  --color-error: var(--wf-error);
+  --color-ok: var(--wf-ok);
+  --color-info: var(--wf-info);
+  --color-info-fg: var(--wf-info-fg);
+  --color-info-soft: var(--wf-info-soft);
+  --color-select: var(--wf-select);
+}
+
+/* LIGHT is the default: an empty localStorage gets this, and index.html only
+   adds .dark when a stored preference asks for it. */
+:root {
+  color-scheme: light;
+
+  --wf-app: #ffffff;
+  --wf-panel: #fafafa;
+  --wf-raised: #e5e5e5;
+  --wf-raised-hover: #d4d4d4;
+  --wf-input: #ffffff;
+  --wf-track: #d4d4d4;
+  --wf-scrim: #ffffffd9;
+
+  --wf-line: #d4d4d4;
+  --wf-line-soft: #e5e5e5;
+
+  --wf-fg: #171717;
+  --wf-fg-2: #404040;
+  --wf-fg-3: #525252;
+  --wf-muted: #737373;
+  --wf-dim: #a3a3a3;
+
+  --wf-warn: #b45309;
+  --wf-warn-2: #92400e;
+  --wf-warn-soft: #fef3c7;
+  --wf-warn-border: #d97706;
+  --wf-error: #b91c1c;
+  --wf-ok: #047857;
+  --wf-info: #0369a1;
+  --wf-info-fg: #075985;
+  --wf-info-soft: #e0f2fe;
+  --wf-select: #a16207;
+
+  /* Charts (uPlot, read by lib/theme.chartPalette). The grid strokes are
+     matched to the dark theme by CONTRAST against their own axes face, not
+     by picking the mirror-image Tailwind shade: zinc-200 measured a
+     luminance delta of 22 against --wf-panel where dark's #3f3f46 gets 41,
+     and a too-faint grid is how a flat purity line ends up camouflaged. */
+  --wf-chart-axis: #525252;
+  --wf-chart-tick: #a3a3a3;
+  --wf-chart-grid: #d4d4d8;      /* delta 38 */
+  --wf-chart-grid-soft: #f4f4f5; /* delta 6, matching dark's blended 6 */
+  --wf-chart-text: #404040;
+  --wf-chart-select: rgba(0, 0, 0, 0.07);
+  --wf-cursor: #db2777;
+
+  /* readouts painted over the timeline bar: the halo has to be the OPPOSITE
+     of the text it separates from the bar */
+  --wf-label-shadow: 0 1px 2px rgb(255 255 255 / 0.85);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --wf-app: #0a0a0a;
+  --wf-panel: #171717;
+  --wf-raised: #262626;
+  --wf-raised-hover: #404040;
+  --wf-input: #171717;
+  --wf-track: #363636;
+  --wf-scrim: #000000cc;
+
+  --wf-line: #404040;
+  --wf-line-soft: #262626;
+
+  --wf-fg: #f5f5f5;
+  --wf-fg-2: #d4d4d4;
+  --wf-fg-3: #a3a3a3;
+  --wf-muted: #737373;
+  --wf-dim: #525252;
+
+  --wf-warn: #fbbf24;
+  --wf-warn-2: #fcd34d;
+  --wf-warn-soft: #78350f99;
+  --wf-warn-border: #f59e0b;
+  --wf-error: #f87171;
+  --wf-ok: #34d399;
+  --wf-info: #38bdf8;
+  --wf-info-fg: #bae6fd;
+  --wf-info-soft: #0c4a6e99;
+  --wf-select: #facc15;
+
+  --wf-chart-axis: #a3a3a3;
+  --wf-chart-tick: #525252;
+  --wf-chart-grid: #3f3f46;
+  --wf-chart-grid-soft: #26262666;
+  --wf-chart-text: #d4d4d4;
+  --wf-chart-select: rgba(255, 255, 255, 0.12);
+  --wf-cursor: #f472b6;
+
+  --wf-label-shadow: 0 1px 2px rgb(0 0 0 / 0.85);
+}
+
 html, body, #app {
   height: 100%;
   margin: 0;
-  background: #0a0a0a;
+  background: var(--wf-app);
   /* The app is a fixed full-screen layout; page-level scrollbars must
      never appear (variable-width live readouts would otherwise make them
      flicker on every frame). Inner regions manage their own overflow. */
@@ -14,8 +162,8 @@ html, body, #app {
    Physics fields apply on blur/Enter — an unapplied value must LOOK
    unapplied, not silently disagree with the computation) */
 .wf-pending {
-  border-color: #f59e0b;
-  color: #fbbf24;
+  border-color: var(--wf-warn-border);
+  color: var(--wf-warn);
 }
 
 /* a live numeric readout: fixed-width, right-aligned, tabular digits — the
@@ -33,7 +181,7 @@ html, body, #app {
   top: 0;
   bottom: 0;
   width: 1px;
-  background: #f472b6;
+  background: var(--wf-cursor);
   opacity: 0.9;
   pointer-events: none;
   will-change: transform;
@@ -42,10 +190,54 @@ html, body, #app {
 /* keycap in the help popover */
 .wf-kbd {
   padding: 0 4px;
-  border: 1px solid #525252;
+  border: 1px solid var(--wf-line);
   border-bottom-width: 2px;
   border-radius: 4px;
-  background: #262626;
+  background: var(--wf-raised);
   font-family: ui-monospace, monospace;
   white-space: nowrap;
 }
+
+/* A saturated action button (Solve/Play, Restart session, Apply live,
+   Render). The fill hue stays a utility on each button; this carries the two
+   things they all share and that both used to be wrong:
+   - `color: #fff`. These buttons never SET a text colour — they inherited the
+     shell's light text, which was invisible the instant the shell went light
+     ("black on blue"). White is right in both themes: every hue used here is
+     a 700/800 shade.
+   - a real disabled state. `disabled:opacity-40` over a saturated fill gives
+     pale colour under equally pale text, unreadable either way round; drop to
+     the neutral raised surface instead.
+   Unlayered, so it beats the Tailwind utility layer without !important. */
+.wf-solid { color: #fff; }
+.wf-solid:disabled {
+  background: var(--wf-raised);
+  color: var(--wf-dim);
+  cursor: not-allowed;
+}
+
+/* Every numeric input and select in the app (SetupPanel, ICEditor,
+   ExportPanel). Global on purpose — it used to live in a non-scoped <style>
+   inside ICEditor.vue, which made it look local to a component that is only
+   one of its three users. Tailwind's preflight gives form controls
+   `color: inherit`, so the text follows --wf-fg with no rule here. */
+.wf-num {
+  width: 100%;
+  background: var(--wf-input);
+  border: 1px solid var(--wf-line);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Every uPlot chart (SeriesPlot, MarginalsPlot, PotentialEditor). Also
+   global on purpose — this block used to sit inside MarginalsPlot.vue and
+   silently styled the other two. uPlot's own default .u-select is
+   rgba(0,0,0,.07), invisible on the dark theme. */
+.wf-plot .u-title {
+  color: var(--wf-chart-text);
+  font-size: 12px;
+  font-weight: 500;
+}
+.wf-plot .u-values { color: var(--wf-chart-text); }
+.wf-plot .u-select { background: var(--wf-chart-select); }

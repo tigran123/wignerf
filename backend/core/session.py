@@ -602,6 +602,16 @@ class SimSession:
                                "before": old})
         self.post_msg({"type": "params_applied", "applied": new, "before": old,
                        "at_record": at_record})
+        # ...and echo the new physics at once, exactly as play/pause do
+        # (routers/stream._handle). The periodic status is only every
+        # STATUS_PERIOD and that check sits at the top of the sender's tick, so
+        # under a frame burst it lags by SECONDS — measured ~5 s at 256². The
+        # setup form marks a field amber while it disagrees with `status`, so
+        # without this echo a live change the session had already accepted left
+        # its own field amber long after the "✓ applied" flash, i.e. the UI
+        # said "not applied" about something it had just confirmed applying.
+        # Cheap: live parameter changes are user-paced, not per-frame.
+        self.post_msg(self.status())
 
     def status(self):
         first, last = self.history.extent()

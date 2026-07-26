@@ -492,6 +492,43 @@ def test_set_params_live_and_rejected():
         client.delete("/api/sessions/%s" % info["session_id"])
 
 
+def test_params_applied_is_followed_by_a_fresh_status():
+    """A live change must echo its own status IMMEDIATELY, the way play/pause
+    do. The periodic status is only every STATUS_PERIOD and that check sits at
+    the top of the sender's tick, so under a frame burst it lags by seconds
+    (measured ~5 s at 256²) — and the setup form marks a field amber while it
+    disagrees with `status`. Without the echo, a change the session had just
+    confirmed applying sat behind an amber "not applied" field."""
+    with TestClient(app) as client:
+        info = _mk(client)
+        with client.websocket_connect(info["ws_url"]) as ws:
+            ws.send_text(json.dumps({"type": "play"}))
+            _recv_frames(ws, 2)
+            ws.send_text(json.dumps({"type": "set_params",
+                                     "params": {"U": "x^4/4"}}))
+            applied_at = None
+            status_at = None
+            for i in range(400):
+                m = ws.receive()
+                if not m.get("text"):
+                    continue
+                d = json.loads(m["text"])
+                if d["type"] == "params_applied" and applied_at is None:
+                    applied_at = i
+                # the status that carries the NEW value, not a stale periodic
+                elif (d["type"] == "status" and applied_at is not None
+                        and d.get("potential") == "x^4/4"):
+                    status_at = i
+                    break
+            assert applied_at is not None, "no params_applied"
+            assert status_at is not None, "no status carrying the new U(x)"
+            # immediately AFTER, not a second later: nothing but the eviction
+            # notice may come between them on the control channel
+            assert status_at - applied_at <= 2, \
+                "status lagged params_applied by %d messages" % (status_at - applied_at)
+        client.delete("/api/sessions/%s" % info["session_id"])
+
+
 def test_no_op_params_are_dropped():
     """A change that changes nothing must leave no trace. The UI sends whole
     fields — PotentialEditor's "Apply live" always carries the U(x) draft,

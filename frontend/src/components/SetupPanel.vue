@@ -11,6 +11,11 @@ import { applyPrecisionInvariants, markPrecisionChosen, resetToDefaults,
          type SimConfig } from '../lib/config'
 
 const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
+                            // live = a session exists; computing = it is
+                            // producing new records right now (only then is
+                            // there a run for U(x)'s "Apply live" to reach —
+                            // status.running is true during playback too)
+                            computing?: boolean
                             liveGrid?: GridCfg | null; maxGrid?: number
                             livePhysics?: LivePhysics | null
                             liveRun?: LiveRun | null
@@ -52,8 +57,14 @@ function runDiffers(field: keyof LiveRun) {
   if (field === 't2' && props.cfg.mode !== 'batch') return false
   return (lr[field] ?? null) !== (props.cfg[field] ?? null)
 }
+// Only the fields this SECTION owns. `precision` is a LiveRun member because
+// that is where status carries it, but it is a COMPUTE control and it has its
+// own amber line down there (`computeStale`) — including it here meant a
+// float64 → float32 switch lit the RUN warning too, announcing "running:
+// interactive (no t₂), Δt rec = 0.05" at someone who had changed neither and
+// whose mode and Δt rec did not differ at all. Each section reports its own.
 const runStale = computed(() =>
-  (['mode', 't2', 'record_dt', 'precision'] as const).some(runDiffers))
+  (['mode', 't2', 'record_dt'] as const).some(runDiffers))
 
 const f32 = computed(() => props.cfg.precision === 'float32')
 
@@ -192,6 +203,16 @@ const historyDiffers = computed(() =>
   props.historyCapMb != null && wantCapMb.value != null
   && props.historyCapMb !== wantCapMb.value)
 
+/** The history tooltip NAMES the host ceiling. That number used to sit beside
+ *  the field as "(0 = host max 110000)", which does not fit a third of this
+ *  column — and the tooltip explained the 0 convention without ever saying
+ *  what 0 resolves TO, which is the half you actually need. */
+const historyHelp = computed(() =>
+  'in-RAM frame history for this session (scrub/replay depth). 0 = the'
+  + " host's WIGNERF_HISTORY_MB, which is also the ceiling — a session can ask"
+  + ' for less, never more'
+  + (props.historyMbMax ? ` (host max ${props.historyMbMax} MiB).` : '.'))
+
 const computeStale = computed(() =>
   deviceDiffers.value || historyDiffers.value
   || (!!props.hasRun && runDiffers('precision')))
@@ -205,10 +226,11 @@ const computeStale = computed(() =>
  * t₂=100" was really the old interactive session and computed straight past
  * t=100). Keep every group named.
  */
-const WHAT_APPLIES_HELP = 'm, c, ℏ, tol, t dir and auto-expand apply LIVE at the'
-  + ' frontier. Grid, IC, variants, RUN (mode, t₂, Δt rec) and COMPUTE'
-  + ' (precision, device, history) need a session restart — the form marks any'
-  + ' of those in amber while it disagrees with the running session.'
+const WHAT_APPLIES_HELP = 'U(x), m, c, ℏ, tol, t dir and auto-expand apply LIVE'
+  + ' at the frontier — the numeric fields on blur/Enter, U(x) via its own'
+  + ' "Apply live" button. Grid, IC, variants, RUN (mode, t₂, Δt rec) and'
+  + ' COMPUTE (precision, device, history) need a session restart — the form'
+  + ' marks any of those in amber while it disagrees with the running session.'
 
 /** Physics fields apply on `@change` (blur/Enter), so a typed-but-not-yet-
  *  committed value is otherwise invisible — mark it, and say so in the note
@@ -273,9 +295,8 @@ function adoptLive() {
     <PotentialEditor
       v-model="props.cfg.potential"
       :grid="props.cfg.grid" :hbar-eff="props.cfg.hbar_eff"
-      :live="live" :variants="props.cfg.variants"
+      :live="live" :computing="computing ?? false" :variants="props.cfg.variants"
       :live-expr="props.livePhysics?.potential ?? null"
-      @update:model-value="emit('dirty')"
       @apply-live="(expr) => emit('apply-live', { U: expr })"
       @validity="(v) => emit('potential-validity', v)"
       @grid-dirty="emit('dirty')"
@@ -284,42 +305,51 @@ function adoptLive() {
     <section class="space-y-1.5">
       <!-- the ? marks the heading as hoverable: a tooltip nobody knows is there
            is the same as no tooltip -->
-      <h3 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider
+      <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider
                  cursor-help w-fit" :title="WHAT_APPLIES_HELP">Physics <span
-        class="text-neutral-600 normal-case">(what applies live?)</span></h3>
-      <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500" title="rest mass, mₑ = 1">m</span>
+        class="text-dim normal-case">(what applies live?)</span></h3>
+      <!-- Seven columns so ONE grid gives two differently-shaped rows AND lets
+           them be uneven where the content is: m, c, ℏ across the first, tol +
+           t dir across the second. c gets 3 of the 7 because it is the only
+           field here holding a long number (137.035999 needs ~10 digits, which
+           an equal third of a 320px column truncates); m and ℏ hold 1-ish, and
+           tol's width goes to its LABEL, which grows by " ≥1e-5" in float32.
+           The m/c/ℏ labels are one glyph, so a fixed `w-4` aligns their three
+           inputs; tol's and t dir's are words and size to content. -->
+      <div class="grid grid-cols-7 gap-x-2 gap-y-1 text-xs">
+        <label class="col-span-2 flex items-center gap-1">
+          <span class="w-4 text-muted" title="rest mass, mₑ = 1">m</span>
           <input v-model.number="props.cfg.mass" type="number" step="any" min="0"
-                 class="wf-num" :class="pending('mass') && 'wf-pending'"
+                 class="wf-num min-w-0" :class="pending('mass') && 'wf-pending'"
                  @change="emit('apply-live', { mass: props.cfg.mass })" />
         </label>
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500"
+        <label class="col-span-3 flex items-center gap-1">
+          <span class="w-4 text-muted"
                 title="speed of light: 137.036 physical, 1 = old toy runs">c</span>
           <input v-model.number="props.cfg.c" type="number" step="any" min="0.1"
-                 class="wf-num" :class="pending('c') && 'wf-pending'"
+                 class="wf-num min-w-0" :class="pending('c') && 'wf-pending'"
                  @change="emit('apply-live', { c: props.cfg.c })" />
         </label>
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500"
+        <label class="col-span-2 flex items-center gap-1">
+          <span class="w-4 text-muted"
                 title="value of ℏ in the evolution equations (a.u.: physical value 1); dial it below 1 to watch the classical limit emerge">ℏ</span>
           <input v-model.number="props.cfg.hbar_eff" type="number" step="any" min="0.001"
-                 class="wf-num" :class="pending('hbar_eff') && 'wf-pending'"
+                 class="wf-num min-w-0" :class="pending('hbar_eff') && 'wf-pending'"
                  @change="emit('apply-live', { hbar_eff: props.cfg.hbar_eff })" />
         </label>
-        <label class="flex items-center gap-1" :title="f32 ? TOL_F32_HELP : TOL_HELP">
-          <span class="w-10 text-neutral-500">tol<template
+        <label class="col-span-4 flex items-center gap-1"
+               :title="f32 ? TOL_F32_HELP : TOL_HELP">
+          <span class="shrink-0 whitespace-nowrap text-muted">tol<template
             v-if="f32"> ≥{{ TOL_MIN_F32.toExponential() }}</template></span>
           <input v-model.number="props.cfg.tol" type="number" step="any"
                  :min="f32 ? TOL_MIN_F32 : 1e-6" max="0.5"
-                 class="wf-num" :class="pending('tol') && 'wf-pending'"
+                 class="wf-num min-w-0" :class="pending('tol') && 'wf-pending'"
                  @change="clampTol(); emit('apply-live', { tol: props.cfg.tol })" />
         </label>
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500"
+        <label class="col-span-3 flex items-center gap-1">
+          <span class="shrink-0 whitespace-nowrap text-muted"
                 title="time direction of NEWLY computed records: flips the sign of dt in the propagator at the frontier. Already-computed history is unaffected — use the timeline to move within it. Shortcut: R">t dir</span>
-          <select class="wf-num" :value="(props.sign ?? 1) > 0 ? 1 : -1"
+          <select class="wf-num min-w-0" :value="(props.sign ?? 1) > 0 ? 1 : -1"
                   @change="emit('apply-live', { dt_sign: Number(($event.target as HTMLSelectElement).value) })">
             <option :value="1">forward</option>
             <option :value="-1">backward</option>
@@ -331,36 +361,36 @@ function adoptLive() {
            permanent three-line paragraph is exactly what the narrow first column
            cannot afford — it moved to the section heading's tooltip (WHAT_APPLIES
            _HELP), where it is still one hover away and still enumerates. -->
-      <p v-if="pendingPhysics" class="text-xs text-amber-400">
+      <p v-if="pendingPhysics" class="text-xs text-warn">
         edited (amber): press Enter or leave the field to apply it live.
       </p>
     </section>
 
     <section class="space-y-1.5">
-      <h3 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Grid</h3>
+      <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Grid</h3>
       <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
         <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500">x₁,x₂</span>
+          <span class="w-10 text-muted">x₁,x₂</span>
           <input v-model.number="props.cfg.grid.x1" type="number" step="any"
                  class="wf-num" @change="emit('dirty')" />
           <input v-model.number="props.cfg.grid.x2" type="number" step="any"
                  class="wf-num" @change="emit('dirty')" />
         </label>
         <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500">p₁,p₂</span>
+          <span class="w-10 text-muted">p₁,p₂</span>
           <input v-model.number="props.cfg.grid.p1" type="number" step="any"
                  class="wf-num" @change="emit('dirty')" />
           <input v-model.number="props.cfg.grid.p2" type="number" step="any"
                  class="wf-num" @change="emit('dirty')" />
         </label>
         <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500">Nx</span>
+          <span class="w-10 text-muted">Nx</span>
           <select v-model.number="props.cfg.grid.Nx" class="wf-num" @change="emit('dirty')">
             <option v-for="n in sizeOptions" :key="n" :value="n">{{ n }}</option>
           </select>
         </label>
         <label class="flex items-center gap-1">
-          <span class="w-10 text-neutral-500">Np</span>
+          <span class="w-10 text-muted">Np</span>
           <select v-model.number="props.cfg.grid.Np" class="wf-num" @change="emit('dirty')">
             <option v-for="n in sizeOptions" :key="n" :value="n">{{ n }}</option>
           </select>
@@ -382,16 +412,16 @@ function adoptLive() {
                :title="f32 ? AUTO_EXPAND_F32_HELP : AUTO_EXPAND_HELP">
           <input type="checkbox" v-model="props.cfg.auto_expand" :disabled="f32"
                  @change="emit('apply-live', { auto_expand: props.cfg.auto_expand })" />
-          <span :class="f32 ? 'text-neutral-600' : 'text-neutral-400'">auto-expand<template
+          <span :class="f32 ? 'text-dim' : 'text-fg-3'">auto-expand<template
             v-if="f32"> — float64 only</template></span>
         </label>
         <label class="flex items-center gap-1 cursor-pointer select-none"
                title="axis grid lines on all plots, the W panels and the IC preview">
           <input type="checkbox" v-model="showGrid" />
-          <span class="text-neutral-400">grid lines</span>
+          <span class="text-fg-3">grid lines</span>
         </label>
       </div>
-      <p v-if="liveDiffers" class="text-xs text-amber-400">
+      <p v-if="liveDiffers" class="text-xs text-warn">
         live: [{{ fmt(liveGrid!.x1) }}, {{ fmt(liveGrid!.x2) }}] ×
         [{{ fmt(liveGrid!.p1) }}, {{ fmt(liveGrid!.p2) }}]
         {{ liveGrid!.Nx }}×{{ liveGrid!.Np }}
@@ -401,78 +431,75 @@ function adoptLive() {
     </section>
 
     <section class="space-y-1.5">
-      <h3 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Run</h3>
+      <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Run</h3>
       <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
         <label class="flex items-center gap-1"
                title="interactive: no end time — Solve keeps computing new records until you pause, streaming a live preview you can zoom. batch: Solve computes at full speed until t = t₂ with NO frame streaming — the heatmap/marginals dim and only a progress report (t, %, throughput) is sent, so heavy runs are not slowed by transferring frames; the observable curves still update. Then the button becomes Play — playback of the finished history.">
-          <span class="w-14 text-neutral-500">mode</span>
+          <span class="w-14 text-muted">mode</span>
           <select v-model="props.cfg.mode" class="wf-num"
-                  :class="runDiffers('mode') ? 'text-amber-400' : ''">
+                  :class="runDiffers('mode') ? 'text-warn' : ''">
             <option value="interactive">interactive</option>
             <option value="batch">batch</option>
           </select>
         </label>
         <label class="flex items-center gap-1" v-if="props.cfg.mode === 'batch'">
-          <span class="w-14 text-neutral-500">t₂</span>
+          <span class="w-14 text-muted">t₂</span>
           <input v-model.number.lazy="props.cfg.t2" type="number" step="any"
                  class="wf-num"
-                 :class="runDiffers('t2') ? 'text-amber-400' : ''" />
+                 :class="runDiffers('t2') ? 'text-warn' : ''" />
         </label>
         <label class="flex items-center gap-1">
-          <span class="w-14 text-neutral-500" title="physical time per record">Δt rec</span>
+          <span class="w-14 text-muted" title="physical time per record">Δt rec</span>
           <input v-model.number.lazy="props.cfg.record_dt" type="number" step="any" min="0.001"
                  class="wf-num"
-                 :class="runDiffers('record_dt') ? 'text-amber-400' : ''" />
+                 :class="runDiffers('record_dt') ? 'text-warn' : ''" />
         </label>
         <!-- playback speed lives ONLY in the transport bar; a session
              always starts at 1.00 a.u./s -->
       </div>
       <!-- Name what is ACTUALLY running. The amber fields say "this differs";
            only this line says WHAT you are computing under, which is the fact
-           you need when a run does not do what the form describes. -->
-      <p v-if="runStale" class="text-xs text-amber-400">
+           you need when a run does not do what the form describes. The RUN
+           fields only — the precision it used to append belongs to COMPUTE and
+           is stated by COMPUTE's own line, so quoting it here just said the
+           same word twice whenever both differed. -->
+      <p v-if="runStale" class="text-xs text-warn">
         running: {{ liveRun!.mode === 'batch'
                     ? `batch, t₂ = ${liveRun!.t2}` : 'interactive (no t₂)' }},
-        Δt rec = {{ liveRun!.record_dt }}, {{ liveRun!.precision }}
+        Δt rec = {{ liveRun!.record_dt }}
         — restart to apply the values above
       </p>
     </section>
 
     <section class="space-y-1.5">
-      <h3 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Compute</h3>
-      <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
-        <label class="flex items-center gap-1 col-span-2"
+      <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Compute</h3>
+      <!-- One row, three columns — these were three full-width rows each
+           carrying one short control. The label sits ABOVE its control here
+           rather than beside it, unlike every other section: "precision",
+           "device" and "history" are WORDS, and a third of this column is
+           ~100px, which an inline label plus a select showing "float64" does
+           not fit. Stacked still costs two lines instead of three. -->
+      <div class="grid grid-cols-3 gap-x-2 gap-y-1 text-xs">
+        <label class="flex flex-col gap-0.5 min-w-0"
                title="spectral working precision. float64 is the physics setting. float32 is a PREVIEW mode: ~3.3-3.8× faster and ~58% of the VRAM on CUDA (no speedup on CPU), but purity and energy drift by ~1e-4 with the same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the relativistic shear. The exponents are built in double either way.">
-          <span class="w-14 text-neutral-500">precision</span>
+          <span class="text-muted">precision</span>
           <!-- onPrecisionChange marks the choice (until the user operates THIS
                control the form only holds a placeholder and the create payload
                omits precision, so the host's WIGNERF_PRECISION decides) and
                applies the float32 invariants synchronously — see its comment
                for why a watcher is too late. -->
           <select v-model="props.cfg.precision" class="wf-num"
-                  :class="runDiffers('precision') ? 'text-amber-400' : ''"
+                  :class="runDiffers('precision') ? 'text-warn' : ''"
                   @change="onPrecisionChange()">
             <option value="float64">float64</option>
             <option value="float32">float32</option>
           </select>
         </label>
-        <!-- Only while the choice is PENDING: it names what the switch just did
-             to two OTHER settings, which is a fact about the switch, not a
-             standing property of the session. "Restart session" applies the
-             precision, `runDiffers` goes false, and this clears itself — from
-             then on the header badge carries the one permanent fact. The
-             reasons stay in each control's tooltip, and the controls keep a
-             compact marker for devices with no hover. -->
-        <p v-if="f32 && runDiffers('precision')"
-           class="col-span-2 text-xs text-amber-400/90 -mt-0.5">
-          single precision mode<template v-if="f32Applied.length">;
-          {{ f32Applied.join('; ') }}</template>
-        </p>
-        <label class="flex items-center gap-1 col-span-2"
+        <label class="flex flex-col gap-0.5 min-w-0"
                title="which device(s) this session's variant workers run on. Default spreads them over the host's whole WIGNERF_DEVICE pool, costliest variant to the fastest card; pick one device to keep a session off a card you need for something else.">
-          <span class="w-14 text-neutral-500">device</span>
-          <select v-model="props.cfg.device" class="wf-num flex-1"
-                  :class="deviceDiffers ? 'text-amber-400' : ''"
+          <span class="text-muted">device</span>
+          <select v-model="props.cfg.device" class="wf-num"
+                  :class="deviceDiffers ? 'text-warn' : ''"
                   @change="emit('dirty')">
             <option value="">default (host pool)</option>
             <option v-for="d in props.deviceOptions ?? []" :key="d.spec" :value="d.spec">
@@ -483,21 +510,36 @@ function adoptLive() {
             </option>
           </select>
         </label>
-        <p v-if="deviceMissing" class="col-span-2 text-xs text-amber-400">
+        <label class="flex flex-col gap-0.5 min-w-0" :title="historyHelp">
+          <span class="text-muted">history</span>
+          <!-- the unit stays to the RIGHT of the field, as it reads; the
+               "0 = host max N" it used to carry alongside does not fit a third
+               of this column and moved into the tooltip above, which had to
+               name the number anyway -->
+          <span class="flex items-center gap-1">
+            <input v-model.number.lazy="props.cfg.history_mb" type="number" step="64" min="0"
+                   :max="props.historyMbMax ?? undefined" class="wf-num min-w-0"
+                   :class="historyDiffers ? 'text-warn' : ''"
+                   @change="clampHistory(); emit('dirty')" />
+            <span class="shrink-0 text-muted">MiB</span>
+          </span>
+        </label>
+        <!-- What the switch just did to two OTHER settings — a fact about the
+             switch, not a standing property of the session, so it lives only
+             while the choice is PENDING and "Restart session" clears it. It
+             used to open with "single precision mode", which said nothing the
+             select, its tooltip and the header's float32 badge do not already
+             say, and which appeared even when the switch had changed nothing
+             else (a form already at tol ≥ 1e-5 with auto-expand off). What is
+             left is only the part no other control reports. -->
+        <p v-if="f32 && runDiffers('precision') && f32Applied.length"
+           class="col-span-3 text-xs text-warn/90 -mt-0.5">
+          {{ f32Applied.join('; ') }}
+        </p>
+        <p v-if="deviceMissing" class="col-span-3 text-xs text-warn">
           this backend has no {{ props.cfg.device }} — Restart will be refused
           until you pick another.
         </p>
-        <label class="flex items-center gap-1 col-span-2"
-               title="in-RAM frame history for this session (scrub/replay depth). 0 = the host's WIGNERF_HISTORY_MB, which is also the ceiling — a session can ask for less, never more.">
-          <span class="w-14 text-neutral-500">history</span>
-          <input v-model.number.lazy="props.cfg.history_mb" type="number" step="64" min="0"
-                 :max="props.historyMbMax ?? undefined" class="wf-num"
-                 :class="historyDiffers ? 'text-amber-400' : ''"
-                 @change="clampHistory(); emit('dirty')" />
-          <span class="text-neutral-500">MiB
-            <template v-if="props.historyMbMax">(0 = host max {{ props.historyMbMax }})</template>
-          </span>
-        </label>
       </div>
       <!-- Only when a field DISAGREES with the session. The steady-state facts
            live where they cost nothing: the devices and the history cap ride the
@@ -506,17 +548,21 @@ function adoptLive() {
            one — the amber fields say "this differs", only this says WHAT you are
            computing under, which is the fact you need when a run does not do
            what the form describes. -->
-      <p v-if="computeStale" class="text-xs text-amber-400">
+      <p v-if="computeStale" class="text-xs text-warn">
         running {{ liveRun?.precision ?? '' }} on
         {{ props.liveDevices?.join(', ') || '—' }}<template
           v-if="props.historyCapMb">, history cap {{ props.historyCapMb }} MiB</template>
         — restart to apply the values above
       </p>
-      <button class="w-full py-1.5 rounded bg-sky-800 hover:bg-sky-700 font-medium"
-              @click="emit('restart')">Restart session</button>
-      <button class="w-full py-1 rounded bg-neutral-800 hover:bg-neutral-700 text-xs text-neutral-300"
-              title="restore grid, potential, physics, run mode, IC and variants to their defaults"
-              @click="resetSetup">Reset setup to defaults</button>
+      <div class="flex gap-2">
+        <button class="wf-solid flex-1 py-1.5 rounded bg-sky-700 hover:bg-sky-600
+                       font-medium whitespace-nowrap"
+                @click="emit('restart')">Restart session</button>
+        <button class="flex-1 py-1.5 rounded bg-raised hover:bg-raised-hover
+                       text-fg-2 whitespace-nowrap"
+                title="restore grid, U(x), physics, run mode, IC and variants to their defaults"
+                @click="resetSetup">Reset to defaults</button>
+      </div>
     </section>
   </div>
 </template>

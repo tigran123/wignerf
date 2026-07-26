@@ -21,7 +21,14 @@ WignerRenderer.ts) so the video and the screen read the same:
   re-derives its grid from the painted frame): freezing them at the range
   union would shrink every frame before an auto-expansion into a corner of
   its panel. Only value scales are export-wide,
-- variant colours and dash patterns mirror frontend/src/lib/variants.ts.
+- variant colours and dash patterns mirror frontend/src/lib/variants.ts, and
+  the frame is rendered in the SPA's light or dark theme (ExportSpec.theme,
+  defaulted from the app's own toggle): the palettes below mirror the
+  --wf-* custom properties in frontend/src/style.css. Change a colour on one
+  side and change it on the other — a video that does not read like the
+  screen is the whole failure mode this module exists to avoid.
+  What does NOT change with the theme is the heatmap itself ("bwr", white at
+  W = 0) or the grid drawn over it, exactly as in the SPA.
 """
 
 import textwrap
@@ -34,23 +41,59 @@ from matplotlib.ticker import FuncFormatter
 
 from .protocol import VARIANTS
 
-# mirrors frontend/src/lib/variants.ts (VARIANT_META)
-VARIANT_STYLE = {
-    "qn": ("Quantum, non-relativistic", "#38bdf8", (0, ())),
-    "qr": ("Quantum, relativistic", "#a78bfa", (0, (12, 7))),
-    "cn": ("Classical, non-relativistic", "#fbbf24", (0, (6, 6))),
-    "cr": ("Classical, relativistic", "#34d399", (0, (2, 6))),
+THEMES = ("dark", "light")
+
+# Labels and dash patterns mirror frontend/src/lib/variants.ts (VARIANT_META);
+# the dashes are the anti-occlusion device (coincident curves stay legible
+# through each other's gaps) and so are theme-independent.
+VARIANT_LABEL_DASH = {
+    "qn": ("Quantum, non-relativistic", (0, ())),
+    "qr": ("Quantum, relativistic", (0, (12, 7))),
+    "cn": ("Classical, non-relativistic", (0, (6, 6))),
+    "cr": ("Classical, relativistic", (0, (2, 6))),
 }
 
-BG = "#0a0a0a"          # bg-neutral-950, as in the SPA
-AXBG = "#171717"
-FG = "#d4d4d4"
-MUTED = "#a3a3a3"
-GRIDC = "#3f3f46"       # uPlot grid stroke (SeriesPlot/MarginalsPlot)
-# GridOverlay.vue's phase-space grid: rgba(120,120,120,.28), .55 at zero
+# variants.ts VARIANT_COLORS: Tailwind *-400 on dark, *-600 on light — a
+# curve colour has to hold its own against the PAGE, and #fbbf24 amber on
+# white does not.
+VARIANT_COLORS = {
+    "dark": {"qn": "#38bdf8", "qr": "#a78bfa", "cn": "#fbbf24", "cr": "#34d399"},
+    "light": {"qn": "#0284c7", "qr": "#7c3aed", "cn": "#d97706", "cr": "#059669"},
+}
+
+# The SPA's --wf-* tokens (frontend/src/style.css), by role:
+#   bg      figure face   (--wf-app)
+#   axbg    axes face     (--wf-panel)
+#   fg      titles        (--wf-chart-text)
+#   muted   ticks/labels  (--wf-chart-axis)
+#   grid    chart grid + spines (--wf-chart-grid)
+#   clock   the header time readout (the QN hue)
+#   cursor  time cursor on the series (--wf-cursor)
+PALETTE = {
+    "dark": {
+        "bg": "#0a0a0a", "axbg": "#171717", "fg": "#d4d4d4",
+        "muted": "#a3a3a3", "grid": "#3f3f46",
+        "clock": "#38bdf8", "cursor": "#f472b6",
+    },
+    "light": {
+        "bg": "#ffffff", "axbg": "#fafafa", "fg": "#404040",
+        "muted": "#525252", "grid": "#d4d4d8",
+        "clock": "#0284c7", "cursor": "#db2777",
+    },
+}
+
+# GridOverlay.vue's phase-space grid: rgba(120,120,120,.28), .55 at zero.
+# Theme-independent — it is drawn over the heatmap, which is too.
 PANEL_GRIDC = "#787878"
 PANEL_GRID_ALPHA = 0.28
 PANEL_ZERO_ALPHA = 0.55
+
+
+def variant_style(key, theme="light"):
+    """(label, colour, dash) for a variant in `theme` — the shape
+    VARIANT_STYLE used to have before the palette became theme-dependent."""
+    label, dash = VARIANT_LABEL_DASH[key]
+    return label, VARIANT_COLORS[theme][key], dash
 
 AU_TIME_FS = 2.4188843265857e-2      # lib/units.ts
 AU_ENERGY_EV = 27.211386245988
@@ -98,20 +141,20 @@ def _num_width(values, decimals=3):
                default=decimals + 2)
 
 
-def _style_axes(ax, title=None, title_loc="center", grid=True):
-    ax.set_facecolor(AXBG)
+def _style_axes(ax, pal, title=None, title_loc="center", grid=True):
+    ax.set_facecolor(pal["axbg"])
     for s in ax.spines.values():
-        s.set_color(GRIDC)
-    ax.tick_params(colors=MUTED, labelsize=7)
+        s.set_color(pal["grid"])
+    ax.tick_params(colors=pal["muted"], labelsize=7)
     # NB: grid(False, color=...) *enables* the grid (matplotlib treats the
     # line properties as a request), so the two cases must be separate
     if grid:
-        ax.grid(True, color=GRIDC, linewidth=0.5, alpha=0.6)
+        ax.grid(True, color=pal["grid"], linewidth=0.5, alpha=0.6)
     else:
         ax.grid(False)
-    ax.yaxis.get_offset_text().set(color=MUTED, fontsize=6.5)
+    ax.yaxis.get_offset_text().set(color=pal["muted"], fontsize=6.5)
     if title:
-        ax.set_title(title, color=FG, fontsize=8.5, pad=3, loc=title_loc)
+        ax.set_title(title, color=pal["fg"], fontsize=8.5, pad=3, loc=title_loc)
 
 
 def series_ylim(values):
@@ -154,9 +197,14 @@ class FrameFigure:
     META_MIN_FONTSIZE = 5.0    # below this it is decoration, not information
 
     def __init__(self, variants, stats, meta_lines, width=1920, height=1080,
-                 show_grid=True):
+                 show_grid=True, theme="light"):
         self.variants = list(variants)
         self.stats = stats
+        # light or dark, from ExportSpec.theme (defaulted to the SPA's own
+        # toggle). Resolved once: every colour below comes from self.pal, so
+        # the two palettes cannot drift apart in the body of the renderer.
+        self.theme = theme if theme in THEMES else "light"
+        self.pal = PALETTE[self.theme]
         # ONE grid setting for the whole frame, mirroring the SPA's "grid
         # lines on plots" checkbox: charts get uPlot's grid, the W panels
         # get GridOverlay.vue's (which is why they used to have none — the
@@ -165,12 +213,12 @@ class FrameFigure:
         self.width, self.height = int(width), int(height)
         dpi = 100.0*self.width/self.REF_WIDTH
         self.fig = Figure(figsize=(self.width/dpi, self.height/dpi), dpi=dpi,
-                          facecolor=BG)
+                          facecolor=self.pal["bg"])
         self.canvas = FigureCanvasAgg(self.fig)
         n = len(self.variants)
         rows, cols = (1, 1) if n <= 1 else (1, 2) if n == 2 else (2, 2)
 
-        self.fig.text(0.012, 0.972, "wignerf — W(x, p, t)", color=FG,
+        self.fig.text(0.012, 0.972, "wignerf — W(x, p, t)", color=self.pal["fg"],
                       fontsize=13, weight="bold", va="center")
         # The two header readouts change every frame, so they must not
         # WOBBLE. "%.4g" printed a different number of decimals as the value
@@ -181,12 +229,12 @@ class FrameFigure:
         # with narrow spaces) pin every glyph to its own pixel column.
         self._tw = _num_width(stats.t)
         self._fw = _num_width([v*AU_TIME_FS for v in stats.t])
-        self.time_text = self.fig.text(0.30, 0.972, "", color="#38bdf8",
+        self.time_text = self.fig.text(0.30, 0.972, "", color=self.pal["clock"],
                                        fontsize=13, va="center",
                                        family="DejaVu Sans Mono")
         # right-anchored: the per-record geometry line is long and would run
         # off the canvas at 720p
-        self.geom_text = self.fig.text(0.988, 0.972, "", color=MUTED,
+        self.geom_text = self.fig.text(0.988, 0.972, "", color=self.pal["muted"],
                                        fontsize=9, va="center", ha="right",
                                        family="DejaVu Sans Mono")
 
@@ -199,11 +247,12 @@ class FrameFigure:
         self.images = []
         for i, key in enumerate(self.variants):
             ax = self.fig.add_subplot(gs[i//cols, i % cols])
-            label, color, _ = VARIANT_STYLE[key]
-            _style_axes(ax, grid=False)   # the panel grid is drawn on top
+            label, color, _ = variant_style(key, self.theme)
+            # the panel grid is drawn on top
+            _style_axes(ax, self.pal, grid=False)
             ax.set_title(label, color=color, fontsize=9, pad=4)
-            ax.set_xlabel("x (a₀)", color=MUTED, fontsize=8)
-            ax.set_ylabel("p (a.u.)", color=MUTED, fontsize=8)
+            ax.set_xlabel("x (a₀)", color=self.pal["muted"], fontsize=8)
+            ax.set_ylabel("p (a.u.)", color=self.pal["muted"], fontsize=8)
             s = stats.scale.get(key, 1.0)
             # extent/limits are placeholders: the first update() installs the
             # first record's own window (see _apply_geom)
@@ -214,8 +263,8 @@ class FrameFigure:
             ax.set_xlim(stats.x1, stats.x2)
             ax.set_ylim(stats.p1, stats.p2)
             cb = self.fig.colorbar(im, ax=ax, fraction=0.05, pad=0.02)
-            cb.ax.tick_params(colors=MUTED, labelsize=6.5)
-            cb.outline.set_edgecolor(GRIDC)
+            cb.ax.tick_params(colors=self.pal["muted"], labelsize=6.5)
+            cb.outline.set_edgecolor(self.pal["grid"])
             self.images.append((ax, im))
 
         # ---- diagnostics column (right block), same order as PlotsColumn
@@ -223,11 +272,11 @@ class FrameFigure:
                                     bottom=0.235, top=0.935, hspace=0.75)
         self.rho_lines, self.phi_lines = {}, {}
         ax_rho = self.ax_rho = self.fig.add_subplot(gsr[0])
-        _style_axes(ax_rho, "ρ(x) = ∫W dp", grid=self.show_grid)
+        _style_axes(ax_rho, self.pal, "ρ(x) = ∫W dp", grid=self.show_grid)
         ax_phi = self.ax_phi = self.fig.add_subplot(gsr[1])
-        _style_axes(ax_phi, "φ(p) = ∫W dx", grid=self.show_grid)
+        _style_axes(ax_phi, self.pal, "φ(p) = ∫W dx", grid=self.show_grid)
         for key in self.variants:
-            _, color, dash = VARIANT_STYLE[key]
+            _, color, dash = variant_style(key, self.theme)
             self.rho_lines[key] = ax_rho.plot([], [], color=color,
                                               linestyle=dash, lw=1.2)[0]
             self.phi_lines[key] = ax_phi.plot([], [], color=color,
@@ -247,9 +296,9 @@ class FrameFigure:
                 (("E(t)", stats.E), ("ΔX·ΔP(t)", stats.uncert),
                  ("purity γ(t) = 2πℏ∬W²dxdp", stats.purity)), start=2):
             ax = self.fig.add_subplot(gsr[row])
-            _style_axes(ax, title, title_loc="right", grid=self.show_grid)
+            _style_axes(ax, self.pal, title, title_loc="right", grid=self.show_grid)
             for key in self.variants:
-                _, color, dash = VARIANT_STYLE[key]
+                _, color, dash = variant_style(key, self.theme)
                 ax.plot(t, numpy.asarray(data[key], dtype=float), color=color,
                         linestyle=dash, lw=1.2)
             if t.size:
@@ -261,8 +310,10 @@ class FrameFigure:
                 lambda v, _pos, ax=ax: "%.*f"
                 % (_tick_decimals(list(ax.get_yticks())), v)))
             self.cursors.append(ax.axvline(t[0] if t.size else 0.0,
-                                           color="#f472b6", lw=1.0, alpha=0.9))
-        ax.set_xlabel("t (a.u.)", color=MUTED, fontsize=8)   # bottom plot only
+                                           color=self.pal["cursor"],
+                                           lw=1.0, alpha=0.9))
+        # bottom plot only
+        ax.set_xlabel("t (a.u.)", color=self.pal["muted"], fontsize=8)
 
         # ---- metadata block: everything needed to reproduce the run.
         # It grows downward from a fixed anchor with nothing stopping it, so it
@@ -276,7 +327,7 @@ class FrameFigure:
         fs = self._meta_fontsize(max(len(left), len(right)))
         left, right = self._meta_fit(left, fs), self._meta_fit(right, fs)
         for x, col in ((0.012, left), (0.335, right)):
-            self.fig.text(x, self.META_TOP, "\n".join(col), color=MUTED,
+            self.fig.text(x, self.META_TOP, "\n".join(col), color=self.pal["muted"],
                           fontsize=fs, va="top",
                           linespacing=self.META_LINESPACING,
                           family="DejaVu Sans")

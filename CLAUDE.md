@@ -157,7 +157,16 @@ source) is what keeps startup fast. See `README.md`.
   in-place merge on the reactive cfg), and accepts that .json OR an exported
   .mp4: `lib/mp4meta.ts` scans the file's head for the same document in the
   `comment` tag (faststart keeps it there — byte ~3.5k), so a kept video is
-  self-restoring.
+  self-restoring. Its confirmation line says `press "Restart session" to run
+  it` and NOT "or Solve" — an import moves grid/IC/variants, which are
+  SessionCreate-only, so Solve would compute the old ones (the auto-restart in
+  `syncFreshSessionToForm` only fires when the document ALSO moves
+  mode/t₂/Δt rec/precision on a fresh idle session). And it clears on a
+  `sessionId` change, because that IS the restart it asks for: it used to
+  clear only at the top of the NEXT import, so "press Restart session to run
+  it" stood over a session already running the imported setup. It survives a
+  panel close/reopen on purpose — an import you have not acted on yet is still
+  actionable.
   A render is destroyed by anything that moves the session on — Restart
   deletes the session (`close` → `videoexport.close_session`, file unlinked
   mid-write) and computing new records evicts the ones behind the renderer
@@ -227,7 +236,9 @@ source) is what keeps startup fast. See `README.md`.
   tick decimals reproduce that component's `scales.y.range` rule
   (`render_mpl.series_ylim`); the "grid lines on plots" toggle rides along
   in `ExportSpec.show_grid` and governs EVERY plot in the frame — charts
-  get uPlot's `#3f3f46`, the W panels get `GridOverlay.vue`'s
+  get uPlot's grid stroke (`--wf-chart-grid`, so it follows the theme like
+  the rest of the chrome; see the Theming bullet), the W panels get
+  `GridOverlay.vue`'s theme-INDEPENDENT
   rgba(120,120,120,.28/.55-at-zero) drawn AFTER the image (matplotlib puts
   the axes grid under it, which is why the heatmaps first had none; the
   lines are animated artists ordered behind the images in `_dynamic`) — matplotlib's own autoscale renders a 2e-5
@@ -266,6 +277,75 @@ source) is what keeps startup fast. See `README.md`.
   `GET /sessions/{id}` when it opens — the streamed status lags a frame
   burst by up to seconds after a pause, and seeding the range from it
   silently exported half the history.
+- **Theming (light/dark)**: a header button (`☀ light` / `☾ dark`) flips the
+  whole UI; **light is the DEFAULT** and the choice persists in
+  `localStorage.wignerf.theme`, a sibling of `wignerf.layout`/`wignerf.grid`
+  and so untouched by "Reset setup to defaults". **CSS is the single source of
+  truth**: `frontend/src/style.css` defines every colour once per theme as
+  `--wf-*` on `:root` (light) and `.dark`, and a Tailwind 4 `@theme inline`
+  block turns them into semantic utilities (`bg-panel`, `text-fg-3`,
+  `border-line`, `text-warn`, …). **`inline` is load-bearing** — a plain
+  `@theme` copies the VALUE in at build time and a runtime override then
+  changes nothing. There are ~15 roles, not 200 literals: the migration
+  replaced 217 hard-coded `neutral-*`/accent utilities with them, so
+  `grep -rn 'neutral-\|#[0-9a-f]\{6\}' frontend/src` should now only find the
+  legitimate remainder (below).
+  State lives in `frontend/src/lib/theme.ts` — a module-singleton `ref`, NOT a
+  prop like `showGrid`, because the uPlot option builders need it too and
+  half a dozen components read it at once. `chartPalette()` reads the
+  `--wf-chart-*` properties back off the document, so JS duplicates no value;
+  it must run AFTER the root class is applied, hence a function called per
+  chart build (one `getComputedStyle`, never per frame) with literal fallbacks
+  for the DOM-less unit tests. That ordering is why `setTheme`/`toggleTheme`
+  apply the root class SYNCHRONOUSLY as well as from the watch: `chartPalette`
+  CACHES per theme name, so one read taken before the class landed would pin
+  the wrong palette for the life of the page — not a one-frame glitch. The
+  watch alone happens to win that race (a watcher created outside a component
+  has no job id, so its pre-flush job sorts ahead of the components'), but
+  nothing should rest on a Vue scheduler detail, and `apply` is idempotent.
+  **The charts destroy+rebuild** on a theme change
+  — uPlot takes axis/grid/series colours at construction only — by widening the
+  watch the grid-lines toggle already had (`[() => props.showGrid, theme]` in
+  `SeriesPlot`/`MarginalsPlot`, `watch(theme, …)` in `PotentialEditor`; all
+  three re-apply their existing data to the new chart rather than re-fetching
+  it — `PotentialEditor` from `result.samples`, or the U(x) trace blanks for a
+  round-trip on every flip). The
+  theme is deliberately NOT in `SimulatorView`'s `plotsKey`, for the reason the
+  note there gives: a flip must never remount/blank the W panels.
+  `index.html` applies the stored class in a **blocking inline script**,
+  because `main.ts` is a deferred module and a dark user would otherwise get a
+  white flash on every load; it also declares `color-scheme`, which fixes a
+  standing dark-mode bug (native `<select>`/`<input type=range>` widgets were
+  rendering in the OS's LIGHT style over the dark UI).
+  **What does NOT follow the theme, on purpose**: the bwr heatmap LUT
+  (`lib/colormaps.ts`, `Colorbar.vue`, mpl `cmap="bwr"`) — blue-white-red with
+  W = 0 at white is the physics convention — and therefore everything drawn ON
+  the heatmap rather than on the page: `GridOverlay.vue`'s
+  `rgba(120,120,120,.28/.55)` lines and grey glyphs, `Colorbar.vue`'s
+  `bg-black/70 text-white` chrome, `WignerPanel`/`PanelGrid`'s `bg-black/75`
+  overlay labels, and `ICEditor`'s IC-marker rings. Saturated filled action
+  buttons (`bg-sky-700`, `bg-pink-800` Solve, `bg-emerald-700`, `bg-red-800`,
+  white text) also stay put — they read correctly on white. What DOES change
+  and is easy to miss: **variant curve colours**
+  (`lib/variants.ts` `VARIANT_COLORS`, Tailwind `*-400` on dark → `*-600` on
+  light, because `#fbbf24` amber on white is unreadable) via `variantColor()`,
+  and the Timeline readouts' halo (`--wf-label-shadow` inverts, or it smears
+  the text instead of separating it from the bar).
+  **The mp4 export follows the UI theme** (`ExportSpec.theme`, defaulted from
+  the app every time the Export panel opens and overridable per job — it is
+  never persisted, or it would stop tracking). Its schema default is `light`,
+  matching the SPA's: the panel always sends the field, so that default is only
+  what a direct API call gets, and it should get what a first-time browser
+  does. It threads the same path
+  `show_grid` does: `ExportPanel` → `protocol.ExportSpec` →
+  `videoexport._worker_init`/`_render_serial` → `render_mpl.FrameFigure(theme=)`,
+  which resolves `PALETTE[theme]` once into `self.pal` and passes it to
+  `_style_axes`. `render_mpl`'s `PALETTE`/`VARIANT_COLORS` MIRROR the `--wf-*`
+  values (it cannot read our stylesheet) — change a colour on one side and
+  change it on the other. Two module-level style blocks moved into
+  `style.css` in the process, `.wf-num` (was inside `ICEditor.vue`, styles every
+  input in three components) and `.wf-plot .u-*` (was inside `MarginalsPlot.vue`,
+  styled all three charts).
 - **Parameter policy**: U(x), c, mass, hbar_eff, tol, dt_sign, auto_expand
   apply live at the frontier; grid/IC/variant-set and the whole COMPUTE group
   (precision, device, history_mb — the Setup panel's third section) require a
@@ -284,11 +364,41 @@ source) is what keeps startup fast. See `README.md`.
   `history_mb_max` so asking for 999999 on a 110000 host is not a "difference"
   — and only then compares. One amber line names what is running, exactly as
   the RUN section's does, and only while something differs.
+  **Each section's summary line covers its OWN fields.** `precision` lives in
+  `LiveRun` because that is where `status` carries it, but it is a COMPUTE
+  control: it triggers and is named by COMPUTE's line, and it is deliberately
+  absent from `runStale` and from the RUN line's text. It used to be in both,
+  so a plain float64 → float32 switch raised THREE amber notes instead of two
+  — the third announcing "running: interactive (no t₂), Δt rec = 0.05" at a
+  user who had changed neither and whose mode and Δt rec did not differ at
+  all, which reads as the form having quietly moved something else.
   The steady-state facts are NOT repeated in the panel: the devices and the
   history cap ride the timeline's own `hist 0.1 / 107 GiB · dev: cuda:1, cuda:0`
   readout, which is drawn anyway. A standing "running on …, history cap …"
   paragraph there spent vertical space in a narrow column to say what that
   readout already says for free.
+  **The panel's column is 320px (`w-80`), and its grids are shaped to it.**
+  PHYSICS is `grid-cols-7`: m + c + ℏ on one row, tol + t dir on the next, with
+  c taking 3 of the 7 because it is the only field holding a long number
+  (137.035999 truncates at an equal third) and tol taking 4 because its LABEL
+  grows by " ≥1e-5" in float32. COMPUTE is `grid-cols-3` — precision, device,
+  history in one row — and is the ONE section that puts its label ABOVE the
+  control rather than beside it: those three labels are words, and a third of
+  320px does not fit "precision" plus a select reading "float64". Stacked it is
+  two lines where three full-width rows were three. history keeps its unit to
+  the RIGHT of the field; the "(0 = host max N)" that used to sit beside it
+  moved into `historyHelp`, the tooltip, which had to name that number anyway.
+  Verify layout changes here at the real width — headless Chrome, screenshot
+  the `<aside>`, and assert nothing's rect exceeds it (see the UI-debugging
+  note above); every field fits today with zero overflow.
+  `apply_params` echoes a fresh `status` right after its `params_applied`,
+  exactly as play/pause do — the periodic one is only every `STATUS_PERIOD`
+  (1 s) and that check sits at the top of the sender's tick, so a field the
+  form marks amber against `status` could stay amber for a second or more after
+  the "✓ applied" flash had already confirmed the change. Pinned by
+  `test_params_applied_is_followed_by_a_fresh_status`; measured end to end in a
+  browser at 256² while computing, click → `params_applied` is 12 ms and the
+  status follows in 1 ms.
   `apply_params` compares against what is LIVE and drops the fields that
   did not change — no worker command, no `param_log` entry, no
   `params_applied`, and nothing at all if the whole message is a no-op (the
@@ -298,14 +408,58 @@ source) is what keeps startup fast. See `README.md`.
   `before` as well as `applied`, so the block renders "ℏ 1 → 2" and
   `describe.state_at` rewinds the header physics to the FIRST exported
   record instead of quoting the values the run ended with. Live changes are
-  visible in the UI: the header flashes "✓ applied …", a Physics field
-  whose form value differs from `status` renders amber (they apply on
-  blur/Enter), and "Apply live" is greyed with an inline reason when the
-  draft already IS the live U.
+  visible in the UI: the header flashes "✓ applied …", and any live-appliable
+  field whose form value differs from `status` renders amber — the numeric
+  Physics fields (which apply on blur/Enter) via `pending()`, and the U(x)
+  input via `PotentialEditor.isPending`.
+  **U(x) is a LIVE-appliable parameter and has exactly ONE button.** It used
+  to have two, "Use at restart" beside "Apply live", and both were confusing
+  for the same reason: the draft was local to the editor, so the FORM did not
+  mean what it showed until you pressed the first one — while every other
+  setting in the panel is bound straight to `cfg`. Now the draft auto-commits
+  to `cfg.potential` from `compile()`'s success path, gated on the server's
+  verdict (a half-typed `x^2/` must never reach `cfg`, which is persisted to
+  localStorage and is what a restart computes from) and on the response still
+  describing the CURRENT text. So `Use at restart` had nothing left to do, and
+  U(x) no longer marks the session restart-dirty at all: it applies live, so
+  "restart to apply" was a false claim that no successful Apply live could
+  clear.
+  **Solve carries the form's U(x).** `SimulatorView.sendCommand` pushes
+  `set_params {U: cfg.potential}` before a `play` whose action is `solve`,
+  whenever the form's (validated) U differs from `status.potential`. Without it
+  the form was authoritative for nothing: measured 369 records computed under
+  `x^2/2` behind a form reading `x^2/2 + 5*x^4`, the only signal being an amber
+  input in a panel that can be hidden. Playback is excluded — it computes
+  nothing. So "Apply live" is gated on `status.computing`, NOT on `live` and
+  NOT on `running`: while nothing computes there is no live run to reach and
+  Solve does the job, and an enabled button there invites a click that is at
+  best redundant and reads as the only way to make the new U count. The button
+  exists for the one case Solve cannot serve — a computation already in flight,
+  which you would otherwise pause. `computing`, because `running` is true
+  during pure PLAYBACK too (`running and not stop_at_frontier`), where the
+  button's own tooltip — "push this U(x) into the computation already in
+  progress" — would be false; it is the same field batch mode dims the display
+  on. Bonus: `useSession`'s optimistic transport flip touches only `running`,
+  so the button now stays briefly DISABLED after a Solve click rather than
+  briefly enabled, which is the safer direction to be wrong in.
+  What is left is one emerald "Apply live", disabled unless the session is
+  COMPUTING AND the draft is valid AND it differs from `status.potential`, with
+  the reason in its `title` and **no standing paragraph** — the old
+  "already the live U(x) — edit it to enable …" line was on screen at every
+  page load, because that IS the steady state (see
+  [no-mystery-disabled-controls]: marker + tooltip + amber on the transition,
+  never permanent prose).
   The setup form gates the transport: while the potential draft is invalid
   for the active variant families or the IC preview errors, Solve (button
-  AND Space) is disabled and "Use at restart"/"Apply live" are greyed —
-  a computation must never run behind a visibly broken form.
+  AND Space) is disabled and "Apply live" is greyed — a computation must
+  never run behind a visibly broken form.
+  **Every saturated action button carries `.wf-solid`** (`style.css`): Solve/
+  Play, Restart session, Apply live, Render. It supplies `color: #fff` —
+  those buttons never set a text colour, they INHERITED the shell's light
+  text, which went invisible ("black on blue") the moment the shell could be
+  light — and a disabled state that drops to the neutral raised surface,
+  because `disabled:opacity-40` over a saturated fill is pale colour under
+  equally pale text, unreadable in either theme.
 - **Run modes: `interactive` vs `batch`** (SessionCreate `mode`; `batch`
   requires `t2`). Both start paused. INTERACTIVE computes until paused and
   streams a coalesced live preview (the newest complete record) so you can
@@ -610,6 +764,14 @@ grids) and the measured refresh interval.
     `runDiffers('precision')` holds, so "Restart session" clears it and the
     header badge carries the one permanent fact from then on. The amber note is
     not garnish: it is the only path on a touch device, which has no hover.
+    But it renders ONLY when `f32Applied` is non-empty, and it no longer opens
+    with "single precision mode" — that phrase said nothing the precision
+    select, its `title` and the header's float32 badge do not already say, and
+    it appeared even when the switch had changed nothing else, which is the
+    common case (a form already at tol ≥ 1e-5 with auto-expand off). Measured
+    on the real panel: a float64 → float32 switch after a 399-record run used
+    to raise THREE amber paragraphs and now raises one, the COMPUTE line naming
+    what is running.
     Clearing `auto_expand` in the form is NOT enough on its own, because it
     applies LIVE — `SimulatorView` watches `cfg.precision` and sends
     `auto_expand: false` to a running session, since the status→form watcher
