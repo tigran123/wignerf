@@ -592,6 +592,10 @@ const deviceOptions = ref<{ spec: string; device: string }[] | null>(null)
 // whether a form device of '' still matches the RUNNING session's devices — a
 // restart-only field with no live counterpart to compare against otherwise.
 const hostPool = ref<string[] | null>(null)
+/** Installed memory per device spec, for the Setup panel's 2D footprint line.
+ *  Keyed rather than reduced to a minimum: which device binds depends on how
+ *  assign_devices distributes the workers — see SetupPanel.deviceLoad. */
+const hostDeviceTotals = ref<Record<string, number | null> | null>(null)
 /**
  * The host's ceilings PER NDIM, from /api/device.
  *
@@ -643,7 +647,8 @@ const historyCapMb = computed(() => {
 async function probeHost() {
   try {
     const { data } = await api.get<{ choices: { spec: string; device: string }[]
-                                     devices?: { spec: string }[]
+                                     devices?: { spec: string
+                                                 total_bytes?: number | null }[]
                                      precision?: string
                                      max_grid?: Record<string, number>
                                      max_cells?: Record<string, number | null>
@@ -651,6 +656,13 @@ async function probeHost() {
       '/device', { timeout: 5000 })
     deviceOptions.value = data.choices ?? []
     hostPool.value = data.devices?.map((d) => d.spec) ?? null
+    // TOTAL, not free: a static fact the panel can compare against without
+    // re-polling a number that moves under it. Keyed by spec — reducing it to
+    // the pool minimum was wrong, because a session with fewer variants than
+    // devices never touches the smaller cards at all.
+    const totals: Record<string, number | null> = {}
+    for (const d of data.devices ?? []) totals[d.spec] = d.total_bytes ?? null
+    hostDeviceTotals.value = Object.keys(totals).length ? totals : null
     // Normalized key by key rather than assigned wholesale: the JSON keys are
     // strings, and an older backend (or the probe's own error path) carries
     // neither field — a missing one must keep its literal fallback, not become
@@ -780,7 +792,23 @@ onBeforeUnmount(() => {
       <span v-if="reconnecting" class="ml-auto text-warn">
         backend disconnected — reconnecting…
       </span>
-      <span v-else-if="!session.connected.value" class="ml-auto text-warn">connecting…</span>
+      <!-- NOT while createError is up: a failed create leaves no socket to
+           connect, so "connecting…" is a false progress report on a state that
+           will never change. The error line below says what actually happened. -->
+      <span v-else-if="!session.connected.value && !createError"
+            class="ml-auto text-warn">connecting…</span>
+
+      <!-- A HARD failure, and the one notice that IS flow content — it must be
+           readable, and it does not come and go while you watch the heatmaps.
+           `basis-full` gives it its own line inside this flex-wrap header,
+           which also pushes the absolute transient strip below it: the strip is
+           anchored `top-full`, so with the error outside the header the two
+           landed on the SAME y and the amber "setup changed — restart to
+           apply" was painted straight over the error text. That pairing is not
+           exotic — a restart that 422s sets BOTH, every time. -->
+      <div v-if="createError" class="basis-full text-error text-sm pt-1">
+        {{ createError }}
+      </div>
 
       <!-- TRANSIENT NOTICES OVERLAY, and why it is absolutely positioned.
            These four come and go WHILE you are watching the heatmaps, and the
@@ -813,8 +841,6 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div v-if="createError" class="px-3 py-2 text-error text-sm">{{ createError }}</div>
-
     <!-- ================= landscape ================= -->
     <main v-if="layout === 'landscape'" class="flex-1 min-h-0 flex gap-2 p-2">
       <aside v-if="showSetup" class="w-80 shrink-0 overflow-y-auto space-y-4 pr-1 text-sm">
@@ -829,6 +855,7 @@ onBeforeUnmount(() => {
                     :bytes-per-cell="cfg.grid.ndim > 1 ? hostLimits.bytesPerCell2d : null"
                     :live-devices="session.status.value?.devices ?? null"
                     :device-options="deviceOptions" :host-pool="hostPool"
+                    :device-totals="hostDeviceTotals"
                     :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
                     v-model:show-grid="showGrid"
                     v-model:show-cells="showCells"
@@ -875,6 +902,7 @@ onBeforeUnmount(() => {
                     :bytes-per-cell="cfg.grid.ndim > 1 ? hostLimits.bytesPerCell2d : null"
                     :live-devices="session.status.value?.devices ?? null"
                     :device-options="deviceOptions" :host-pool="hostPool"
+                    :device-totals="hostDeviceTotals"
                     :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
                     v-model:show-grid="showGrid"
                     v-model:show-cells="showCells"

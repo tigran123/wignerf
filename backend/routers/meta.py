@@ -6,7 +6,8 @@ from fastapi import APIRouter
 
 import config
 from core import axes as axes_mod
-from core.xp import ArrayBackend, devices_allowed, resolve_devices
+from core.xp import (ArrayBackend, device_total_bytes, devices_allowed,
+                     resolve_devices)
 
 router = APIRouter()
 
@@ -27,8 +28,14 @@ def _probe_backend():
     reverse) is a form that lies about what it can do."""
     def _probe(d):
         b = ArrayBackend(device=d)
+        # total_bytes, NOT free: this dict is lru_cached, and free memory moves.
+        # Total is static, and it is what the Setup panel needs to say "this
+        # grid can never fit here" without re-polling. Whether it fits RIGHT NOW
+        # stays with routers/sessions._fit_error, which asks the driver at
+        # create time and quotes the exact numbers.
         return {"spec": d, "device": b.name, "is_gpu": b.is_gpu,
-                "fft_provider": b.fft_provider}
+                "fft_provider": b.fft_provider,
+                "total_bytes": device_total_bytes(d)}
     try:
         pool = resolve_devices(config.DEVICE)
         allowed = devices_allowed(config.DEVICE)

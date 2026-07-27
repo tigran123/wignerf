@@ -24,6 +24,23 @@ def test_device():
     assert "device" in r.json()
 
 
+def test_device_reports_each_pool_device_s_total_memory():
+    """The Setup panel's 2D footprint line turns red on "cannot fit this host",
+    and TOTAL is what lets it say that without re-polling: free memory moves,
+    total does not. Missing, the line stayed plain grey at 26.00 GiB/device on a
+    host whose largest card is 24 — and WIGNERF_MAX_CELLS_2D did not cover it
+    either, because 128×128×128×64 is EXACTLY 2**27 and the rail is a `>`.
+
+    None is allowed (no cupy, an unreadable /proc): the panel then simply does
+    not warn, exactly as _fit_error declines to refuse on unknown free memory.
+    """
+    d = client.get("/api/device").json()
+    for dev in d["devices"]:
+        assert "total_bytes" in dev, dev
+        tb = dev["total_bytes"]
+        assert tb is None or (isinstance(tb, int) and tb > 0), dev
+
+
 def test_potential_preview_valid():
     r = client.post("/api/preview/potential",
                     json={"expr": "x^2/2", "x1": -6, "x2": 6, "grid": GRID})

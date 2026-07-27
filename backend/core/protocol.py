@@ -347,11 +347,15 @@ MSG_EXPAND_F32 = (
     "precision float64 to auto-expand, or size the domain by hand.")
 
 
-# The first 2D cut ships without float32, relativistic variants, auto-expand
-# and mp4 export — milestones M1..M4 in CLAUDE.md, all four wanted and all four
-# out only until the physics core is verified. Each is refused explicitly here
-# rather than half-working: a gate that says what it stands in for cannot be
-# mistaken for settled scope, and cannot be relaxed by accident.
+# 2D still ships without float32, auto-expand and mp4 export — milestones M1, M3
+# and M4 in CLAUDE.md, all three wanted and all three out only until the work
+# each names is done. Each is refused explicitly here rather than half-working: a
+# gate that says what it stands in for cannot be mistaken for settled scope, and
+# cannot be relaxed by accident.
+#
+# M2 (relativistic variants qr/cr) WAS here and is done as of 2026-07-27 — the
+# mc^2 cancellation inside the 4D kinetic difference and the massless gradient at
+# the lattice origin are both measured and pinned in tests/test_propagator2d.py.
 MSG_F32_2D = (
     "float32 is not available for 2D runs yet (milestone M1): the mixed-"
     "precision rules — float64 meshes and exponent construction, single-"
@@ -359,12 +363,6 @@ MSG_F32_2D = (
     "shift, and adjust_step's single-precision residual floor was measured at "
     "256² only. It is the first 2D follow-up precisely because memory is the "
     "binding 2D constraint. Use precision float64.")
-MSG_REL_2D = (
-    "relativistic variants (qr, cr) are not available for 2D runs yet "
-    "(milestone M2): T = c√(px²+py²+m²c²) drops out of the solver for free, but "
-    "the mc² cancellation inside the 4D kinetic difference is unverified and the "
-    "massless gradient is singular on the whole origin rather than at one "
-    "point. Use qn and/or cn.")
 MSG_EXPAND_2D = (
     "auto-expand is not available for 2D runs yet (milestone M3): in 4D every "
     "axis doubling doubles a multi-GiB working set, so the planner needs a "
@@ -460,8 +458,6 @@ class SessionCreate(BaseModel):
             # resolved to float64 above rather than colliding with this gate
             if self.precision == "float32":
                 raise ValueError(MSG_F32_2D)
-            if any(VARIANTS[v]["relativistic"] for v in self.variants):
-                raise ValueError(MSG_REL_2D)
             if self.auto_expand:
                 raise ValueError(MSG_EXPAND_2D)
         return self
@@ -535,6 +531,17 @@ class SeekCmd(BaseModel):
     record: int = Field(ge=0)
 
 
+class LoopCmd(BaseModel):
+    """Repeat a playback-only run instead of stopping at the frontier.
+
+    A DISPLAY policy, like `delay`, not a physics one: it changes only what the
+    cursor does when it arrives, never what is computed. Live-settable so it can
+    be armed mid-playback, and mid-run in time to catch the current pass.
+    """
+    type: Literal["loop"]
+    on: bool
+
+
 class SetParamsCmd(BaseModel):
     type: Literal["set_params"]
     params: ParamChange
@@ -545,7 +552,7 @@ class PingCmd(BaseModel):
 
 
 ClientMsg = Annotated[
-    Union[PlayCmd, PauseCmd, DelayCmd, SeekCmd, SetParamsCmd, PingCmd],
+    Union[PlayCmd, PauseCmd, DelayCmd, SeekCmd, SetParamsCmd, PingCmd, LoopCmd],
     Field(discriminator="type"),
 ]
 

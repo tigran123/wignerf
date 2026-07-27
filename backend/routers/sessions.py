@@ -82,19 +82,68 @@ def _fit_error(cfg, devices):
     counts = {}
     for dev in assignment.values():
         counts[dev] = counts.get(dev, 0) + 1
-    for dev, n in sorted(counts.items()):
+
+    # What each assigned device could actually take, once its CUDA context is
+    # paid for. None = unknowable, and those devices are dropped rather than
+    # guessed at.
+    budget = {}
+    for dev in counts:
         free = xp.device_free_bytes(dev)
         if free is None:
             continue                       # cannot tell: the rail is the guard
-        need = n*per + (CONTEXT_BYTES if dev != "cpu" else 0)
-        if need > free*FIT_MARGIN:
-            return ("%s has %.1f GiB free and this session would put %.1f GiB "
-                    "on it (%d worker%s × %.1f GiB%s). Reduce an axis, drop a "
-                    "variant, or pick a device with more room."
-                    % (dev, free/1024**3, need/1024**3, n,
-                       "" if n == 1 else "s", per/1024**3,
-                       "" if dev == "cpu" else " + 0.3 GiB CUDA context"))
-    return None
+        budget[dev] = (free, free*FIT_MARGIN
+                       - (0 if dev == "cpu" else CONTEXT_BYTES))
+    if not budget:
+        return None
+
+    over = [(d, n) for d, n in sorted(counts.items())
+            if d in budget and n*per > budget[d][1]]
+    if not over:
+        return None
+
+    # THE ROOMIEST DEVICE DECIDES WHICH STORY THIS IS. Naming only the device
+    # that happens to sort first said "cuda:0 has 8.9 GiB free ... pick a device
+    # with more room" on a host whose other card ALSO could not hold one worker
+    # (26.0 GiB needed against a 23.6 GiB 3090) — advice that cannot be taken,
+    # pointing at a card that is not really the problem. Report the pool.
+    best, (best_free, best_budget) = max(budget.items(), key=lambda kv: kv[1][1])
+    ctx = "" if all(d == "cpu" for d in budget) else " + 0.3 GiB CUDA context"
+
+    if per > best_budget:
+        # Nothing here can hold even ONE worker — but "too big for this card"
+        # and "this card is busy right now" need OPPOSITE advice, and only the
+        # installed total separates them. Saying "reduce an axis" at someone
+        # whose 3090 is merely occupied by their own last session sends them to
+        # shrink a grid that would have fitted on an idle card.
+        total = xp.device_total_bytes(best)
+        ctx_b = 0 if best == "cpu" else CONTEXT_BYTES
+        if total is not None and per + ctx_b <= total*FIT_MARGIN:
+            return ("this grid needs %.1f GiB per worker%s, and %s — the "
+                    "roomiest device — has only %.1f GiB free of %.1f GiB "
+                    "installed. It would fit on an idle card, so free that "
+                    "memory first (another session here, or another process) "
+                    "or reduce an axis."
+                    % (per/1024**3, ctx, best, best_free/1024**3,
+                       total/1024**3))
+        return ("this grid needs %.1f GiB per worker%s and no device in the "
+                "pool can hold even one — the roomiest is %s with %.1f GiB free "
+                "of %.1f GiB installed. Reduce an axis; dropping a variant or "
+                "changing device will not help."
+                % (per/1024**3, ctx, best, best_free/1024**3,
+                   (total or best_free)/1024**3))
+
+    # A worker DOES fit somewhere — this is a distribution problem, so say
+    # which device is over and what would actually relieve it.
+    dev, n = over[0]
+    free, _ = budget[dev]
+    need = n*per + (0 if dev == "cpu" else CONTEXT_BYTES)
+    room = int(best_budget//per)
+    return ("%s has %.1f GiB free and this session would put %.1f GiB on it "
+            "(%d worker%s × %.1f GiB%s). Drop a variant, reduce an axis, or "
+            "set device to %s, which has room for %d of them."
+            % (dev, free/1024**3, need/1024**3, n, "" if n == 1 else "s",
+               per/1024**3, "" if dev == "cpu" else " + 0.3 GiB CUDA context",
+               best, room))
 
 
 @router.post("/sessions")

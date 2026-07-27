@@ -329,21 +329,22 @@ export function setNdim(c: SimConfig, ndim: Ndim) {
 }
 
 /**
- * The three things a 2D run cannot do in this cut, applied to the config
- * rather than argued with at Restart time — the exact counterpart of
+ * The two things a 2D run still cannot do, applied to the config rather than
+ * argued with at Restart time — the exact counterpart of
  * applyPrecisionInvariants, and for the same reason: the backend refuses each
- * combination outright (milestones M1-M3), so reaching one from a stale
+ * combination outright (milestones M1 and M3), so reaching one from a stale
  * localStorage entry, an imported 1D setup or a probe-adopted host default
  * would leave Restart failing with a 422 the user never chose.
+ *
+ * The relativistic variants were the third (M2) and landed on 2026-07-27, so
+ * qr/cr are no longer filtered out here. A stored 2D config that this function
+ * once stripped down to ['qn'] keeps whatever it was left with — there is
+ * nothing to migrate, because the stripping was destructive at the time.
  */
 export function applyNdimInvariants(c: SimConfig) {
   if (c.grid.ndim < 2) return
   c.precision = 'float64'          // M1
   c.auto_expand = false            // M3
-  const nonrel = c.variants.filter((v) => v === 'qn' || v === 'cn')   // M2
-  if (nonrel.length !== c.variants.length)
-    c.variants.splice(0, c.variants.length,
-                      ...(nonrel.length ? nonrel : (['qn'] as VariantKey[])))
 }
 
 /** Axis labels for this config's dimensionality ('x','p' / 'x','y','px','py'). */

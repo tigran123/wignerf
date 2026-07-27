@@ -33,6 +33,10 @@ const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
                             // backend offers, and the history cap it granted
                             // against the ceiling it enforces
                             liveDevices?: string[] | null
+                            // installed memory per device spec. Keyed, not a
+                            // single number: which device binds depends on the
+                            // assignment, and at one variant only ONE is used.
+                            deviceTotals?: Record<string, number | null> | null
                             deviceOptions?: { spec: string; device: string }[] | null
                             // the host's POOL — what a form device of '' resolves
                             // to, hence the only way to compare that against the
@@ -121,8 +125,8 @@ const PRECISION_2D_HELP = 'Not available for 2D runs yet, and refused by the'
 const NDIM_HELP = 'spatial dimensions. 1D solves W(x,p,t); 2D solves'
   + ' W(x,y,px,py,t) and streams the six pairwise 2D projections instead of the'
   + ' 4D array. Restart-only, and it rebuilds the grid, the initial condition'
-  + ' and (if untouched) U. NB 2D defers float32, relativistic variants,'
-  + ' auto-expand and mp4 export — the API refuses each with the reason.'
+  + ' and (if untouched) U. NB 2D defers float32, auto-expand and mp4 export'
+  + ' — the API refuses each with the reason.'
 const TOL_HELP = 'adaptive-step relative tolerance'
 // toExponential: JS prints 1e-5 as "0.00001", which is neither how the field is
 // typed nor how the backend's own refusal words it
@@ -306,14 +310,77 @@ const overCells = computed(() =>
  * The per-card figure assumes the workers spread evenly over the pool, which is
  * what session.assign_devices does.
  */
+// CUDA context + cuFFT plan cache, per process per device. The frontend mirror
+// of routers/sessions.CONTEXT_BYTES — move both together. No FIT_MARGIN mirror
+// on purpose: that margin exists because FREE memory moves between the check
+// and the first allocation, and this comparison is against TOTAL, which does
+// not. Leaving it out keeps the panel strictly less trigger-happy than the
+// server, which is the right direction for a pre-flight hint.
+const CONTEXT_GIB = 300 / 1024
+
+/**
+ * Which devices this session's workers would land on, and how many each gets —
+ * the frontend mirror of `core.session.assign_devices`. Move both together.
+ *
+ * The two properties that matter, and that a "spread evenly over the pool"
+ * shortcut gets WRONG: only `min(pool, variants)` devices are used at all, and
+ * the pool is ordered fastest-first so the earlier devices take the extra when
+ * the split is uneven. A single-variant session therefore touches exactly ONE
+ * device — the fastest — and says nothing whatsoever about the others.
+ *
+ * Getting that wrong is not academic: comparing one worker against the SMALLEST
+ * pool device condemned 128×128×64×64 (13.0 GiB, one qn worker) as "will not fit
+ * this host" against the 10.6 GiB 2080 Ti, while the worker was in fact bound
+ * for the 23.6 GiB 3090 and the session started and computed happily. A
+ * pre-flight hint that contradicts what the server then does is worse than no
+ * hint, because it teaches you to ignore the line.
+ */
+const deviceLoad = computed(() => {
+  const bpc = props.bytesPerCell
+  const pool = wantDevices.value
+  if (ndim.value < 2 || !bpc || !pool?.length) return null
+  const per = cells.value * bpc / 1024 ** 3
+  const nv = props.cfg.variants.length
+  const k = Math.min(pool.length, nv)
+  const base = Math.floor(nv / k)
+  const extra = nv % k
+  return Array.from({ length: k }, (_, j) => {
+    const workers = base + (j < extra ? 1 : 0)
+    return { spec: pool[j]!, workers, giB: workers * per }
+  })
+})
+
+/**
+ * Does any device this session would actually USE lack the memory to hold its
+ * share? TOTAL, not free, deliberately: total is a static fact the form can
+ * state without re-polling, so the panel can never contradict the server, whose
+ * live-free refusal (`routers/sessions._fit_error`) is a strict superset.
+ *
+ * Unknown total ⇒ no warning, the same way _fit_error declines to refuse on
+ * unknown free memory: there the cell rail is the only guard and guessing is
+ * worse than staying quiet.
+ */
+const wontFit = computed(() => {
+  const load = deviceLoad.value
+  const totals = props.deviceTotals
+  if (!load || !totals) return false
+  return load.some((d) => {
+    const t = totals[d.spec]
+    return !!t && d.giB + CONTEXT_GIB > t / 1024 ** 3
+  })
+})
+
 const footprint = computed(() => {
   const bpc = props.bytesPerCell
   if (ndim.value < 2 || !bpc) return ''
   const per = cells.value * bpc / 1024 ** 3
-  const nv = props.cfg.variants.length
-  const ndev = Math.max(1, props.liveDevices?.length ?? props.hostPool?.length ?? 1)
-  const perCard = per * Math.ceil(nv / ndev)
-  const cardsNote = ndev > 1 ? ` · ${perCard.toFixed(2)} GiB/device` : ''
+  const load = deviceLoad.value
+  // The per-device figure only says something when more than one device is
+  // actually USED. At one variant the split is 1×1, so "13.00 GiB per worker ·
+  // 13.00 GiB/device" was the same number twice, dressed up as a distribution.
+  const cardsNote = load && load.length > 1
+    ? ` · ${Math.max(...load.map((d) => d.giB)).toFixed(2)} GiB/device`
+    : ''
   return `≈ ${per.toFixed(2)} GiB per worker${cardsNote} · ${cells.value.toLocaleString()} cells`
 })
 
@@ -545,15 +612,21 @@ function adoptLive() {
            would find out by OOM. Red once past the host's cell ceiling, which
            is the refusal the create call would return. -->
       <p v-if="footprint" class="text-xs tabular-nums"
-         :class="overCells ? 'text-error' : 'text-fg-3'"
+         :class="overCells || wontFit ? 'text-error' : 'text-fg-3'"
          :title="overCells
            ? `over the host's WIGNERF_MAX_CELLS_2D (${maxCells?.toLocaleString()}) — creating this session will be refused`
+           : wontFit
+           ? 'more memory than the smallest device in the pool physically has,'
+             + ' so this grid cannot start on this host at all — the workers'
+             + ' spread over the pool, so the smaller card is what binds.'
+             + ' Reduce an axis or drop a variant.'
            : 'estimated device memory per variant worker at this grid. Mostly '
              + 'NOT the state: W is real (float64, 8 B/cell), and the rest is '
              + 'the step\'s machinery at full shape — two exponent slots '
              + '(2 complex meshes each), the dU/dT rate meshes, the FFT work '
              + 'arrays and adjust_step\'s two candidate states.'">
         {{ footprint }}<template v-if="overCells"> — over the host cap</template>
+        <template v-else-if="wontFit"> — will not fit this host</template>
       </p>
       <p v-if="liveDiffers" class="text-xs text-warn">
         live: {{ liveText }}

@@ -164,6 +164,18 @@ class SessionClock:
         self.cursor = 0.0            # display position in record units
         self.stop_at_frontier = False  # playback-only run: pause at frontier
         self.browsed = False         # display detached from the live frontier
+        # Loop a playback-only run instead of pausing at the frontier. A
+        # DISPLAY policy like `delay` — it never changes what is computed.
+        # loop_from is where the current pass STARTED, captured when playback
+        # begins, so "again" means the region you actually asked to watch
+        # rather than the whole history from record 0.
+        self.loop = False
+        self.loop_from = 0
+        # Bumped on every wrap. The sender replays from `last_sent + 1`, which
+        # is still AT the frontier when the cursor jumps back — so rewinding the
+        # cursor alone stalls the loop silently. The epoch is how the sender
+        # learns to reset that, the same job `pending_seek` does for a seek.
+        self.loop_epoch = 0
         self._t = [self.t1]          # t of record k (append-only)
         self._anchor = (0, self.t1)  # (k, t) of the last sign change
 
@@ -230,6 +242,16 @@ class SessionClock:
                 # Solve pressed AT the frontier re-attaches the display to
                 # it (live coalescing); play behind starts detached (replay)
                 self.browsed = behind
+                if self.stop_at_frontier:
+                    self.loop_from = int(self.cursor)
+            self._cond.notify_all()
+
+    def set_loop(self, on):
+        """Arm/disarm playback looping. Live-settable: turning it ON mid-run
+        catches the current pass, turning it OFF lets that pass finish and stop
+        at the frontier — neither interrupts what is on screen."""
+        with self._cond:
+            self.loop = bool(on)
             self._cond.notify_all()
 
     def set_delay(self, v):
@@ -264,9 +286,21 @@ class SessionClock:
                                       float(latest_complete))
                     if self.stop_at_frontier and delivered >= latest_complete \
                        and self.cursor >= latest_complete:
-                        self.running = False
-                        self.stop_at_frontier = False
-                        self.browsed = False   # arrived at the frontier
+                        if self.loop and self.loop_from < latest_complete:
+                            # Rewind instead of stopping. Same delivery gate as
+                            # the pause below, so a slow client cannot be
+                            # rewound past frames it has not been sent yet; and
+                            # `browsed` stays True, which is what keeps the run
+                            # classified as playback rather than letting the
+                            # next tick re-attach it to the frontier and roll
+                            # into computation — the exact confusion this
+                            # feature exists to remove.
+                            self.cursor = float(self.loop_from)
+                            self.loop_epoch += 1
+                        else:
+                            self.running = False
+                            self.stop_at_frontier = False
+                            self.browsed = False   # arrived at the frontier
                 elif not self.browsed:
                     # Attached to the frontier: follow it while solving AND
                     # while PAUSED — a pause leaves in-flight records landing
@@ -722,6 +756,7 @@ class SimSession:
             "mode": self.clock.mode,
             "t2": self.clock.t2,
             "delay": self.clock.delay,
+            "loop": self.clock.loop,
             "sign": self.clock.sign,
             "record_dt": self.clock.record_dt,
             "record_extent": [first, last],

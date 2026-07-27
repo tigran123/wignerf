@@ -72,6 +72,8 @@ export interface SessionStatus {
   mode: 'interactive' | 'batch'
   t2: number | null
   delay: number
+  // playback repeats from where it started instead of pausing at the frontier
+  loop?: boolean
   sign: number
   record_dt: number
   record_extent: [number, number]

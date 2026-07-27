@@ -83,7 +83,39 @@ const action = computed(() =>
   transportAction(props.status, props.lastFrame?.record ?? null))
 const playLabel = computed(() =>
   action.value === 'pause' ? 'Pause' : action.value === 'play' ? 'Play' : 'Solve')
-const solveBlocked = computed(() => action.value === 'solve' && !props.setupValid)
+/**
+ * No session at all — `status` is null both before the first one exists and
+ * after `destroy()` ran, which is where a FAILED restart leaves us: create()
+ * deletes the old session before it posts, so a 422 leaves the app session-less
+ * with the form still showing a valid-looking setup. Solve stayed pink and
+ * enabled there and its click went nowhere, which reads as the button being
+ * broken rather than as there being nothing to command.
+ */
+const noSession = computed(() => !props.status)
+const solveBlocked = computed(() =>
+  action.value === 'solve' && (!props.setupValid || noSession.value))
+
+/**
+ * Repeat a playback pass instead of stopping at the frontier. Optimistic like
+ * the transport flip: the server echoes a fresh status right after, but the
+ * checkbox must not lag a click by up to the status period.
+ */
+const loopOptimistic = ref<boolean | null>(null)
+watch(() => props.status?.loop, () => { loopOptimistic.value = null })
+function toggleLoop(ev: Event) {
+  const on = (ev.target as HTMLInputElement).checked
+  loopOptimistic.value = on
+  emit('command', { type: 'loop', on })
+}
+const loopOn = computed(() => loopOptimistic.value ?? !!props.status?.loop)
+const loopTitle = computed(() => noSession.value
+  ? 'no session'
+  : loopOn.value
+    ? 'playback repeats from where you started it instead of pausing at the'
+      + ' frontier. Turn off to let the current pass finish and stop.'
+    : 'repeat playback from where you pressed Play instead of pausing at the'
+      + ' end — without it the transport becomes "Solve" at the frontier and'
+      + ' Space then COMPUTES rather than replaying.')
 
 function togglePlay(ev?: Event) {
   // drop focus so a later Space is the global shortcut, never a second
@@ -212,7 +244,9 @@ const stepInfo = computed(() => {
       :class="playLabel === 'Solve' ? 'bg-pink-800 hover:bg-pink-700'
                                     : 'bg-sky-700 hover:bg-sky-600'"
       :disabled="solveBlocked"
-      :title="solveBlocked
+      :title="noSession
+        ? 'no session — the last restart did not create one; see the error above'
+        : solveBlocked
         ? 'setup is invalid — fix the potential / initial condition first'
         : playLabel === 'Solve'
           ? 'will compute new records (GPU/CPU work) — shortcut: Space'
@@ -221,6 +255,21 @@ const stepInfo = computed(() => {
             : 'shortcut: Space'"
       @click="togglePlay($event)"
     >{{ playLabel }}</button>
+
+    <!-- Loop lives HERE, beside the transport, because it is about what
+         happens when playback ENDS and that is the moment you reach for this
+         row. Enabled while running, unlike the delay dial: arming it mid-pass
+         is the common case — you notice the run is about to stop just before
+         it does. It is why the button says "Solve" after a replay finishes:
+         playback pauses at the frontier, and Space there computes instead of
+         replaying. -->
+    <label class="flex items-center gap-1 shrink-0 cursor-pointer select-none"
+           :class="noSession ? 'opacity-40' : ''"
+           :title="loopTitle">
+      <input type="checkbox" :checked="loopOn" :disabled="noSession"
+             @change="toggleLoop" />
+      <span class="text-fg-3">loop</span>
+    </label>
 
     <label class="flex items-center gap-2 shrink-0"
            :class="running ? 'opacity-40' : ''" :title="delayTitle">

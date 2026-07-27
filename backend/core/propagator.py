@@ -137,14 +137,29 @@ class Propagator:
             def T(*k):
                 return c*xp.sqrt(sum(ki**2 for ki in k) + m**2*c**2)
 
-            if m == 0.0 and self.ndim == 1:
-                # T = c*|p|: the gradient is c times the unit vector, i.e.
-                # c*sign(p), and the 1/|k| form below would be 0/0 at p=0. In 2D
-                # the whole origin is singular rather than one point, which is
-                # one reason massless relativistic runs stay 1D-only for now
-                # (milestone M2 in CLAUDE.md).
+            if m == 0.0:
+                # T = c*|k|: the gradient is c times the UNIT vector k_i/|k|,
+                # which the general form below evaluates as 0/0 at the origin —
+                # and the origin IS a lattice point (a symmetric box with even N
+                # puts an exact 0.0 on every axis), so this is reached, not
+                # hypothetical. Define it as 0 there.
+                #
+                # That is not a new convention for 2D, it is the existing 1D one
+                # spelled generically: at ndim=1 this returns c*sign(k0)
+                # BITWISE, because sqrt(k0*k0) == |k0| exactly for every finite
+                # lattice value and sign(0) is already 0. Pinned by
+                # test_the_massless_gradient_reduces_to_the_1d_convention, so a
+                # future change here cannot silently move the 1D path.
+                #
+                # Only the CLASSICAL variant reaches this: the quantum one
+                # differentiates T through the Bopp difference qd(), which needs
+                # no gradient and is untroubled by |k| being non-smooth at 0.
                 def grad(i):
-                    return lambda *k: c*xp.sign(k[0])
+                    def g(*k):
+                        r = xp.sqrt(sum(kj**2 for kj in k))
+                        nz = r > 0.
+                        return c*xp.where(nz, k[i]/xp.where(nz, r, 1.), 0.)
+                    return g
             else:
                 def grad(i):
                     return lambda *k: c*k[i]/xp.sqrt(

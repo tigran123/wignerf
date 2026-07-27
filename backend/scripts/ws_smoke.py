@@ -8,9 +8,10 @@ Creates a harmonic session, plays it, and asserts streaming invariants:
 monotone record indices, exact record-time spacing, unit norm after
 dequantizing the SPATIAL plane, flat energy, lockstep bundles, exact seek.
 
---ndim 2 runs the same checks over a 4D phase space at 32^4 (two variants —
-the relativistic ones are deferred, milestone M2), which is the one place the
-2D record path is exercised against a real uvicorn rather than a TestClient.
+--ndim 2 runs the same checks over a 4D phase space at 32^4, all four variants
+(relativistic included since milestone M2 landed on 2026-07-27), which is the
+one place the 2D record path is exercised against a real uvicorn rather than a
+TestClient.
 """
 
 import argparse
@@ -57,7 +58,8 @@ else:
         "ic": {"type": "mixture", "components": [
             {"q0": [2.0, 0.0], "k0": [0.0, 0.5],
              "sigma_q": [0.707, 0.707], "sigma_k": [0.707, 0.707]}]},
-        "variants": ["qn", "cn"],
+        "variants": ["qn", "qr", "cn", "cr"],
+        "c": 10.0,      # low c so the relativistic variants visibly differ
         "record_dt": 0.05,
         "delay": 0.0,
     }

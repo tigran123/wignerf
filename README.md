@@ -75,13 +75,20 @@ SI (fs / Å / eV) appears in display labels only.
 
 ### What 2D does not do yet
 
-Four features are 1D-only for now, each refused at the door with a message
+Three features are 1D-only for now, each refused at the door with a message
 naming the gate rather than half-working: **float32** (`precision` is forced to
-float64 and the Setup control is disabled), the **relativistic** variants,
-**auto-expand** (boundary *detection* does run in 2D, and warns on all four
-axes — only the automatic regrid is deferred), and **mp4 export** of a 2D run.
-The Export panel's other half — the setup document, and import of a `.json` or
-a previously exported `.mp4` — works at either dimensionality.
+float64 and the Setup control is disabled), **auto-expand** (boundary *detection*
+does run in 2D, and warns on all four axes — only the automatic regrid is
+deferred), and **mp4 export** of a 2D run. The Export panel's other half — the
+setup document, and import of a `.json` or a previously exported `.mp4` — works
+at either dimensionality.
+
+The **relativistic** variants were the fourth and now work in 2D, restoring the
+anharmonic-shear diagnostic there. One caveat worth knowing: a **massless**
+(m = 0) relativistic run loses purity at a rate set by how well the momentum grid
+resolves the kink in T = c|p| — ~7e-6 per 100 steps at 32⁴, falling ~10× at 48⁴.
+It is independent of the timestep, so the remedy is a finer momentum axis, not a
+smaller dt.
 
 Sizing a 2D run: a worker costs ~208 B per cell in float64, flat across sizes,
 of which the state itself is only 4% (the rest is the step's machinery at full
@@ -341,9 +348,10 @@ under `~/.claude` and are not covered by this.
 A personal research tool, under active development.
 
 2D space (4D phase space) landed in July 2026 as a first cut: the physics core
-is verified, and the four features listed under *What 2D does not do yet* are
-committed follow-up work rather than optional extras — float32 first, since
-memory is *the* 2D constraint. Two further items are already scoped: cuts at
+is verified, and the features listed under *What 2D does not do yet* are
+committed follow-up work rather than optional extras — float32 next, since
+memory is *the* 2D constraint. The relativistic variants were the first of them
+to land. Two further items are already scoped: cuts at
 fixed (y, p_y) alongside the projections, which are exact for separable states
 but average away the fringe contrast of precisely the entangled regime 2D exists
 to show; and merging the inverse/forward FFT pair across step boundaries, worth

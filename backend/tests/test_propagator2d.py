@@ -37,7 +37,7 @@ from core.grid import Axis, Grid
 from core.initial import (GaussianComponent, cat_wigner, minimal_sigma_p,
                          mixture_wigner)
 from core.propagator import Propagator
-from core.xp import ArrayBackend
+from core.xp import ArrayBackend, C_AU
 
 SIG = 1.0/sqrt(2.0)
 
@@ -73,17 +73,27 @@ def evolve(prop, W, dt, nsteps):
 # 1. the independent-method reference
 # ---------------------------------------------------------------------------
 
-def _schroedinger(xv, yv, psi, U, mass, hbar, dt, nsteps):
+def _schroedinger(xv, yv, psi, U, mass, hbar, dt, nsteps, c=None):
     """Split-operator TDSE on psi(x,y): exp(-iU dt/2) exp(-iT dt) exp(-iU dt/2)
-    with T = (kx^2+ky^2)/2m in the Fourier basis. Deliberately NOT the Wigner
-    machinery — no Bopp shifts, no phase-space grid, nothing shared but numpy's
-    FFT — so agreement is evidence, not tautology."""
+    with T in the Fourier basis. Deliberately NOT the Wigner machinery — no Bopp
+    shifts, no phase-space grid, nothing shared but numpy's FFT — so agreement is
+    evidence, not tautology.
+
+    c=None gives the non-relativistic T = (kx^2+ky^2)/2m; a c makes it the
+    square-root (Salpeter) T = c*sqrt(p^2 + m^2c^2) with p = hbar*kappa, which a
+    spectral method applies exactly because T is diagonal in the Fourier basis.
+    The rest energy is a global phase there and cancels from |psi|^2 — the same
+    cancellation the Wigner side gets from T entering only as a DIFFERENCE."""
     dx, dy = xv[1] - xv[0], yv[1] - yv[0]
     kx = 2.*pi*np.fft.fftfreq(len(xv), d=dx)[:, None]
     ky = 2.*pi*np.fft.fftfreq(len(yv), d=dy)[None, :]
     Umesh = U(xv[:, None], yv[None, :])
     halfU = np.exp(-0.5j*dt*Umesh/hbar)
-    expT = np.exp(-1j*dt*hbar*(kx**2 + ky**2)/(2.*mass))
+    if c is None:
+        expT = np.exp(-1j*dt*hbar*(kx**2 + ky**2)/(2.*mass))
+    else:
+        expT = np.exp(-1j*dt*c*np.sqrt(hbar**2*(kx**2 + ky**2)
+                                       + mass**2*c**2)/hbar)
     for _ in range(nsteps):
         psi = halfU*psi
         psi = np.fft.ifft2(expT*np.fft.fft2(psi))
@@ -116,9 +126,10 @@ def _hh():
              lambda x, y: y + lam*(x**2 - y**2)))
 
 
-def _wigner_vs_psi(backend, dt, nsteps):
+def _wigner_vs_psi(backend, dt, nsteps, c=None):
     """Run both methods to the same t and return
-    (relative rho error, obs, psi diagnostics)."""
+    (relative rho error, obs, psi diagnostics). c=None is non-relativistic;
+    passing a c runs BOTH sides relativistically (milestone M2)."""
     hbar, mass = 1.0, 1.0
     U, gradU = _hh()
     # p spans exactly the FFT frequency range of the Schroedinger x-grid, so
@@ -127,14 +138,15 @@ def _wigner_vs_psi(backend, dt, nsteps):
     g = grid2(backend, n=32, xlim=6.0, plim=pi*32/12.0)
     q0, sig, k0 = (1.0, 0.5), (SIG, SIG), (0.0, 0.6)
     prop = Propagator(g, quantum=True, mass=mass, hbar_eff=hbar,
-                      U=U, gradU=gradU)
+                      U=U, gradU=gradU, relativistic=c is not None,
+                      **({} if c is None else dict(c=c)))
     W = g.shift(cat_wigner(g, [GaussianComponent(q0, k0, sig, sig)], hbar))
 
     xv, yv = backend.asnumpy(g.v[0]), backend.asnumpy(g.v[1])
     psi = _coherent_psi(xv, yv, q0, sig, k0, hbar)
 
     W = evolve(prop, W, dt, nsteps)
-    psi = _schroedinger(xv, yv, psi, U, mass, hbar, dt, nsteps)
+    psi = _schroedinger(xv, yv, psi, U, mass, hbar, dt, nsteps, c=c)
 
     planes = observables.reduce_planes(W, g)
     obs = observables.compute(W, prop, planes)
@@ -227,7 +239,15 @@ def test_matches_an_independent_schroedinger_run(backend):
 @pytest.mark.parametrize("quantum", [True, False])
 def test_separable_run_equals_two_1d_runs(backend, quantum):
     """U = x^2/2 + 0.3*y^4 is separable but NOT quadratic, so the quantum run
-    carries real Moyal corrections in y — and must still factorise exactly."""
+    carries real Moyal corrections in y — and must still factorise exactly.
+
+    NB this anchor is NON-RELATIVISTIC and cannot be extended to qr/cr. It rests
+    on the whole exponent factorising, which needs T separable as well as U:
+    T = (px^2+py^2)/2m is a sum, but T = c*sqrt(px^2+py^2+m^2c^2) is not, so a
+    relativistic 2D run is genuinely NOT the outer product of two 1D relativistic
+    runs. Adding a relativistic parametrization here would fail against CORRECT
+    code. The independent cross-check that replaces it for relativistic variants
+    is test_relativistic_matches_an_independent_schroedinger_run."""
     U2 = lambda x, y: x**2/2. + 0.3*y**4
     g2 = grid2(backend)
     p2 = Propagator(g2, quantum=quantum, U=U2,
@@ -309,15 +329,24 @@ def test_a_coupled_cubic_is_not_a_pair_of_1d_shifts(backend):
                                                      g.shape), rtol=1e-9)
 
 
-@pytest.mark.parametrize("quantum", [True, False])
-def test_angular_momentum(backend, quantum):
+@pytest.mark.parametrize("quantum,relativistic", [
+    (True, False), (False, False), (True, True), (False, True)])
+def test_angular_momentum(backend, quantum, relativistic):
     """<Lz> is conserved by a CENTRAL potential and not by an anisotropic one —
-    a genuinely two-dimensional invariant, and one no 1D test can reach."""
+    a genuinely two-dimensional invariant, and one no 1D test can reach.
+
+    It holds for the RELATIVISTIC variants too (milestone M2) and for the same
+    reason: T depends on the momenta only through |k|, so it is invariant under a
+    joint rotation of (x,y) and (px,py) exactly as p^2/2m is. That makes this the
+    one existing 2D anchor that transfers to qr/cr unchanged — separability does
+    not (see above), and quantum == classical does not either (T is not quadratic
+    in k, so the kinetic Moyal corrections do not vanish)."""
     g = grid2(backend)
     W0 = g.shift(mixture_wigner(g, [GaussianComponent(
         (2.0, 0.0), (0.0, 1.0), (SIG, SIG), (SIG, SIG))]))
 
-    central = Propagator(g, quantum=quantum, **iso_harmonic())
+    kw = dict(quantum=quantum, relativistic=relativistic)
+    central = Propagator(g, **kw, **iso_harmonic())
     lz0 = observables.compute(W0, central).lz
     # x*py - y*px = 2*1 - 0; the 1.5e-7 deficit is Gaussian tail truncation at
     # the domain edge, the same bound test_mixture_normalization uses in 1D
@@ -328,7 +357,7 @@ def test_angular_momentum(backend, quantum):
     # breaking rotational symmetry (and the periodic torus), not physics.
     assert observables.compute(W, central).lz == pytest.approx(lz0, abs=2e-5)
 
-    aniso = Propagator(g, quantum=quantum,
+    aniso = Propagator(g, **kw,
                        U=lambda x, y: x**2/2. + 2.*y**2,
                        gradU=(lambda x, y: x + 0.*y, lambda x, y: 4.*y + 0.*x))
     Wa = evolve(aniso, W0, 0.01, 300)
@@ -439,3 +468,282 @@ def test_cat_state_is_a_valid_2d_quantum_state(backend):
     assert float(W.sum())*g.dV == pytest.approx(1.0, abs=1e-6)
     assert (2.*pi)**2*float((W*W).sum())*g.dV == pytest.approx(1.0, abs=1e-4)
     assert float(W.min()) < -1e-3         # interference fringes go negative
+
+
+# ---------------------------------------------------------------------------
+# 6. relativistic variants in 2D (milestone M2)
+# ---------------------------------------------------------------------------
+
+def test_relativistic_matches_an_independent_schroedinger_run(backend):
+    """The relativistic counterpart of anchor 1, and the anchor that REPLACES
+    separability for qr/cr (T = c*sqrt(px^2+py^2+m^2c^2) does not factorise, so
+    a 2D relativistic run is not the outer product of two 1D ones).
+
+    Both sides run relativistically: the reference applies the square-root
+    (Salpeter) T exactly in the Fourier basis, sharing nothing with the Wigner
+    machinery but numpy's FFT.
+
+    c = 10 with momenta of order 1, deliberately. Two things have to hold at once
+    and they pull in opposite directions — the relativistic correction must be
+    big enough to be the thing under test, and the splitting error must still
+    dominate the dt-INDEPENDENT ~1.5e-5 grid floor that anchor 1's docstring
+    documents. Measured relative density error and ratio:
+
+        c = 10:  1.345e-4 at dt = 0.02, 2.936e-5 at 0.01, ratio 4.58  (O(dt^2))
+        c = 5 :  1.135e-4,              3.282e-5,         ratio 3.46
+        c = 3 :  8.522e-5,              3.218e-5,         ratio 2.65  <- floor
+
+    At c = 3 the fine residual has reached that floor and the convergence check
+    stops meaning anything, exactly as it does for the non-relativistic anchor
+    below dt = 0.005. Do not lower c to make the physics "more relativistic"."""
+    C = 10.0
+    coarse, _, _ = _wigner_vs_psi(backend, 0.02, 50, c=C)
+    fine, obs, extra = _wigner_vs_psi(backend, 0.01, 100, c=C)
+    g, planes, psi, rho_psi, xv, yv, hbar, mass, U = extra
+
+    assert fine < 1e-4, "densities disagree: %.3g" % fine
+    assert coarse/fine > 3.0, (
+        "the relativistic residual is not O(dt^2) — %.3g at dt=0.02 vs %.3g at "
+        "0.01. A dt-independent residual means the 4D kinetic operator is wrong, "
+        "not the step size." % (coarse, fine))
+
+    # ...and the test can actually FAIL: a no-op `relativistic` flag, or a wrong
+    # sqrt, is not a small perturbation here. The relativistic and
+    # non-relativistic densities differ by 1.46e-2 of the peak at c = 10 (5.53e-2
+    # at c = 5, 1.32e-1 at c = 3), i.e. ~500x the residual above, so agreement
+    # with the relativistic reference is evidence and not a tautology.
+    nonrel = _wigner_vs_psi(backend, 0.01, 100, c=None)[2][1][(0, 1)]
+    rho_rel = planes[(0, 1)]
+    sep = float(np.max(np.abs(np.asarray(rho_rel) - np.asarray(nonrel)))) \
+        / float(np.max(np.abs(np.asarray(nonrel))))
+    assert sep > 100.*fine, (
+        "the relativistic run is indistinguishable from the non-relativistic "
+        "one (%.3g), so this test could pass with T unchanged" % sep)
+
+    # <H> against psi, with the rest energy handled explicitly on both sides:
+    # observables subtract m*c^2 (it cancels inside the Wigner kinetic
+    # DIFFERENCE), while <T> from psi carries it.
+    dx, dy = g.d[0], g.d[1]
+    psit = np.fft.fftshift(np.fft.fft2(psi))*dx*dy/(2.*pi*hbar)
+    nk = np.abs(psit)**2
+    kxv = 2.*pi*np.fft.fftshift(np.fft.fftfreq(len(xv), d=dx))
+    kyv = 2.*pi*np.fft.fftshift(np.fft.fftfreq(len(yv), d=dy))
+    T_psi = float(np.sum(
+        (C*np.sqrt(kxv[:, None]**2 + kyv[None, :]**2 + mass**2*C**2)
+         - mass*C**2)*nk))*(kxv[1] - kxv[0])*(kyv[1] - kyv[0])
+    E_psi = T_psi + float(np.sum(U(xv[:, None], yv[None, :])*rho_psi))*dx*dy
+    assert obs.E == pytest.approx(E_psi, rel=1e-3)
+
+
+def test_the_kinetic_bopp_difference_survives_the_mc2_cancellation(backend):
+    """The named M2 risk, settled by measurement rather than argument.
+
+    Quantum relativistic dT is (T(K + hL/2) - T(K - hL/2))/(i*h)/2 — a difference
+    of terms of magnitude m*c^2 = 1.878e4 at c = 137.036 yielding a result of
+    order 1e2. The stable form of the same quantity has no cancellation at all:
+
+        T+ - T- = c*(A - B)/(sqrt(A) + sqrt(B)),   A - B = 2*h*(K.L)
+
+    Measured absolute error against it, 2026-07-27:
+
+        ndim=1  N=32  max|dT_im| =  29.3   err 3.61e-12   rel 1.23e-13
+        ndim=1  N=64  max|dT_im| =  58.5   err 3.60e-12   rel 6.16e-14
+        ndim=2  N=32  max|dT_im| =  58.4   err 4.10e-12   rel 7.02e-14
+        ndim=2  N=64  max|dT_im| = 116.6   err 4.21e-12   rel 3.61e-14
+
+    The ABSOLUTE error is flat — 3.6e-12 in 1D against 4.2e-12 in 2D — because it
+    is set by m^2c^2*eps ~ 1.9e-12, a couple of ulps, and that does not care how
+    many momentum components enter the sum. So a second momentum argument does
+    NOT worsen the cancellation, and the relative error actually improves because
+    |dT| grows. This is why construction stays float64 (in float32 the same
+    difference has 200% error) and why M1 must re-measure it, not inherit it."""
+    for nd, gf in ((1, grid1), (2, grid2)):
+        for n in (32, 64):
+            g = gf(backend, n=n)
+            kw = (dict(U=lambda x: x**2/2., gradU=(lambda x: x,)) if nd == 1
+                  else iso_harmonic())
+            p = Propagator(g, quantum=True, relativistic=True, mass=1.0,
+                           c=C_AU, hbar_eff=1.0, **kw)
+            h = p.hbar_eff
+            A = sum((k + h*l/2.)**2 for k, l in zip(g.K, g.Lam)) + C_AU**2
+            B = sum((k - h*l/2.)**2 for k, l in zip(g.K, g.Lam)) + C_AU**2
+            kdotl = sum(k*l for k, l in zip(g.K, g.Lam))
+            ref = np.asarray(-C_AU*kdotl/(np.sqrt(A) + np.sqrt(B)))
+            got = np.asarray(p.dT_im)
+            err = float(np.max(np.abs(got - ref)))
+            # 1e-11 is ~2.5x the worst measured 4.21e-12; a bound on the ABSOLUTE
+            # error, because that is the quantity m^2c^2*eps actually sets.
+            assert err < 1e-11, (
+                "ndim=%d N=%d: the kinetic Bopp difference lost %.3g to the mc^2 "
+                "cancellation" % (nd, n, err))
+
+
+def test_relativistic_matches_nonrel_at_large_c(backend):
+    """The 2D mirror of the 1D check: c = 1e4 makes (p/mc)^2 ~ 1e-8 while keeping
+    the cancellation error (~m*c^2*eps, see above) far below the phase scale."""
+    g = grid2(backend)
+    W0 = g.shift(mixture_wigner(g, [GaussianComponent(
+        (2.0, 0.0), (0.0, 0.0), (SIG, SIG), (SIG, SIG))]))
+    nr = Propagator(g, quantum=True, relativistic=False, **iso_harmonic())
+    re = Propagator(g, quantum=True, relativistic=True, c=1e4,
+                    **iso_harmonic())
+    Wn = evolve(nr, W0, 0.01, 100)
+    Wr = evolve(re, W0, 0.01, 100)
+    assert float(np.max(np.abs(Wn - Wr))) < 1e-6
+    # and the rest energy must be subtracted from E: <U> = 2.5, <T> = 0.5
+    assert observables.compute(Wr, re).E == pytest.approx(3.0, abs=1e-3)
+
+
+def _shear_diag2(backend, dt, T, **kw):
+    """Evolve the 2D coherent state at fixed dt to time T, sampling every 5
+    steps. Returns (max(dx*dpx) - hbar/2, peak-to-peak E, max |purity drift|) —
+    the three numbers that separate anharmonic shear from numerics, exactly as
+    the 1D suite's _shear_diag does."""
+    g = grid2(backend)
+    prop = Propagator(g, **iso_harmonic(), **kw)
+    expU, expT = prop.exponents(dt)
+    W = g.shift(mixture_wigner(g, [GaussianComponent(
+        (2.0, 0.0), (0.0, 0.0), (SIG, SIG), (SIG, SIG))]))
+    excess, E, gamma = [], [], []
+    for i in range(int(T/dt)):
+        W = prop.solve_spectral(W, expU, expT)
+        if i % 5 == 0:
+            obs = observables.compute(W, prop)
+            excess.append(obs.std[0]*obs.std[2] - 0.5)
+            E.append(obs.E)
+            gamma.append(obs.purity)
+    return max(excess), max(E) - min(E), max(abs(x - gamma[0]) for x in gamma)
+
+
+def test_relativistic_uncertainty_shear(backend):
+    """The diagnostic M2 exists to restore: relativistic variants grow dx*dpx
+    away from hbar/2 and non-relativistic ones do not, because T's -p^4/(8m^3c^2)
+    term makes the orbital frequency depend on energy and the ensemble shears.
+    The packet sits at (2,0) with zero momentum, so the orbit is planar and the
+    y dimension is a spectator — the 2D analogue of the 1D measurement.
+
+    c = 10 rather than 137.036: the shear scales as 1/c^4, and at c = 137 it
+    needs ~1200 steps to clear the noise, which at 57 ms/step over a 32^4 grid
+    is not a test. Measured at dt = 0.05, T = 10 (2026-07-27):
+
+        non-relativistic   shear 6.01e-6   E span 1.25e-3   dpurity 3.1e-11
+        relativistic c=10  shear 6.215e-3  E span 1.25e-3   dpurity 1.2e-10
+        the same at dt/2   shear 6.157e-3  E span 3.10e-4   dpurity 1.1e-10
+        relativistic c=20  shear 3.816e-4  E span 1.24e-3   dpurity 3.6e-11
+
+    Three independent tells that this is physics and not discretization, all
+    asserted below: halving dt leaves the shear alone (0.95%) while the O(dt^2)
+    splitting oscillation of E drops 4.03x; the purity stays flat, so the shear
+    is symplectic; and c=10 against c=20 gives 16.3x, i.e. the 2^4 of the
+    documented 1/c^4 law. Do not "fix" this; see the gotcha in CLAUDE.md."""
+    rel = dict(quantum=False, relativistic=True, c=10.0)
+    flat, _, _ = _shear_diag2(backend, 0.05, 10., quantum=False,
+                              relativistic=False)
+    shear, E_span, dgamma = _shear_diag2(backend, 0.05, 10., **rel)
+
+    assert shear > 100.*flat            # measured 1034x
+    assert dgamma < 1e-8                # symplectic: 1.2e-10
+
+    # dt-invariance of the shear, against a 4x drop in the splitting oscillation
+    half, E_span_half, _ = _shear_diag2(backend, 0.025, 10., **rel)
+    assert abs(half - shear) < 0.1*shear                 # measured 0.95%
+    assert E_span/E_span_half > 3.0, (
+        "E's splitting oscillation is not O(dt^2) (%.3g vs %.3g), so the shear "
+        "cannot be attributed to physics" % (E_span, E_span_half))
+
+    # 1/c^4: doubling c must cut the shear ~16x
+    slow, _, _ = _shear_diag2(backend, 0.05, 10., quantum=False,
+                              relativistic=True, c=20.0)
+    assert 8.0 < shear/slow < 32.0, "1/c^4 scaling broken: %.3g" % (shear/slow)
+
+
+@pytest.mark.parametrize("nd", [1, 2])
+def test_the_massless_gradient_reduces_to_the_1d_convention(backend, nd):
+    """m = 0 gives T = c|k|, whose gradient is c times the UNIT vector k_i/|k| —
+    0/0 at the origin, and the origin IS a lattice point (a symmetric box with
+    even N puts an exact 0.0 on every axis). It is defined as 0 there.
+
+    That is the existing 1D convention (c*sign(p), and sign(0) == 0) written
+    generically, not a new 2D one, and this test pins that it stays BITWISE so:
+    sqrt(k*k) == |k| exactly for every finite lattice value, so k_i/|k| is
+    exactly +-1 off the origin. Only the CLASSICAL variant reaches the gradient;
+    the quantum one differentiates T through qd()."""
+    g = grid1(backend, n=32) if nd == 1 else grid2(backend, n=32)
+    kw = (dict(U=lambda x: x**2/2., gradU=(lambda x: x,)) if nd == 1
+          else iso_harmonic())
+    p = Propagator(g, quantum=False, relativistic=True, mass=0.0, c=C_AU, **kw)
+    _, grads = p._kinetic()
+
+    kvs = [backend.asnumpy(g.v[nd + i]) for i in range(nd)]
+    i0 = int(np.argmin(np.abs(kvs[0])))
+    assert kvs[0][i0] == 0.0, "no exact zero on the momentum lattice"
+
+    if nd == 1:
+        gm = backend.asnumpy(np.asarray(grads[0](g.v[1])))
+        assert np.all(gm == C_AU*np.sign(kvs[0]))       # bitwise
+        assert gm[i0] == 0.0
+    else:
+        kx, ky = g.v[2][:, None], g.v[3][None, :]
+        gx = backend.asnumpy(np.asarray(grads[0](kx, ky)))
+        gy = backend.asnumpy(np.asarray(grads[1](kx, ky)))
+        assert np.all(np.isfinite(gx)) and np.all(np.isfinite(gy))
+        j0 = int(np.argmin(np.abs(kvs[1])))
+        assert kvs[1][j0] == 0.0
+        # along ky = 0 the 2D gradient IS the 1D one, bitwise
+        assert np.all(gx[:, j0] == C_AU*np.sign(kvs[0]))
+        assert gx[i0, j0] == 0.0 and gy[i0, j0] == 0.0
+
+
+@pytest.mark.parametrize("quantum", [True, False])
+def test_a_massless_2d_run_is_finite_and_conserved(backend, quantum):
+    """m = 0 in 2D is reachable for the first time now that relativistic
+    variants are (protocol.py requires exclusively relativistic variants when
+    mass == 0), so it gets its own end-to-end check rather than inheriting the
+    massive case's. c = 1 keeps the unit-speed motion inside the box.
+
+    MASSLESS COSTS PURITY, AND IT IS THE GRID NOT THE STEP. T = c|k| has a KINK
+    at the origin, so its Bopp difference has slowly-decaying Fourier content in
+    lambda that a finite lattice truncates. Measured over 100 steps at 32^4
+    (2026-07-27):
+
+        m=0 quantum    dt=0.01  -7.19e-6     dt=0.005  -6.99e-6
+        m=0 classical  dt=0.01  -4.66e-5     dt=0.005  -3.43e-5
+        m=1 c=1        dt=0.01  -3.27e-9     dt=0.005  -2.96e-9
+        m=1 c=137.036  dt=0.01  -4.62e-12    dt=0.005  -3.27e-12
+
+    Halving dt does NOT help (that is the assertion below), but refining the
+    MOMENTUM grid does: the massless quantum drift falls from 7.19e-6 at N=32 to
+    7.16e-7 at N=48, ~10x for a 1.5x refinement. So this is spectral truncation
+    of a non-smooth T, not an unstable propagator — and the remedy for a user who
+    needs a clean massless run is a finer momentum axis, not a smaller dt. Norm
+    is conserved to machine precision throughout, which is what says the
+    evolution is still exactly unitary; it is the RESOLUTION of the kink that is
+    lossy, not the map."""
+    g = grid2(backend)
+    p = Propagator(g, quantum=quantum, relativistic=True, mass=0.0, c=1.0,
+                   **iso_harmonic())
+    assert np.all(np.isfinite(np.asarray(p.dT_im)))
+    assert np.all(np.isfinite(np.asarray(p.dU_im)))
+    assert p.rest_energy == 0.0          # m*c^2 with m = 0
+
+    W0 = g.shift(mixture_wigner(g, [GaussianComponent(
+        (2.0, 0.0), (0.0, 0.0), (SIG, SIG), (SIG, SIG))]))
+    o0 = observables.compute(W0, p)
+
+    def run(dt, nsteps):
+        o = observables.compute(evolve(p, W0, dt, nsteps), p)
+        assert np.isfinite(o.E)
+        # |expU| = |expT| = 1 regardless of how well the kink is resolved, so
+        # norm is the invariant that must still hold to machine precision
+        assert o.norm == pytest.approx(o0.norm, abs=1e-12)
+        return abs(o.purity - o0.purity)
+
+    coarse = run(0.01, 100)
+    fine = run(0.005, 200)
+    assert coarse < 1e-4, "massless purity loss %.3g is out of family" % coarse
+    # dt-INDEPENDENT: a splitting error would fall ~4x here. If this ever starts
+    # scaling with dt, the massless branch has acquired a time-integration bug
+    # and the kink explanation above no longer applies.
+    assert fine > 0.3*coarse, (
+        "the massless purity drift fell with dt (%.3g -> %.3g), so it is no "
+        "longer the kink-truncation effect this test documents" % (coarse, fine))

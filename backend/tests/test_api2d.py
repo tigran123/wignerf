@@ -1,13 +1,17 @@
 """
-2D sessions through the API: the record path end to end, and the four explicit
-refusals that stand in for deferred work (milestones M1-M4 in CLAUDE.md).
+2D sessions through the API: the record path end to end, and the three explicit
+refusals that stand in for deferred work (milestones M1, M3 and M4 in CLAUDE.md).
 
 The refusal tests are not box-ticking. Each gate replaces a feature that would
 otherwise half-work — a float32 2D run whose mixed-precision rules were never
-re-verified, a relativistic 2D variant whose mc^2 cancellation was never
-checked — and a gate that silently stopped firing is exactly how a half-feature
-ships. They also pin that the messages NAME the milestone, so whoever hits one
-learns what is missing rather than that "2D is broken".
+re-verified, an auto-expanding 4D grid with no memory guard on the doubling —
+and a gate that silently stopped firing is exactly how a half-feature ships.
+They also pin that the messages NAME the milestone, so whoever hits one learns
+what is missing rather than that "2D is broken".
+
+M2 (relativistic variants) was the fourth and landed on 2026-07-27, so what
+pins it here is the opposite kind of test: qr/cr must be ACCEPTED in 2D and
+stream finite records. See tests/test_propagator2d.py for the physics.
 """
 
 import json
@@ -141,8 +145,6 @@ def test_a_float32_host_default_does_not_block_2d(monkeypatch):
 
 @pytest.mark.parametrize("over,needle", [
     (dict(precision="float32"), "M1"),
-    (dict(variants=["qr"]), "M2"),
-    (dict(variants=["qn", "cr"]), "M2"),
     (dict(auto_expand=True), "M3"),
 ])
 def test_deferred_features_are_refused_with_their_milestone(over, needle):
@@ -150,6 +152,69 @@ def test_deferred_features_are_refused_with_their_milestone(over, needle):
         r = client.post("/api/sessions", json=cfg2(**over))
         assert r.status_code == 422, r.text
         assert needle in r.text, r.text
+
+
+@pytest.mark.parametrize("variants", [["qr"], ["cr"], ["qn", "qr", "cn", "cr"]])
+def test_relativistic_2d_sessions_are_accepted_and_stream(variants):
+    """The inverse of a gate test, and the reason M2's row left the table above:
+    qr/cr must now CREATE in 2D and produce finite records. A relativistic
+    variant that 422'd here for two months is exactly the thing a stale gate
+    would keep doing after the physics landed."""
+    with TestClient(app) as client:
+        r = client.post("/api/sessions", json=cfg2(variants=variants, c=10.0))
+        assert r.status_code == 200, r.text
+        info = r.json()
+        assert info["variants"] == variants
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            ws.send_text(json.dumps({"type": "play"}))
+            f = None
+            for _ in range(200):
+                m = ws.receive()
+                if m.get("bytes"):
+                    f = protocol.unpack_frame(m["bytes"])
+                    break
+            assert f is not None, "no frame arrived"
+            assert f.geom.ndim == 2
+            assert len(f.variants) == len(variants), "lockstep bundle incomplete"
+            for v in f.variants:
+                # the mc^2 that cancels inside dT dominates <H> and is
+                # subtracted by observables — a NaN or a stray 100.0 here is
+                # exactly what a mishandled rest energy looks like
+                assert v.E == v.E and abs(v.E) < 1e3, v.E
+                assert v.purity == v.purity
+        client.delete("/api/sessions/%s" % sid)
+
+
+def test_massless_needs_relativistic_variants_and_now_works_in_2d():
+    """mass = 0 became reachable in 2D only with M2, because the schema requires
+    exclusively relativistic variants there (non-relativistic T = p^2/2m
+    diverges). The gradient c*k_i/|k| is 0/0 at the origin, which IS a lattice
+    point, so this is the API-level guard that it does not stream NaN."""
+    with TestClient(app) as client:
+        bad = client.post("/api/sessions",
+                          json=cfg2(mass=0.0, variants=["qn", "cr"]))
+        assert bad.status_code == 422, bad.text
+
+        r = client.post("/api/sessions",
+                        json=cfg2(mass=0.0, variants=["qr", "cr"], c=1.0))
+        assert r.status_code == 200, r.text
+        info = r.json()
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            ws.send_text(json.dumps({"type": "play"}))
+            f = None
+            for _ in range(200):
+                m = ws.receive()
+                if m.get("bytes"):
+                    f = protocol.unpack_frame(m["bytes"])
+                    break
+            assert f is not None, "no frame arrived"
+            for v in f.variants:
+                assert v.E == v.E, "massless <H> is NaN — the origin of the "\
+                                   "momentum lattice reached the 0/0 gradient"
+                assert v.purity == v.purity
+        client.delete("/api/sessions/%s" % sid)
 
 
 def test_auto_expand_is_also_refused_live():
@@ -247,6 +312,63 @@ def test_the_device_fit_check_is_the_operative_2d_guard(monkeypatch):
         r = client.post("/api/sessions", json=cfg2(grid=big, variants=["qn"]))
         assert r.status_code == 200, r.text
         client.delete("/api/sessions/%s" % r.json()["session_id"])
+
+
+def test_the_fit_refusal_describes_the_POOL_not_the_first_device(monkeypatch):
+    """Two refusals that need different advice, and the old message gave the
+    wrong one for the worse case.
+
+    It reported whichever assigned device sorted FIRST and always closed with
+    "Reduce an axis, drop a variant, or pick a device with more room". On a real
+    host (RTX 3090 + 2080 Ti) a 128x128x128x64 grid needs 26.0 GiB per worker,
+    and it said "cuda:0 has 8.9 GiB free ... pick a device with more room" —
+    naming the small card and implying a roomier one existed, when the 3090's
+    23.6 GiB could not hold one worker either. The reasonable reading is "so
+    what, I have cuda:1", and it is wrong.
+
+    So the roomiest device decides which story is told: whether ANY device can
+    hold a single worker is what separates "this grid is too big for this host"
+    from "these variants do not distribute onto it".
+    """
+    import routers.sessions as rs
+    free = {}
+    monkeypatch.setattr(rs.xp, "device_free_bytes", lambda d: free.get(d))
+    monkeypatch.setattr(rs, "resolve_devices", lambda spec: ["cuda:9", "cuda:8"])
+    monkeypatch.setattr(config, "MAX_CELLS_2D", 1 << 40)
+
+    big = {"ndim": 2, "axes": [{"lo": -8.0, "hi": 8.0, "N": 32},
+                               {"lo": -8.0, "hi": 8.0, "N": 32},
+                               {"lo": -7.0, "hi": 7.0, "N": 16},
+                               {"lo": -7.0, "hi": 7.0, "N": 16}]}
+    per = 32*32*16*16*config.BYTES_PER_CELL_2D
+    with TestClient(app) as client:
+        # (A) NOTHING can hold one worker. Advice must not send the user after
+        # another device or a shorter variant list — neither exists to be had.
+        free.clear()
+        free["cuda:9"] = int(per*0.8)
+        free["cuda:8"] = int(per*0.4)
+        r = client.post("/api/sessions",
+                        json=cfg2(grid=big, variants=["qn", "cn"]))
+        assert r.status_code == 422, r.text
+        msg = r.json()["detail"]
+        assert "no device in the pool can hold even one" in msg, msg
+        assert "cuda:9" in msg, "must name the ROOMIEST device: %s" % msg
+        assert "will not help" in msg, msg
+        assert "pick a device with more room" not in msg, msg
+
+        # (B) a worker DOES fit on cuda:9 — now it is a distribution problem,
+        # the over-subscribed device is the one to name, and moving there is
+        # real advice with a real number attached
+        free.clear()
+        free["cuda:9"] = int(per*10)
+        free["cuda:8"] = int(per*0.5)
+        r = client.post("/api/sessions",
+                        json=cfg2(grid=big, variants=["qn", "cn"]))
+        assert r.status_code == 422, r.text
+        msg = r.json()["detail"]
+        assert "cuda:8" in msg and "would put" in msg, msg
+        assert "set device to cuda:9" in msg, msg
+        assert "no device in the pool" not in msg, msg
 
 
 def test_the_preview_refuses_what_the_session_would(monkeypatch):

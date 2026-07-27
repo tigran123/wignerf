@@ -156,7 +156,22 @@ describe('reset keeps the dimensionality', () => {
     m.resetToDefaults(cfg)
     expect(cfg.precision).toBe('float64')
     expect(cfg.auto_expand).toBe(false)
-    expect(cfg.variants.every((v) => v === 'qn' || v === 'cn')).toBe(true)
+  })
+
+  it('keeps the relativistic variants in 2D (M2 landed 2026-07-27)', async () => {
+    // applyNdimInvariants used to strip qr/cr to match a backend gate that no
+    // longer exists. If it starts filtering again, a 2D user silently loses the
+    // variants they picked and the form stops describing what will be computed.
+    const { m, cfg } = await load(BASE_2D)
+    cfg.variants.splice(0, cfg.variants.length, 'qn', 'qr', 'cn', 'cr')
+    m.applyNdimInvariants(cfg)
+    expect(cfg.variants).toEqual(['qn', 'qr', 'cn', 'cr'])
+    // ...while the two gates that DO remain still bite
+    cfg.precision = 'float32'
+    cfg.auto_expand = true
+    m.applyNdimInvariants(cfg)
+    expect(cfg.precision).toBe('float64')
+    expect(cfg.auto_expand).toBe(false)
   })
 
   it('gives the IC editor the right default for its dimensionality', async () => {

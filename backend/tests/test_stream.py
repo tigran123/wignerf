@@ -891,3 +891,78 @@ def test_live_params_tracked_in_status():
             assert r["hbar_eff"] == 0.5 and r["tol"] == 0.02
             assert r["mass"] == 1.0        # untouched params keep their value
         client.delete("/api/sessions/%s" % sid)
+
+
+def test_loop_replays_the_same_region_instead_of_stopping():
+    """`loop` repeats a playback pass from where it STARTED rather than pausing
+    at the frontier.
+
+    It exists because of a transport property that is correct but easy to walk
+    into: playback auto-pauses at the frontier, and the button there becomes
+    "Solve" — so the Space that replayed a moment ago now COMPUTES. Looping
+    removes the need to reach for Home first.
+
+    Two things are asserted that a naive implementation gets wrong. It must
+    replay the SAME region (from the seek point, not from record 0), and it must
+    keep running — rewinding only `cursor` stalls silently, because the sender
+    walks forward from `last_sent`, which is still sitting at the frontier. That
+    is what `loop_epoch` is for.
+    """
+    import time as _time
+    with TestClient(app) as client:
+        info = _mk(client)
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            ws.send_text(json.dumps({"type": "play"}))
+            _recv_frames(ws, 8)
+            ws.send_text(json.dumps({"type": "pause"}))
+            _time.sleep(0.3)
+            frontier = client.get("/api/sessions/%s" % sid).json()["record_extent"][1]
+            assert frontier >= 6
+
+            start = 3                      # loop the region [3, frontier]
+            ws.send_text(json.dumps({"type": "delay", "seconds": 0}))
+            ws.send_text(json.dumps({"type": "loop", "on": True}))
+            ws.send_text(json.dumps({"type": "seek", "record": start}))
+            ws.send_text(json.dumps({"type": "play"}))
+
+            # Count LAPS by arrivals at `start`, not hits on `frontier`. The
+            # live frame already in flight when the seek was sent is itself
+            # `frontier`, so counting those reads a DEAD loop as two passes —
+            # measured, with the sender's rearm removed: [8, 3, 4, 5, 6, 7, 8]
+            # and then nothing at all, which that assertion happily accepted.
+            # Wall-clock bounded so the failing case fails in seconds rather
+            # than blocking on ws.receive() waiting for a status tick.
+            seen, deadline = [], _time.monotonic() + 15.0
+            while _time.monotonic() < deadline:
+                m = ws.receive()
+                if m.get("bytes"):
+                    seen.append(protocol.unpack_frame(m["bytes"]).record)
+                    if seen.count(start) >= 2:
+                        break
+            assert seen.count(start) >= 2, \
+                "playback did not come round again: %r" % seen[-30:]
+            lap = seen[seen.index(start):]
+            # it wrapped to the SEEK point, not to 0, and never went below it
+            assert min(lap) >= start, \
+                "loop rewound past where playback started: %r" % sorted(set(lap))[:5]
+            assert frontier in lap, "a lap never reached the frontier: %r" % lap
+            # ...and it is still a playback run: no new records were computed
+            r = client.get("/api/sessions/%s" % sid).json()
+            assert r["running"] and not r["computing"]
+            assert r["record_extent"][1] == frontier, "loop rolled into computing"
+            assert r["loop"] is True
+
+            # turning it off lets the pass in flight finish and stop
+            ws.send_text(json.dumps({"type": "loop", "on": False}))
+            paused = None
+            for _ in range(300):
+                _time.sleep(0.05)
+                r = client.get("/api/sessions/%s" % sid).json()
+                if not r["running"]:
+                    paused = r
+                    break
+            assert paused is not None, "loop off did not let playback stop"
+            assert paused["cursor"] == pytest.approx(frontier)
+            assert paused["loop"] is False
+        client.delete("/api/sessions/%s" % sid)

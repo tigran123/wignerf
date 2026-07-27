@@ -144,6 +144,33 @@ def device_free_bytes(spec):
         return None
 
 
+def device_total_bytes(spec):
+    """Total memory installed on a device spec, or None when it cannot be
+    determined. The sibling of device_free_bytes, and deliberately a different
+    question: FREE is what routers/sessions._fit_error asks, because it decides
+    whether a session can start RIGHT NOW; TOTAL is a static host fact, which is
+    what lets the Setup panel warn about a grid that could never fit on any
+    hardware here without re-polling a number that moves under it.
+    """
+    if spec == "cpu":
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1])*1024
+        except OSError:
+            pass
+        return None
+    try:
+        cupy = _import_cupy()
+        if cupy is None:
+            return None
+        with cupy.cuda.Device(int(spec.split(":")[1]) if ":" in spec else 0) as d:
+            return int(d.mem_info[1])
+    except Exception:
+        return None
+
+
 PRECISIONS = ("float64", "float32")
 
 

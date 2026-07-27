@@ -48,6 +48,10 @@ async def _handle(msg, s, ws):
         s.post_msg(s.status())
     elif msg.type == "delay":
         s.clock.set_delay(msg.seconds)
+    elif msg.type == "loop":
+        s.clock.set_loop(msg.on)
+        s.post_msg(s.status())      # echo, as play/pause do — the toggle is
+                                    # otherwise invisible until the next status
     elif msg.type == "seek":
         # move the cursor NOW, not on the next sender tick: a play arriving
         # right behind the seek must classify playback-vs-solve against the
@@ -176,6 +180,7 @@ async def _sender(ws, s, recv_task):
     last_status = 0.0
     last_progress = 0.0
     last_running = s.clock.running
+    last_loop_epoch = s.clock.loop_epoch
     await _guard_send(ws.send_text(json.dumps(s.status())))
     # exit on s.closed too: a DELETE/TTL close() pops the session and stops
     # its workers but this coroutine still holds `s` (hence its whole
@@ -187,6 +192,13 @@ async def _sender(ws, s, recv_task):
         lc = s.history.latest_complete()
         cursor = s.clock.advance_cursor(now - last_wall, lc, last_sent)
         last_wall = now
+
+        # The cursor wrapped: rearm the replay walk behind loop_from. Without
+        # this `nxt = max(last_sent + 1, first)` still points past the frontier
+        # and the loop stalls with the display frozen on the last record.
+        if s.clock.loop_epoch != last_loop_epoch:
+            last_loop_epoch = s.clock.loop_epoch
+            last_sent = s.clock.loop_from - 1
 
         # Control channel FIRST: play/pause echoes and periodic status must
         # never queue behind a burst of binary frame sends — the transport

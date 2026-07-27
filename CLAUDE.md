@@ -68,13 +68,15 @@ source) is what keeps startup fast. See `README.md`.
   compatibility property that **RAISES at ndim > 1** rather than returning axis
   0/1, so a call site nobody generalized fails loudly instead of computing a
   wrong number. That is what made the migration tractable; do not soften it.
-  **What is DEFERRED in 2D and why**: float32, relativistic variants,
-  auto-expand and mp4 export are milestones M1–M4 (see the milestone table
-  below), each refused with a message naming its milestone at create time and,
-  for auto-expand, on the live `ParamChange` path too. `applyNdimInvariants`
-  (`lib/config.ts`) mirrors the first three in the FORM for the same reason
-  `applyPrecisionInvariants` exists: the panel can be unmounted and an import
-  can reach the combination from outside it.
+  **What is DEFERRED in 2D and why**: float32, auto-expand and mp4 export are
+  milestones M1, M3 and M4 (see the milestone table below), each refused with a
+  message naming its milestone at create time and, for auto-expand, on the live
+  `ParamChange` path too. `applyNdimInvariants` (`lib/config.ts`) mirrors the
+  first two in the FORM for the same reason `applyPrecisionInvariants` exists:
+  the panel can be unmounted and an import can reach the combination from
+  outside it. **M2 (relativistic `qr`/`cr`) landed 2026-07-27** and its gate is
+  gone from both sides — see the relativistic-2D gotcha below for what was
+  measured to retire it.
 - **2D streams PLANE REDUCTIONS, never the state.** W(x,y,px,py) can be neither
   drawn nor sent, so each worker reduces it on the device to the six pairwise
   2D projections (`axes.PLANES`) plus one 1D marginal per axis, and the 4D array
@@ -137,7 +139,29 @@ source) is what keeps startup fast. See `README.md`.
   faster than paced playback). A playback-only run must never coalesce to the
   frontier while sequential records are unsent (that would teleport
   playback to the end), and its auto-pause is delivery-aware — it fires
-  only after the frontier record was SENT. The transport must stay
+  only after the frontier record was SENT.
+  **`loop` repeats that pass instead of pausing** (`LoopCmd`, a `loop` checkbox
+  in the transport row beside Solve/Play/Pause, echoed in `status`). It exists
+  because the auto-pause above is correct but easy to walk into: playback stops
+  at the frontier, the button there becomes "Solve", and the Space that was
+  replaying a second ago now COMPUTES. It is a DISPLAY policy like `delay` —
+  never changes what is computed — and it rewinds to `loop_from`, the cursor
+  captured when the pass STARTED, so "again" means the region you asked to
+  watch rather than all of history. Two things are load-bearing. It reuses the
+  auto-pause's delivery gate, so a slow client is never rewound past frames it
+  has not been sent; and `browsed` stays True across the wrap, or the next tick
+  re-attaches to the frontier and rolls into computation — precisely the
+  confusion the feature removes. **Rewinding `cursor` alone STALLS the loop
+  silently**: the sender walks forward from `last_sent`, which is still at the
+  frontier, so nothing sends and the display freezes on the last record. Hence
+  `loop_epoch`, bumped on each wrap, which the sender watches to rearm
+  `last_sent` — the job `pending_seek` does for a seek. Measured with that
+  rearm removed: `[8, 3, 4, 5, 6, 7, 8]` and then nothing, against 60 laps with
+  it. NB a test that counts arrivals at the FRONTIER cannot see that failure —
+  the live frame already in flight when the seek was sent is itself the
+  frontier, so a dead loop reads as two passes; count arrivals at the START.
+  Pinned by `test_loop_replays_the_same_region_instead_of_stopping`.
+  The transport must stay
   responsive under full frame backpressure: control JSON (status echoes)
   is flushed BEFORE frame sends each tick, play/pause are echoed
   immediately, replay batches are wall-clock-budgeted (~0.2 s) and
@@ -663,7 +687,21 @@ RTX 3090: ~2400 steps/s at 512², ~550 at 1024², ~134 at 2048²; 2080 Ti:
 and 2+2 beats 3+1's 181 — the even chunk is right); 2 workers: 270 vs
 376 (+39%).
 **WHETHER A 2D SESSION STARTS IS DECIDED BY ASKING THE DRIVER, not by a cell
-count** (`routers/sessions._fit_error`). `WIGNERF_MAX_CELLS_2D` is only a rail
+count** (`routers/sessions._fit_error`). **Its refusal describes the POOL, and
+the ROOMIEST device decides which of two stories it tells** — it used to name
+whichever assigned device sorted first and always close with "pick a device with
+more room", which on the real pair said *"cuda:0 has 8.9 GiB free … pick a device
+with more room"* for a 128×128×128×64 grid: the small card named, a roomier one
+implied, and the 3090's 23.6 GiB unable to hold one 26.0 GiB worker either. The
+honest reading of that is "so what, I have cuda:1", and it is wrong. So: if the
+per-worker footprint exceeds EVERY device's budget it says *no device in the pool
+can hold even one*, names the roomiest with its free/installed figures, and
+states that dropping a variant or changing device will not help — because
+neither will, and only the grid is left. Otherwise a worker does fit somewhere,
+which makes it a DISTRIBUTION problem: it names the over-subscribed device and
+points at the one with room, with a count ("set device to cuda:1, which has room
+for 2 of them"). Pinned by
+`test_the_fit_refusal_describes_the_POOL_not_the_first_device`. `WIGNERF_MAX_CELLS_2D` is only a rail
 (see its table row); the operative check runs `assign_devices` to learn which
 devices this session's workers land on, counts the workers per device, and
 compares `n·cells·BYTES_PER_CELL_2D + CONTEXT_BYTES` (300 MiB of CUDA context +
@@ -834,15 +872,22 @@ Grid section became a four-axis table.
 
 **These are not optional extras — they are all wanted, and each is out of the
 first 2D cut only so the physics core lands verified.** Revisit as soon as 2D
-is stable, tested and committed. M1–M4 are enforced meanwhile by explicit,
-message-bearing refusals so a half-feature can never be mistaken for a
+is stable, tested and committed. M1, M3 and M4 are enforced meanwhile by
+explicit, message-bearing refusals so a half-feature can never be mistaken for a
 working one; do NOT quietly relax a gate without doing the verification it
-stands in for. M1 is the one to do first — memory is *the* 2D constraint.
+stands in for. M1 is the one to do next — memory is *the* 2D constraint.
+
+**M2 is DONE (2026-07-27)** and its row is kept below, struck through, because
+what it stands for is now a worked example of retiring one of these gates: the
+verification the gate named got done and got measured, and the numbers live in
+`tests/test_propagator2d.py` and in the relativistic-2D gotcha. M2 was the
+cheapest of the four, not the most valuable — the physics was already generic,
+so it was a gate removal plus its verification.
 
 | # | Milestone | v1 gate | What it needs |
 |---|---|---|---|
 | M1 | **float32 in 2D** | `SessionCreate` 422 on `ndim == 2` and an EXPLICIT `precision == "float32"` (an omitted one resolves to float64 there — see the `WIGNERF_PRECISION` row); the Setup panel disables the select and marks it `(1D)` | Highest value of the four: ~3.4× faster and ~58% of the working set, i.e. 2.4 → 1.4 GiB/worker at 64⁴. Needs the mixed-precision construction rules (float64 meshes, single stepping) re-verified for the CORRELATED 2D Bopp shift, and `adjust_step`'s float32 residual floor re-measured at 4D sizes (`TOL_MIN_F32` was measured at 256², and the note in `boundary.py` says the floor grows with grid size). |
-| M2 | **Relativistic 2D** (`qr`, `cr`) | `SessionCreate` 422 on `ndim == 2` with any relativistic variant | T = c√(px²+py²+m²c²) falls out of the generic code for free, but the mc² cancellation inside the 4D kinetic DIFFERENCE is unverified (in 1D it is a difference of ~1.9e4-magnitude terms — see the float32 gotcha), and the massless limit is harder than 1D: `dTdp = c·sign(p)` becomes `c·p_d/\|p\|`, singular at the origin rather than at a point. Restores the relativistic shear diagnostic in 2D. |
+| ~~M2~~ | ~~**Relativistic 2D** (`qr`, `cr`)~~ | **DONE 2026-07-27** — gate removed from `SessionCreate` and from `applyNdimInvariants` | Both named risks were measured, not argued away: the mc² cancellation is FLAT between 1D and 2D (abs error 3.6e-12 vs 4.2e-12, set by m²c²·eps and indifferent to how many momentum components enter the sum), and the massless gradient is defined as 0 at the lattice origin, which is bitwise what 1D's `sign(0) == 0` already gave. The relativistic shear diagnostic works in 2D. See the gotcha below. |
 | M3 | **Auto-expand in 2D** | `SessionCreate` 422 and live `ParamChange` refusal on `ndim == 2 and auto_expand` | Boundary DETECTION already ships and warns on all four axes. The exact regrid is deferred because in 4D each axis doubling doubles a multi-GiB footprint (against 1D, where the whole grid is a rounding error next to VRAM). `GridState`, `plan_axis`, `support_cells` and `embed_window` are written generically, so what is left is `session._schedule_regrid` orchestration over 4 axes plus a memory guard that refuses a doubling it cannot afford. |
 | M4 | **mp4 export of 2D runs** | `POST /sessions/{id}/export` 422 on `ndim == 2`; the Export panel states the gate | `render_mpl.FrameFigure` needs a plane-set-driven panel grid, four marginals, ⟨Lz⟩, and the (2πℏ)² purity title. Axis subscripts there must NOT use mathtext — see the plain-text gotcha below; the SPA gets real subscripts from HTML `<sub>` (`lib/axes.ts labelHtml`) but matplotlib has no cheap equivalent, so plain `px`/`py` is the default and a second smaller text artist is the only alternative worth trying. NB the SETUP-DOCUMENT half of the Export panel (`GET /sessions/{id}/setup`, and import of .json or .mp4) does work for 2D from the first cut — only the video render is gated. |
 | M5 | **Cuts / slices** | the wire reserves a per-plane `mode` byte; only `mode=0` (projection) is defined | Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime. A cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
@@ -913,6 +958,74 @@ stands in for. M1 is the one to do first — memory is *the* 2D constraint.
   rotational symmetry rather than physics. And a reductions-vs-naive test
   over all six planes and four marginals, which is what catches 4-axis
   fftshift bookkeeping — the likeliest porting error after the shift pairing.
+- **RELATIVISTIC 2D (M2, landed 2026-07-27): what it cost to retire the gate,
+  and the one anchor that does NOT transfer.** The physics was already generic —
+  `_kinetic()` built T = c√(Σkᵢ² + m²c²) and its gradient for any ndim, and the
+  streaming/observables/frame paths never cared — so M2 was a gate removal plus
+  the verification the gate named. Four things worth keeping:
+  **SEPARABILITY IS UNAVAILABLE FOR `qr`/`cr`, and a natural test would fail
+  against correct code.** `test_separable_run_equals_two_1d_runs` rests on the
+  whole exponent factorising, which needs T separable as well as U:
+  (px²+py²)/2m is a sum, c√(px²+py²+m²c²) is not. A 2D relativistic run is
+  genuinely NOT the outer product of two 1D relativistic runs. Since separability
+  is what validates the 4D pipeline against trusted 1D code, the replacement is
+  `test_relativistic_matches_an_independent_schroedinger_run` — the same TDSE
+  reference as the Bopp anchor, with the square-root (Salpeter) T applied exactly
+  in the Fourier basis. Measured at c = 10: 1.345e-4 relative at dt = 0.02 and
+  2.936e-5 at 0.01, **ratio 4.58** (O(dt²)); at c = 5 the ratio is 3.46 and at
+  c = 3 it is 2.65, because the residual has reached the same dt-independent
+  ~1.5e-5 GRID floor the non-relativistic anchor hits below dt = 0.005. Do not
+  lower c to make it "more relativistic". The test can also FAIL: relativistic
+  and non-relativistic densities differ by 1.46e-2 of the peak at c = 10, ~500×
+  the residual, so a no-op `relativistic` flag cannot pass it.
+  **The mc² cancellation does NOT worsen in 4D.** Quantum relativistic dT is a
+  difference of m²c² ≈ 1.878e4-magnitude terms; against the stable form
+  `(A−B)/(√A+√B)` the measured ABSOLUTE error is 3.61e-12 (1D N=32), 3.60e-12
+  (1D N=64), 4.10e-12 (2D N=32), 4.21e-12 (2D N=64) — flat, because it is
+  m²c²·eps ≈ 1.9e-12, a couple of ulps, and that does not care how many momentum
+  components enter the sum. Relative error actually IMPROVES in 2D (1.2e-13 →
+  3.6e-14) since |dT| grows. M1 must re-measure this in float32, not inherit it.
+  **⟨Lz⟩ transfers, quantum ≡ classical does not.** T depends on the momenta only
+  through |k|, so rotational symmetry holds and `test_angular_momentum` extends
+  to qr/cr unchanged — it is the one existing 2D anchor that does. But qr ≠ cr
+  for relativistic even under a quadratic U: the Moyal corrections vanish because
+  U is quadratic, and T is not quadratic in k, so the kinetic Bopp difference and
+  the gradient genuinely differ. Never assert quantum ≡ classical for qr/cr.
+  **The shear diagnostic works, at c = 10 not c = 137.** Shear goes as 1/c⁴ and
+  at c = 137.036 needs ~1200 steps to clear the noise, which at 57 ms/step over
+  32⁴ is not a test. Measured at dt = 0.05, T = 10: non-relativistic 6.01e-6,
+  relativistic **6.215e-3 (1034×)**, the same at dt/2 **6.157e-3 (unchanged,
+  0.95%) while E's splitting oscillation drops 1.25e-3 → 3.10e-4 (4.03×)**, and
+  c = 20 gives 3.816e-4 — **16.3× ≈ 2⁴, the 1/c⁴ law confirmed independently**.
+  Purity flat at ~1e-10 throughout, so the shear is symplectic, exactly as in 1D.
+  **Relativistic is FREE in memory and in time**, so `BYTES_PER_CELL_2D` did not
+  move: measured on the 3090 at float64, `qn` and `qr` arenas are identical to
+  the byte (176.0 B/cell at 32⁴, 48⁴ and 64⁴ — that harness omits the frame
+  build the 208 figure includes) and throughput is within noise (34.8 vs 35.6
+  steps/s at 64⁴, against the 35.1 in the config table). A √ over meshes that
+  already exist costs nothing; the FFTs are still the whole cost. Massless is the
+  same again — 176.0 B/cell.
+- **MASSLESS (m = 0) relativistic runs lose purity to the |k| KINK, and it is
+  the GRID not the step.** m = 0 became reachable in 2D only with M2 (the schema
+  requires exclusively relativistic variants there, since non-relativistic
+  T = p²/2m diverges). The gradient c·kᵢ/|k| is 0/0 at the origin — which IS a
+  lattice point, a symmetric box with even N puts an exact 0.0 on every axis — so
+  it is defined as 0 there. That is not a new 2D convention: at ndim=1 it returns
+  `c·sign(p)` BITWISE, because `sqrt(k*k) == |k|` exactly for every finite
+  lattice value and `sign(0)` was already 0. Pinned by
+  `test_the_massless_gradient_reduces_to_the_1d_convention`.
+  What massless does cost is purity, because T = c|k| is not smooth at the origin
+  and its Bopp difference has slowly-decaying Fourier content in λ that a finite
+  lattice truncates. Measured over 100 steps at 32⁴: **m=0 quantum −7.19e-6 at
+  dt = 0.01 and −6.99e-6 at dt = 0.005 (dt-INDEPENDENT)**, m=0 classical −4.66e-5
+  / −3.43e-5, against m=1 c=1 at −3.27e-9 and m=1 c=137.036 at −4.62e-12. Halving
+  dt does not help; refining the MOMENTUM grid does — **7.19e-6 at N=32 falls to
+  7.16e-7 at N=48**, ~10× for a 1.5× refinement. So the remedy for a user who
+  needs a clean massless run is a finer momentum axis, never a smaller dt. Norm
+  stays at machine precision throughout, which is what says the map is still
+  exactly unitary and it is the RESOLUTION of the kink that is lossy. Only the
+  CLASSICAL variant reaches the gradient at all; the quantum one differentiates
+  T through `qd()`.
 - **Always run uvicorn with `--ws-per-message-deflate false`** (start.sh
   does). uvicorn's default permessage-deflate zlib-compresses every
   multi-MiB frame bundle on the asyncio event loop and caps the stream at
@@ -1276,9 +1389,38 @@ stands in for. M1 is the one to do first — memory is *the* 2D constraint.
   than relaying out the thing being watched, and it is dismissible. Full width so
   no message has to be truncated to fit a header row. **The float32 badge stays
   inline on purpose** (a permanent property of the session, set before there is
-  anything to watch), and so does `createError` (a hard failure with no session
-  running, so there are no panels to disturb). Do not "tidy" these back into the
-  header row.
+  anything to watch), and so does `createError` — but it must be inline INSIDE
+  the header (`basis-full`, its own flex-wrap line), not after it. Outside, it
+  landed at exactly the y the `top-full` strip is anchored to, and the amber
+  "setup changed — restart to apply" was painted straight OVER the error text.
+  That pairing is not exotic: **every restart that 422s sets both**, because the
+  form still differs from the session it failed to create. Measured on
+  128×128×128×64 — the fit refusal was on screen the whole time and unreadable.
+  Do not "tidy" these back into the header row, and do not move `createError`
+  back out of the header.
+- **A FAILED restart leaves the app session-less, and three things used to hide
+  that.** `useSession.create` calls `destroy()` BEFORE it posts, so a 422 deletes
+  the old session and leaves `info`/`status` null with the form intact. Found on
+  a 2D grid of 128×128×128×64: (1) the server's refusal was rendered but painted
+  over by the transient strip (above); (2) the header read **"connecting…"**
+  forever, a false progress report on a socket that will never open — it is now
+  suppressed while `createError` is set; and (3) the transport button stayed pink
+  "Solve" and ENABLED, doing nothing on click, because `solveBlocked` only knew
+  about an invalid setup — `ControlBar.noSession` (`!props.status`) now disables
+  it and says so in the title. Being briefly disabled just after a create is the
+  safe direction, the same argument the "Apply live" button's `computing` gate
+  makes.
+  **And the Setup panel's 2D footprint line now says when a grid cannot fit at
+  all.** `GET /api/device` reports each pool device's `total_bytes` (added
+  `xp.device_total_bytes`); the panel compares its per-device estimate against
+  the SMALLEST of them — the workers spread, so the smaller card binds, the same
+  property `_fit_error` rests on — and turns red with "will not fit this host".
+  TOTAL, not free, deliberately: total is static, so the panel needs no polling
+  and can never contradict the server, whose live-free refusal is a strict
+  superset. Before this the line was plain grey at **26.00 GiB/device on a host
+  whose largest card is 24**, and `WIGNERF_MAX_CELLS_2D` did not cover it either
+  — 128×128×128×64 is 134,217,728 cells, EXACTLY 2²⁷, so the `>` rail is not
+  tripped. At the cap and far past the hardware, and reading as fine.
 - **A marginal's NEGATIVE part measures the noise floor its edge-band mass is
   read against, and on a coarse grid that floor is ABOVE the trigger.** ρ(x) is
   a probability density, so any negative value in it is pure numerical error —
@@ -1332,4 +1474,7 @@ stands in for. M1 is the one to do first — memory is *the* 2D constraint.
   Non-relativistic harmonic H is exactly quadratic ⇒ no shear ⇒ flat.
   Measured: coherent state at (2,0) in x²/2 with c = 137.036 → 2e-5 at
   t = 100 (analytic σ²k²/2 = 1.6e-5). Pinned by
-  `test_relativistic_uncertainty_shear`.
+  `test_relativistic_uncertainty_shear` — and since M2 there is a 2D one of the
+  same name in `test_propagator2d.py`, which measures the same four tells at
+  c = 10 because 1/c⁴ makes c = 137 unaffordable over a 32⁴ grid; see the
+  relativistic-2D gotcha above for its numbers.
