@@ -46,7 +46,7 @@ empties the pool after every preview, every preview was already cold.
 import logging
 import threading
 import traceback
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
@@ -257,6 +257,14 @@ def preview_potential(req: PotentialPreviewIn):
 class WignerPreviewIn(ICSpec):
     grid: GridSpec
     hbar_eff: float = Field(default=1.0, gt=0)
+    # NOT what this endpoint computes in — the preview always builds in float64
+    # on its own backend, and PREVIEW_BYTES_PER_CELL is right to ignore this.
+    # It is the precision of the SESSION the form would create, and it is here
+    # solely so grid_limit_error's refusal can quote that session's footprint.
+    # Without it the message quoted float64 at a form set to float32 and
+    # over-reported by 1.9x — 52.0 GiB against the 28.0 the Setup panel showed
+    # two columns away, for the same grid.
+    precision: Optional[Literal["float64", "float32"]] = None
 
 
 def _build_frame(b, req):
@@ -303,7 +311,11 @@ def preview_wigner(req: WignerPreviewIn):
     # dims switch away from the 1D default) went to the CPU fallback below and
     # allocated 34 GiB arrays until the kernel OOM-killed the server. The GPU
     # path was never the risk: _pick_device simply declines and falls through.
-    bad = grid_limit_error(req.grid)
+    # An omitted precision resolves to the host default here for the same reason
+    # SessionCreate._check resolves it that way: this message describes the
+    # session the grid WOULD create, so it has to answer the same question the
+    # same way or the two disagree about the same grid.
+    bad = grid_limit_error(req.grid, precision=req.precision or config.PRECISION)
     if bad:
         raise HTTPException(422, bad)
     # A malformed IC is a CLIENT error and is decided here, before any backend

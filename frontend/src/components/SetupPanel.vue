@@ -81,13 +81,11 @@ const f32 = computed(() => props.cfg.precision === 'float32')
 // detector) AND by 2D (no memory guard on a 4-axis doubling) — two different
 // reasons, one disabled state, so the marker and tooltip pick the right words
 const expandGated = computed(() => f32.value || props.cfg.grid.ndim > 1)
-// ...and precision itself is gated by 2D, which defers float32 (M1). Same
-// treatment as auto-expand rather than a control whose value is silently put
-// back: applyNdimInvariants forces float64 in payload(), so picking float32
-// here used to leave the select amber against a value no restart could send —
-// and, on a fresh session, made syncFreshSessionToForm build TWO of them (its
-// loop re-reads the form after restart(), and restart() had moved it back).
-const precisionGated = computed(() => props.cfg.grid.ndim > 1)
+// The precision select had the same treatment until M1 landed (2026-07-27) and
+// float32 became a legal 2D choice. Nothing gates it now — and note what it must
+// NOT go back to: a control left enabled while applyNdimInvariants put its value
+// back in payload(), which left the select amber against a value no restart could
+// send and, on a fresh session, made syncFreshSessionToForm build TWO of them.
 
 // The two float32 refusals, worded once each. They live in TOOLTIPS and in the
 // one-off amber note below, never in a standing paragraph: this panel is a
@@ -112,20 +110,18 @@ const AUTO_EXPAND_2D_HELP = 'Not available for 2D runs yet, and refused by the'
   + ' DETECTION still runs on all four axes and will warn you — size the domain'
   + ' by hand.'
 const PRECISION_HELP = 'spectral working precision. float64 is the physics'
-  + ' setting. float32 is a PREVIEW mode: ~3.3-3.8× faster and ~58% of the VRAM'
-  + ' on CUDA (no speedup on CPU), but purity and energy drift by ~1e-4 with the'
-  + ' same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the'
-  + ' relativistic shear. The exponents are built in double either way.'
-const PRECISION_2D_HELP = 'Not available for 2D runs yet, and refused by the'
-  + ' API (milestone M1): the mixed-precision rules — float64 meshes and'
-  + ' exponent construction, single-precision stepping — have not been'
-  + " re-verified for the correlated 2D Bopp shift, and adjust_step's"
-  + ' single-precision residual floor was measured at 256² only. It is the first'
-  + ' 2D follow-up precisely because memory is the binding 2D constraint.'
+  + ' setting. float32 is a PREVIEW mode, and what it buys depends on the'
+  + ' dimensionality: in 1D 3.3-3.8× faster, in 2D only 1.5-2.6× (the 4-axis'
+  + ' transform gains far less), against ~54-58% of the VRAM either way and no'
+  + ' speedup at all on CPU. The cost is the diagnostics: purity and energy drift'
+  + ' by ~1e-4 with the same secular signature as boundary wrap, ΔX·ΔP noise is'
+  + ' ~150× the relativistic shear, and at a coarse 2D grid it moves enough mass'
+  + ' outward to raise the boundary warning on a contained state. The exponents'
+  + ' are built in double either way.'
 const NDIM_HELP = 'spatial dimensions. 1D solves W(x,p,t); 2D solves'
   + ' W(x,y,px,py,t) and streams the six pairwise 2D projections instead of the'
   + ' 4D array. Restart-only, and it rebuilds the grid, the initial condition'
-  + ' and (if untouched) U. NB 2D defers float32, auto-expand and mp4 export'
+  + ' and (if untouched) U. NB 2D still defers auto-expand and mp4 export'
   + ' — the API refuses each with the reason.'
 const TOL_HELP = 'adaptive-step relative tolerance'
 // toExponential: JS prints 1e-5 as "0.00001", which is neither how the field is
@@ -685,20 +681,17 @@ function adoptLive() {
            ~100px, which an inline label plus a select showing "float64" does
            not fit. Stacked still costs two lines instead of three. -->
       <div class="grid grid-cols-3 gap-x-2 gap-y-1 text-xs">
-        <!-- The "(1D)" marker is the same permanent, line-free gate marker
-             auto-expand carries, for the same reason: a touch device has no
-             hover, and the full reason belongs in the tooltip. -->
-        <label class="flex flex-col gap-0.5 min-w-0"
-               :title="precisionGated ? PRECISION_2D_HELP : PRECISION_HELP">
-          <span :class="precisionGated ? 'text-dim' : 'text-muted'">precision<template
-            v-if="precisionGated"> (1D)</template></span>
+        <!-- No "(1D)" marker and no :disabled since M1 landed: float32 is a
+             legal 2D choice, so this select is live at either dimensionality.
+             The auto-expand checkbox below still carries the idiom. -->
+        <label class="flex flex-col gap-0.5 min-w-0" :title="PRECISION_HELP">
+          <span class="text-muted">precision</span>
           <!-- onPrecisionChange marks the choice (until the user operates THIS
                control the form only holds a placeholder and the create payload
                omits precision, so the host's WIGNERF_PRECISION decides) and
                applies the float32 invariants synchronously — see its comment
                for why a watcher is too late. -->
           <select v-model="props.cfg.precision" class="wf-num"
-                  :disabled="precisionGated"
                   :class="runDiffers('precision') ? 'text-warn' : ''"
                   @change="onPrecisionChange()">
             <option value="float64">float64</option>

@@ -149,28 +149,32 @@ describe('reset keeps the dimensionality', () => {
   })
 
   it('leaves a reset 2D setup in a state the API accepts', async () => {
-    // the host default may be float32, which ndim=2 refuses (M1) — a reset
-    // must not park the form in the one combination Restart would 422 on
+    // A reset must not park the form in a combination Restart would 422 on.
+    // The host default being float32 is no longer one of them (M1 landed
+    // 2026-07-27), so a reset now ADOPTS it in 2D exactly as it does in 1D —
+    // and auto-expand, the one gate left, must still come back off.
     const { m, cfg } = await load(BASE_2D)
     m.setHostPrecision('float32')
     m.resetToDefaults(cfg)
-    expect(cfg.precision).toBe('float64')
+    expect(cfg.precision).toBe('float32')
     expect(cfg.auto_expand).toBe(false)
   })
 
-  it('keeps the relativistic variants in 2D (M2 landed 2026-07-27)', async () => {
-    // applyNdimInvariants used to strip qr/cr to match a backend gate that no
-    // longer exists. If it starts filtering again, a 2D user silently loses the
-    // variants they picked and the form stops describing what will be computed.
+  it('keeps variants and precision in 2D (M2 and M1 landed 2026-07-27)', async () => {
+    // applyNdimInvariants used to strip qr/cr AND force float64, to match
+    // backend gates that no longer exist. If either starts again, a 2D user
+    // silently loses what they picked and the form stops describing what will
+    // be computed — and for precision that is worse than losing it, because
+    // payload() would put float64 back behind an amber "restart to apply" that
+    // no restart could ever clear.
     const { m, cfg } = await load(BASE_2D)
     cfg.variants.splice(0, cfg.variants.length, 'qn', 'qr', 'cn', 'cr')
-    m.applyNdimInvariants(cfg)
-    expect(cfg.variants).toEqual(['qn', 'qr', 'cn', 'cr'])
-    // ...while the two gates that DO remain still bite
     cfg.precision = 'float32'
     cfg.auto_expand = true
     m.applyNdimInvariants(cfg)
-    expect(cfg.precision).toBe('float64')
+    expect(cfg.variants).toEqual(['qn', 'qr', 'cn', 'cr'])
+    expect(cfg.precision).toBe('float32')
+    // ...while the ONE gate that does remain still bites (M3)
     expect(cfg.auto_expand).toBe(false)
   })
 
@@ -212,20 +216,21 @@ describe('precisionForPayload', () => {
     expect(m.precisionForPayload(cfg)).toBeNull()
   })
 
-  it('sends float64 explicitly at ndim=2, chosen or not', async () => {
-    // Same trap as auto-expand, and it took the whole 2D mode down with it: 2D
-    // defers float32 (M1), so deferring the field on a float32 host asks for a
-    // pair the schema refuses and EVERY 2D restart 422s — behind a form that
-    // reads float64, because applyNdimInvariants has already forced it there.
+  it('defers at ndim=2 exactly as at ndim=1 (M1 landed 2026-07-27)', async () => {
+    // This used to send float64 explicitly, because 2D deferred float32 and
+    // deferring the field on a float32 host asked for a pair the schema refused
+    // — EVERY 2D restart 422'd, behind a form reading float64. With the gate
+    // gone, deferring is what lets a float32 host give a 2D session float32, and
+    // an explicit float64 here would silently override that host exactly the way
+    // a hard-coded default once did in 1D.
     const { m, cfg } = await load(undefined)
     m.setNdim(cfg, 2)
     expect(m.precisionIsUserChosen()).toBe(false)
-    expect(cfg.precision).toBe('float64')
-    expect(m.precisionForPayload(cfg)).toBe('float64')
-    // ...and it does not depend on the invariants having run: a config that
-    // reached ndim=2 with a stale float32 still sends float64
+    expect(m.precisionForPayload(cfg)).toBeNull()
+    // ...and a CHOICE is still sent, at ndim=2 as at ndim=1
     cfg.precision = 'float32'
-    expect(m.precisionForPayload(cfg)).toBe('float64')
+    m.markPrecisionChosen()
+    expect(m.precisionForPayload(cfg)).toBe('float32')
   })
 
   it('still defers at ndim=1 after a round trip through 2D', async () => {

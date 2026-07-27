@@ -74,10 +74,17 @@ def _fit_error(cfg, devices):
     Skipped at ndim=1: WIGNERF_MAX_GRID already bounds a 2D array to 4096² =
     16.8M cells (~2.7 GiB/worker), so 1D cannot reach the sizes that need this.
     N⁴ can, which is the whole point.
+
+    The footprint is per PRECISION (measured 208 B/cell in float64 against 112
+    in float32), and reading `cfg.precision` here is what makes M1 worth having:
+    with a flat float64 figure this would have refused grids a float32 session
+    holds comfortably — 4 variants at 80⁴ is 15.9 GiB/card at 2+2 in float64 and
+    8.5 in float32 — i.e. it would have blocked exactly the runs single precision
+    is FOR. `_check` resolves precision before this runs, so it is never None.
     """
     if cfg.grid.ndim < 2:
         return None
-    per = cfg.grid.cells*config.BYTES_PER_CELL_2D
+    per = cfg.grid.cells*config.bytes_per_cell(cfg.grid.ndim, cfg.precision)
     assignment = sessions.assign_devices(cfg.variants, devices)
     counts = {}
     for dev in assignment.values():
@@ -151,7 +158,7 @@ async def create_session(cfg: SessionCreate, request: Request):
     if cfg.ic.type == "mixture" and any(c.sigma_k is None
                                         for c in cfg.ic.components):
         raise HTTPException(422, "sigma_k is required for mixture components")
-    bad = grid_limit_error(cfg.grid, len(cfg.variants))
+    bad = grid_limit_error(cfg.grid, len(cfg.variants), cfg.precision)
     if bad:
         raise HTTPException(422, bad)
     nd = cfg.grid.ndim

@@ -777,10 +777,13 @@ class SimSession:
             "auto_expand": self.auto_expand,
             "max_grid": self.max_grid,
             "max_cells": self.max_cells,
-            # device bytes per grid cell per worker, so the Setup panel can
-            # show a footprint before a restart rather than after an OOM
-            "bytes_per_cell": (config.BYTES_PER_CELL_2D if self.ndim > 1
-                               else None),
+            # device bytes per grid cell per worker, at THIS session's precision
+            # (208 in float64, 112 in float32) — None at ndim=1, which needs no
+            # estimate. The Setup panel reads the same figures off /api/device
+            # instead, because it must describe the ndim and precision it is
+            # SHOWING and both are restart-only; this one describes what RUNS.
+            "bytes_per_cell": config.bytes_per_cell(self.ndim,
+                                                    self.cfg.precision),
             # restart-only, so this is the run's own precision, not a live
             # value that can drift from the form. The SPA badges float32.
             "precision": self.cfg.precision,

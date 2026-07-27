@@ -235,12 +235,42 @@ export class WignerRenderer {
     perfStage('draw', performance.now() - t0)
   }
 
+  /**
+   * Release everything, INCLUDING the context itself.
+   *
+   * `loseContext()` is the load-bearing line, and deleting the objects above it
+   * is not a substitute: a WebGL context lives as long as its canvas, and a
+   * detached canvas is reclaimed only when the GC gets to it — which is
+   * non-deterministic, exactly as it is for the backend's closed sessions.
+   * Meanwhile the context still counts against the browser's live-context cap
+   * (16 in Chrome), and past the cap the browser does not fail the new
+   * context: it silently KILLS THE OLDEST one.
+   *
+   * That is what made the IC preview go blank on Restart in 2D. Restart bumps
+   * plotsKey, PanelGrid remounts, and every panel builds a new context while
+   * the old one is still alive — at ndim=2 that is SIX per Restart against 1D's
+   * one, so the cap arrives in two or three Restarts. The oldest context in the
+   * page is the IC editor's, created at first mount, so the IC editor is what
+   * the browser takes. Nothing reports it: `webglcontextlost` fires on a
+   * component that never listened, and every subsequent GL call succeeds as a
+   * no-op, so the canvas is simply blank for the rest of the page's life. A
+   * reload fixes it, which is exactly what makes it read as a mystery.
+   *
+   * A/B measured with a headless context counter that holds each context
+   * object from creation (re-querying getContext misreports, which cost an
+   * afternoon): across six Restarts in a TWO-panel layout, detached-but-alive
+   * contexts go 2, 4, 6, 8, 10, 12 without this line and stay at 0 with it.
+   * Two panels per Restart is the cheap case — the six-panel 2D layout reaches
+   * the cap three times faster.
+   */
   dispose() {
     const gl = this.gl
     if (!gl) return
     if (this.texW) gl.deleteTexture(this.texW)
     if (this.texLUT) gl.deleteTexture(this.texLUT)
     if (this.prog) gl.deleteProgram(this.prog)
+    this.texW = this.texLUT = this.prog = null
+    gl.getExtension('WEBGL_lose_context')?.loseContext()
     this.gl = null
   }
 }

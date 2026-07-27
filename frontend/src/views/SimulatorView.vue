@@ -105,8 +105,6 @@ function payload() {
   // payload built from a half-fixed config asked for float32 + auto-expand and
   // came back a 422 naming a pair the user never chose. Idempotent, so this
   // costs nothing when the fix-up has already run.
-  // Both invariant sets, and ndim FIRST because it forces float64: the form
-  // must be self-consistent before it is serialized, whichever watcher ran.
   applyNdimInvariants(cfg)
   applyPrecisionInvariants(cfg)
   const p: Record<string, unknown> = JSON.parse(JSON.stringify(cfg))
@@ -379,10 +377,26 @@ const boundaryTitle = computed(() => {
     : ((session.status.value?.auto_expand ?? cfg.auto_expand)
         ? 'Auto-expand is on, so the domain will be regridded.'
         : 'Enable auto-expand, or restart with a larger domain.')
+  // In a float32 2D session the SOLVER puts mass in the band by itself, so the
+  // reading is true but this advice is not the right one. Measured 2026-07-27 on
+  // the shipping 2D default, a fully contained state: 1.0e-3 of the integral in
+  // the band at 32^4 after 12000 steps against 3.1e-5 for the identical state in
+  // float64, latching the warning within ~7 s of wall clock, with purity down 2%
+  // — a degraded run, not a domain that is too small. 48^4 stays clear and 64^4
+  // flickers, so it is the COARSE grid that cannot carry single precision. Say so
+  // rather than sending someone to widen a box that was never the problem.
+  const f32 = session.status.value?.precision === 'float32'
+              && sessionNdim.value > 1
+  const cause = f32
+    ? ' In single precision at a coarse 2D grid the solver itself migrates mass ' +
+      'outward — measured 1e-3 of the integral at 32⁴ against 3e-5 for the same ' +
+      'state in float64 — so if purity has drifted too, suspect the precision ' +
+      'rather than the domain: the remedy is float64, or a finer grid.'
+    : ''
   return 'The spectral domain is periodic, so whatever reaches an edge ' +
          're-enters from the opposite side and the run then evolves the wrong ' +
          '(torus) problem — the tells are a secular energy drift and a slow ' +
-         `purity decay. ${advice}`
+         `purity decay. ${advice}${cause}`
 })
 // the server's status is the authority on the live toggle (delay-dial
 // pattern): a reattach to a surviving session must not show a stale box
@@ -616,12 +630,30 @@ const hostDeviceTotals = ref<Record<string, number | null> | null>(null)
 const hostLimits = ref({
   maxGrid: { 1: 4096, 2: 128 } as Record<number, number>,
   maxCells: { 1: null, 2: 2 ** 27 } as Record<number, number | null>,
-  bytesPerCell2d: 208,
+  // per PRECISION, for the same reason the two above are per ndim: precision is
+  // restart-only too, so a single figure here would make the footprint line
+  // disagree with the server for as long as a switch waits for its restart —
+  // and it disagrees by 1.9x, which at 64^4 is 3.25 GiB/worker against 1.75
+  bytesPerCell2d: { float64: 208, float32: 112 } as Record<string, number>,
 })
 const historyCapMb = computed(() => {
   const b = session.status.value?.history_cap_bytes
   return b == null ? null : Math.round(b/(1024*1024))
 })
+/**
+ * The per-cell footprint the Setup panel's 2D line estimates from: null at
+ * ndim=1, which needs no estimate.
+ *
+ * Keyed off the FORM's precision, not the session's, exactly as the ndim it
+ * indexes by is the form's. Both are restart-only, so the panel's job is to
+ * describe what a Restart WOULD create — and the difference is 1.9x, big enough
+ * that reading the running session's precision here would put a stale figure
+ * under a form the user had just switched to float32 to make a grid fit.
+ */
+const footprintBytesPerCell = computed(() =>
+  cfg.grid.ndim > 1
+    ? (hostLimits.value.bytesPerCell2d[cfg.precision] ?? null)
+    : null)
 
 /**
  * Host facts the form needs before it can create anything: the device
@@ -652,7 +684,8 @@ async function probeHost() {
                                      precision?: string
                                      max_grid?: Record<string, number>
                                      max_cells?: Record<string, number | null>
-                                     bytes_per_cell_2d?: number }>(
+                                     bytes_per_cell_2d?: Record<string, number>
+                                   }>(
       '/device', { timeout: 5000 })
     deviceOptions.value = data.choices ?? []
     hostPool.value = data.devices?.map((d) => d.spec) ?? null
@@ -673,8 +706,14 @@ async function probeHost() {
       const c = data.max_cells?.[String(nd)]
       if (c === null || typeof c === 'number') hostLimits.value.maxCells[nd] = c
     }
-    if (typeof data.bytes_per_cell_2d === 'number')
-      hostLimits.value.bytesPerCell2d = data.bytes_per_cell_2d
+    // Same key-by-key treatment, and for the same reason: a backend from before
+    // M1 sends a bare number here, so anything that is not a per-precision
+    // figure has to leave the literal fallbacks standing rather than index to
+    // undefined and render the footprint line as NaN.
+    for (const p of ['float64', 'float32']) {
+      const v = data.bytes_per_cell_2d?.[p]
+      if (typeof v === 'number') hostLimits.value.bytesPerCell2d[p] = v
+    }
     // Install the host's default so "Reset setup to defaults" agrees with the
     // server, and adopt it if this browser has never chosen a precision.
     setHostPrecision(data.precision)
@@ -852,7 +891,7 @@ onBeforeUnmount(() => {
                     :live-run="liveRun" :has-run="hasRun"
                     :max-grid="hostLimits.maxGrid[cfg.grid.ndim]"
                     :max-cells="hostLimits.maxCells[cfg.grid.ndim] ?? null"
-                    :bytes-per-cell="cfg.grid.ndim > 1 ? hostLimits.bytesPerCell2d : null"
+                    :bytes-per-cell="footprintBytesPerCell"
                     :live-devices="session.status.value?.devices ?? null"
                     :device-options="deviceOptions" :host-pool="hostPool"
                     :device-totals="hostDeviceTotals"
@@ -863,7 +902,7 @@ onBeforeUnmount(() => {
                     @apply-live="applyLive"
                     @potential-validity="(v: boolean) => potentialValid = v" />
         <ICEditor :ic="cfg.ic" :grid="cfg.grid" :hbar-eff="cfg.hbar_eff"
-                    :quiet="!!createError"
+                  :precision="cfg.precision" :quiet="!!createError"
                   :show-grid="showGrid" :show-cells="showCells"
                   :live-edge-axes="session.boundary.value?.axes
                                    ?? session.status.value?.boundary?.axes ?? null"
@@ -899,7 +938,7 @@ onBeforeUnmount(() => {
                     :live-run="liveRun" :has-run="hasRun"
                     :max-grid="hostLimits.maxGrid[cfg.grid.ndim]"
                     :max-cells="hostLimits.maxCells[cfg.grid.ndim] ?? null"
-                    :bytes-per-cell="cfg.grid.ndim > 1 ? hostLimits.bytesPerCell2d : null"
+                    :bytes-per-cell="footprintBytesPerCell"
                     :live-devices="session.status.value?.devices ?? null"
                     :device-options="deviceOptions" :host-pool="hostPool"
                     :device-totals="hostDeviceTotals"
@@ -912,7 +951,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="overflow-y-auto min-h-0 pr-1">
           <ICEditor :ic="cfg.ic" :grid="cfg.grid" :hbar-eff="cfg.hbar_eff"
-                    :quiet="!!createError"
+                    :precision="cfg.precision" :quiet="!!createError"
                     :show-grid="showGrid" :show-cells="showCells"
                   :live-edge-axes="session.boundary.value?.axes
                                    ?? session.status.value?.boundary?.axes ?? null"

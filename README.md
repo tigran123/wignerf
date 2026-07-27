@@ -75,26 +75,39 @@ SI (fs / Å / eV) appears in display labels only.
 
 ### What 2D does not do yet
 
-Three features are 1D-only for now, each refused at the door with a message
-naming the gate rather than half-working: **float32** (`precision` is forced to
-float64 and the Setup control is disabled), **auto-expand** (boundary *detection*
-does run in 2D, and warns on all four axes — only the automatic regrid is
-deferred), and **mp4 export** of a 2D run. The Export panel's other half — the
-setup document, and import of a `.json` or a previously exported `.mp4` — works
-at either dimensionality.
+Two features are 1D-only for now, each refused at the door with a message naming
+the gate rather than half-working: **auto-expand** (boundary *detection* does run
+in 2D, and warns on all four axes — only the automatic regrid is deferred) and
+**mp4 export** of a 2D run. The Export panel's other half — the setup document,
+and import of a `.json` or a previously exported `.mp4` — works at either
+dimensionality.
 
-The **relativistic** variants were the fourth and now work in 2D, restoring the
-anharmonic-shear diagnostic there. One caveat worth knowing: a **massless**
-(m = 0) relativistic run loses purity at a rate set by how well the momentum grid
-resolves the kink in T = c|p| — ~7e-6 per 100 steps at 32⁴, falling ~10× at 48⁴.
-It is independent of the timestep, so the remedy is a finer momentum axis, not a
-smaller dt.
+Two more used to be on that list and now work. The **relativistic** variants
+restore the anharmonic-shear diagnostic in 2D; one caveat worth knowing is that a
+**massless** (m = 0) relativistic run loses purity at a rate set by how well the
+momentum grid resolves the kink in T = c|p| — ~7e-6 per 100 steps at 32⁴, falling
+~10× at 48⁴, independent of the timestep, so the remedy is a finer momentum axis
+and not a smaller dt.
 
-Sizing a 2D run: a worker costs ~208 B per cell in float64, flat across sizes,
-of which the state itself is only 4% (the rest is the step's machinery at full
-shape). That is 0.20 GiB per worker at 32⁴ and 3.25 GiB at 64⁴. Measured on an
-RTX 3090: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴
-is for exploration and 64⁴ is a serious run**. Whether a session starts is not
+**float32** is the other, and in 2D it is a memory setting rather than a speed
+one: it costs 112 bytes per cell against float64's 208, but it is only 1.5–2.6×
+faster here against 3.3–3.8× in 1D, because the 4D step transforms two axes at a
+time and single precision gains far less on that. Two things to expect from it.
+It is still a preview mode, so purity and energy drift with the same secular
+signature as boundary wrap. And at a **coarse** 2D grid it moves enough mass
+outward by itself to raise the boundary warning on a perfectly contained state —
+measured 1e-3 of the integral at 32⁴ against 3e-5 for the same state in float64,
+within seconds. 48⁴ and above are clear. If that warning appears and purity has
+drifted too, the remedy is float64 or a finer grid, not a wider box.
+
+Sizing a 2D run: a worker costs ~208 B per cell in float64 and ~112 in float32,
+both flat across sizes, of which the state itself is only 4% (the rest is the
+step's machinery at full shape). That is 0.20 GiB per worker at 32⁴ and 3.25 GiB
+at 64⁴ in float64, or 0.11 and 1.75 in float32 — and 80⁴ (7.93 against 4.27) is
+reachable only in single precision on these cards. Measured on an RTX 3090:
+610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for
+exploration and 64⁴ is a serious run**. Reproduce any of it with
+`scripts/bench.py --ndim 2 --precision both [--footprint]`. Whether a session starts is not
 decided by a cell count but by asking the driver how much memory the cards its
 workers actually land on have free; see `WIGNERF_MAX_CELLS_2D` below.
 
@@ -220,7 +233,7 @@ holds the per-machine values for the systemd unit.
 | `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling for **1D** sessions, at creation and for auto-expand alike. A 4096² working set is ~2.7 GiB per variant worker. |
 | `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **2D** sessions. A sanity rail only: a 4D array grows as N⁴, so a per-axis cap is no real guard — 128⁴ is ~52 GiB per worker with every axis inside the rail. |
 | `WIGNERF_MAX_CELLS_2D` | `134217728` (2²⁷) | Total-cell rail for 2D — a cheap deterministic stop for absurd values (256⁴ is one dimensionality switch away from the 1D default), and the only guard on a host whose free memory cannot be read. Deliberately not the operative limit: that is a per-device fit check which runs the worker→device assignment, then compares the estimate against the driver's free memory, so the **smaller card binds** and unknown free memory never refuses. |
-| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); a session may override it. float32 is a **preview mode** — ~3.3–3.8× faster and ~58% of the working set on CUDA, nothing at all on CPU — and it costs the diagnostics this project navigates by, so do not make it the host default anywhere a result might be read off. It refuses auto-expand and `tol` below 1e-5, and is not available in 2D yet. |
+| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); a session may override it. float32 is a **preview mode** — ~3.3–3.8× faster in 1D but only 1.5–2.6× in 2D, and ~54–58% of the working set on CUDA, nothing at all on CPU — and it costs the diagnostics this project navigates by, so do not make it the host default anywhere a result might be read off. It refuses auto-expand and `tol` below 1e-5. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto. Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download; a file is deleted once downloaded, when its session closes, at shutdown, or 30 minutes after finishing. Under systemd's `PrivateTmp=yes` the default is a RAM tmpfs — point it at a disk path for long 4K renders. |
 | `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 encoder: `auto` \| `cpu` \| `nvenc`. `auto` uses the GPU `h264_nvenc` encoder if a runtime probe succeeds, else `libx264 -preset veryfast`. Overridable per job from the Export panel. |
@@ -349,9 +362,10 @@ A personal research tool, under active development.
 
 2D space (4D phase space) landed in July 2026 as a first cut: the physics core
 is verified, and the features listed under *What 2D does not do yet* are
-committed follow-up work rather than optional extras — float32 next, since
-memory is *the* 2D constraint. The relativistic variants were the first of them
-to land. Two further items are already scoped: cuts at
+committed follow-up work rather than optional extras — mp4 export of a 2D run
+next, with the automatic regrid after it. The relativistic variants and float32
+were the first two to land, the latter halving what a 2D worker holds. Two
+further items are already scoped: cuts at
 fixed (y, p_y) alongside the projections, which are exact for separable states
 but average away the fringe contrast of precisely the entangled regime 2D exists
 to show; and merging the inverse/forward FFT pair across step boundaries, worth

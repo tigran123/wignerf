@@ -78,4 +78,9 @@ def device():
     return {**_probe_backend(),
             "max_grid": {str(n): config.max_grid(n) for n in axes_mod.NDIMS},
             "max_cells": {str(n): config.max_cells(n) for n in axes_mod.NDIMS},
-            "bytes_per_cell_2d": config.BYTES_PER_CELL_2D}
+            # keyed by PRECISION for the same reason the two above are keyed by
+            # ndim: the form has to describe what it is showing, and precision is
+            # restart-only too, so a scalar here would make the footprint line
+            # disagree with the server for as long as a switch awaits its restart
+            "bytes_per_cell_2d": {p: config.bytes_per_cell(2, p)
+                                  for p in config.PRECISIONS}}

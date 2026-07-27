@@ -58,10 +58,20 @@ float64 in both modes. That split is not a compromise, it is the whole design:
     speed at 1024^2/2048^2/4096^2, against 3.80x/3.69x/3.27x for float32
     everywhere. The FFTs are the cost; the meshes are built once per rebuild().
 
-float32 is refused for ndim=2 in the first 2D cut (milestone M1 in CLAUDE.md):
-the mixed-precision rules above have not been re-verified for the correlated
-multi-D shift, and adjust_step's single-precision residual floor was measured
-at 256^2 only.
+That split holds UNCHANGED at ndim=2 (milestone M1, 2026-07-27): the rate meshes
+are bitwise identical between the two modes for all four variants at 4 axes just
+as at 2, which is the property that had to be re-verified because the multi-D
+Bopp shift moves every spatial argument together. Nothing here is
+dimension-aware; only exponents() and solve_spectral() see the working dtype.
+
+What single precision BUYS is much smaller in 2D, though, and worth knowing
+before choosing it: measured 2.63x at 32^4, 2.09x at 48^4, 1.48x at 64^4 and
+1.64x at 80^4, against 3.29x for a 1D 4096^2 run of the SAME 16.8M cell count on
+the same card. The 2D step transforms two axes of a 4D array at a time
+(fft_pair's fftn branch) where 1D transforms one axis of a 2D array, and cuFFT's
+single-precision advantage for that strided layout is far smaller. So in 2D
+float32 is chosen for MEMORY — 112 B/cell against 208, see config.py — and the
+speed is a bonus.
 """
 
 import logging

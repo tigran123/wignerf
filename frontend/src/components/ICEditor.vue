@@ -29,6 +29,10 @@ const props = defineProps<{
   ic: ICCfg
   grid: GridCfg
   hbarEff: number
+  /** The form's spectral precision — passed to the preview endpoint only so its
+   *  over-the-cap refusal quotes the SESSION footprint the Setup panel quotes.
+   *  The preview itself always builds in float64; see the call site. */
+  precision: 'float64' | 'float32'
   showGrid?: boolean
   showCells?: boolean
   /** axes the live session's boundary watch already reports — see edgeNotice */
@@ -186,6 +190,13 @@ async function refresh() {
       components: props.ic.components,
       grid: props.grid,
       hbar_eff: props.hbarEff,
+      // NOT what the preview computes in (it is always float64 on its own
+      // backend) — it is what the SESSION would use, and the endpoint needs it
+      // so its over-the-cap refusal quotes the same footprint the Setup panel's
+      // footprint line does. Sent unconditionally rather than only when chosen:
+      // this is the form's displayed value, and the two lines sit on screen
+      // together, so they must agree even while the form is still deferring.
+      precision: props.precision,
     }, { responseType: 'arraybuffer' })
     const f = decodeFrame(data as ArrayBuffer)
     const v = f.variants[0]!
@@ -224,8 +235,12 @@ function scheduleRefresh(notify = true) {
   timer = setTimeout(refresh, 150)
 }
 
-watch(() => [props.ic, props.grid, props.hbarEff], () => scheduleRefresh(false),
-  { deep: true })
+// precision is in the key even though it changes NOTHING the preview computes:
+// it changes what the endpoint's over-the-cap refusal quotes, so without it a
+// float64 → float32 switch left the old figure standing under the plot —
+// contradicting the Setup panel, which updates immediately, by a factor of 1.9.
+watch(() => [props.ic, props.grid, props.hbarEff, props.precision],
+  () => scheduleRefresh(false), { deep: true })
 
 // -- drag-to-place / pan / zoom ---------------------------------------------
 

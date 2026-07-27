@@ -207,7 +207,7 @@ class GridSpec(BaseModel):
         return self.extended(hbar_eff)[0]
 
 
-def grid_limit_error(grid, n_variants=1):
+def grid_limit_error(grid, n_variants=1, precision="float64"):
     """The host's ceilings for this grid, as a message — or None if it fits.
 
     SHARED by session creation and the IC preview, and that sharing is the
@@ -218,6 +218,19 @@ def grid_limit_error(grid, n_variants=1):
     CPU fallback, where it allocated 34 GiB arrays until the kernel OOM-killed
     the server. The create-time refusal the user would eventually have seen came
     far too late; nothing had ever bounded the preview.
+
+    `precision` only scales the GiB figure the ndim=2 message quotes, never the
+    cell rail itself — the rail is a cell count by design.
+
+    BOTH callers must pass the session's precision, including the IC preview.
+    It is tempting to let the preview keep the float64 default on the grounds
+    that it builds on its own float64 backend — but the figure this message
+    quotes is "per variant WORKER", i.e. the session the grid would create, not
+    the preview's own allocation (that is PREVIEW_BYTES_PER_CELL, which really is
+    precision-blind and stays so). Conflating the two put "~52.0 GiB per variant
+    worker" under the IC plot while the Setup panel two columns away showed
+    28.00 GiB for the same 128⁴ grid — the same quantity, 1.9x apart, both on
+    screen at once.
     """
     nd = grid.ndim
     cap = config.max_grid(nd)
@@ -230,7 +243,7 @@ def grid_limit_error(grid, n_variants=1):
                    cap))
     cells = config.max_cells(nd)
     if cells is not None and grid.cells > cells:
-        per = grid.cells*config.BYTES_PER_CELL_2D/1024**3
+        per = grid.cells*config.bytes_per_cell(nd, precision)/1024**3
         # N⁴ when every axis matches, the product otherwise. The user reads this
         # on every keystroke past the cap, so it states the numbers and the
         # remedy and nothing else — the reasoning behind the cap lives in
@@ -318,17 +331,31 @@ class ICSpec(BaseModel):
 
 
 # adjust_step shrinks |dt| until one full step and two half steps agree to a
-# RELATIVE tol. In complex64 that difference has a roundoff floor near 1e-7, so
+# RELATIVE tol. In complex64 that difference has a roundoff floor near 1e-6, so
 # a smaller tol is unreachable: the controller would burn all 15 shrink attempts
 # every 20 steps, drive dt to nothing, and hand back a run slower than the
 # float64 one it was chosen to beat. Refuse the combination instead of silently
 # stalling — the fix is either a larger tol or float64, and the user must pick.
+#
+# ONE constant covers every grid, and that is measured rather than assumed. M1
+# re-measured the floor across both dimensionalities (2026-07-27, RTX 3090, the
+# residual read straight off adjust_step's own expression at dt down to 0.0025,
+# where float64 is still at 5e-9 and nowhere near its own floor):
+#
+#   1D   256^2  9.2e-7     1024^2  1.2e-6     4096^2  1.2e-6
+#   2D    32^4  2.5e-6      48^4   2.0e-6      64^4   2.2e-6
+#
+# It SATURATES rather than growing with cell count — 1024^2 and 4096^2 agree
+# across a 16x change, as do 32^4 and 64^4 — so the earlier "larger at larger
+# grids" reading was only the 256^2 -> 1024^2 step. 2D sits ~2x above 1D because
+# a 4-axis Strang step does more arithmetic per element. Worst case 2.5e-6, so
+# 1e-5 keeps 4x margin everywhere and did not have to move for 2D.
 TOL_MIN_F32 = 1e-5
 MSG_TOL_F32 = ("tol = %g is below the float32 roundoff floor: the adaptive step "
                "controller compares a full step against two half steps, which "
-               "in single precision agree only to ~7e-7 (measured at 256², and "
-               "larger at larger grids), so it would shrink dt without ever "
-               "converging. Use tol >= 1e-5, or precision float64.")
+               "in single precision agree only to ~1e-6 (measured 9e-7 in 1D and "
+               "2.5e-6 in 2D, flat in the grid size), so it would shrink dt "
+               "without ever converging. Use tol >= 1e-5, or precision float64.")
 
 # Auto-expand needs measurements a float32 run cannot supply. Its 1e-6 edge
 # trigger and its 1e-8 support scan both sit BELOW the spectral noise of a
@@ -347,22 +374,21 @@ MSG_EXPAND_F32 = (
     "precision float64 to auto-expand, or size the domain by hand.")
 
 
-# 2D still ships without float32, auto-expand and mp4 export — milestones M1, M3
-# and M4 in CLAUDE.md, all three wanted and all three out only until the work
-# each names is done. Each is refused explicitly here rather than half-working: a
-# gate that says what it stands in for cannot be mistaken for settled scope, and
-# cannot be relaxed by accident.
+# 2D still ships without auto-expand and mp4 export — milestones M3 and M4 in
+# CLAUDE.md, both wanted and both out only until the work each names is done.
+# Each is refused explicitly here rather than half-working: a gate that says what
+# it stands in for cannot be mistaken for settled scope, and cannot be relaxed by
+# accident.
 #
-# M2 (relativistic variants qr/cr) WAS here and is done as of 2026-07-27 — the
-# mc^2 cancellation inside the 4D kinetic difference and the massless gradient at
-# the lattice origin are both measured and pinned in tests/test_propagator2d.py.
-MSG_F32_2D = (
-    "float32 is not available for 2D runs yet (milestone M1): the mixed-"
-    "precision rules — float64 meshes and exponent construction, single-"
-    "precision stepping — have not been re-verified for the correlated 2D Bopp "
-    "shift, and adjust_step's single-precision residual floor was measured at "
-    "256² only. It is the first 2D follow-up precisely because memory is the "
-    "binding 2D constraint. Use precision float64.")
+# TWO gates that were here are gone, and both left their verification behind
+# rather than being waved through. M2 (relativistic qr/cr, 2026-07-27): the mc^2
+# cancellation inside the 4D kinetic difference and the massless gradient at the
+# lattice origin, measured and pinned in tests/test_propagator2d.py. M1 (float32,
+# 2026-07-27): the mixed-precision rules re-verified BITWISE against the
+# correlated 2D Bopp shift for all four variants, the adjust_step residual floor
+# re-measured at 4D sizes (it saturates at ~2.5e-6, so TOL_MIN_F32 = 1e-5 keeps
+# 4x margin and did not move), and the footprint measured at 112 B/cell against
+# float64's 208 — see tests/test_precision.py and config.BYTES_PER_CELL_2D.
 MSG_EXPAND_2D = (
     "auto-expand is not available for 2D runs yet (milestone M3): in 4D every "
     "axis doubling doubles a multi-GiB working set, so the planner needs a "
@@ -393,24 +419,20 @@ class SessionCreate(BaseModel):
     auto_expand: bool = False
     delay: float = Field(default=0.0, ge=0)  # seconds injected between played-back
                                              # frames; 0 = as fast as the client renders
-    # Spectral working precision. float32 is an explicit PREVIEW mode: ~3.3-3.8x
-    # faster and ~58% of the working set on CUDA, at the cost of the diagnostics
-    # this project navigates by (secular purity/energy drift ~1e-4, uncertainty
-    # noise 150x the relativistic shear). Restart-only — it decides the FFT plan
-    # dtype at worker construction — and never inferred, always chosen.
+    # Spectral working precision. float32 is an explicit PREVIEW mode: 3.3-3.8x
+    # faster in 1D but only 1.5-2.6x in 2D, and ~54-58% of the working set on
+    # CUDA, at the cost of the diagnostics this project navigates by (secular
+    # purity/energy drift ~1e-4, uncertainty noise 150x the relativistic shear).
+    # Restart-only — it decides the FFT plan dtype at worker construction — and
+    # never inferred, always chosen.
     #
     # None = "whatever the host is configured for" (WIGNERF_PRECISION), which
-    # is the SPA's normal state until the user operates the control. It is
-    # resolved in _check, NOT by a default_factory, and that distinction is
-    # load-bearing: at ndim=2 float32 is refused outright (M1), so a factory
-    # would hand _check a float32 the client never sent and 422 EVERY 2D
-    # session on a float32 host — the SPA, curl, and scripts/ws_smoke.py
-    # --ndim 2 alike. A gate must refuse what was ASKED FOR, so the host
-    # default resolves to float64 where float32 is not on offer.
-    #
-    # A hard-coded "float64" here would be worse still: it made the env var
-    # decorative once — `/api/device` advertised float32 while every session
-    # that omitted the field silently ran float64.
+    # is the SPA's normal state until the user operates the control, and it
+    # resolves the same way at every ndim now that M1 has landed. It is resolved
+    # in _check rather than by a default_factory, which a hard-coded "float64"
+    # here cannot be: that made the env var decorative once — `/api/device`
+    # advertised float32 while every session that omitted the field silently ran
+    # float64.
     precision: Optional[Literal["float64", "float32"]] = None
     # Per-session overrides of the host defaults. None = use the host's
     # (WIGNERF_DEVICE / WIGNERF_HISTORY_MB). A session may NARROW the host's
@@ -426,12 +448,12 @@ class SessionCreate(BaseModel):
     @model_validator(mode="after")
     def _check(self):
         # Resolve the host default FIRST, so every check below reads a concrete
-        # value — and resolve it to float64 at ndim=2, where float32 is not a
-        # choice this build offers (M1). Assignment here does not re-enter
-        # validation (validate_assignment is off).
+        # value. One rule at every ndim since M1: the ndim=2 special case existed
+        # only because float32 was refused there, and a gate must refuse what was
+        # ASKED FOR rather than collide with a default the client never sent.
+        # Assignment here does not re-enter validation (validate_assignment off).
         if self.precision is None:
-            self.precision = ("float64" if self.grid.ndim > 1
-                              else config.PRECISION)
+            self.precision = config.PRECISION
         if len(set(self.variants)) != len(self.variants):
             raise ValueError("duplicate variants")
         if self.mode == "batch" and self.t2 is None:
@@ -453,13 +475,8 @@ class SessionCreate(BaseModel):
             raise ValueError("the grid is %dD but %d initial-condition "
                              "component(s) carry %d coordinate(s) each"
                              % (nd, len(bad), bad[0].ndim))
-        if nd > 1:
-            # only reachable for an EXPLICIT float32 — an omitted precision
-            # resolved to float64 above rather than colliding with this gate
-            if self.precision == "float32":
-                raise ValueError(MSG_F32_2D)
-            if self.auto_expand:
-                raise ValueError(MSG_EXPAND_2D)
+        if nd > 1 and self.auto_expand:
+            raise ValueError(MSG_EXPAND_2D)
         return self
 
 

@@ -329,21 +329,23 @@ export function setNdim(c: SimConfig, ndim: Ndim) {
 }
 
 /**
- * The two things a 2D run still cannot do, applied to the config rather than
+ * The one thing a 2D run still cannot do, applied to the config rather than
  * argued with at Restart time — the exact counterpart of
- * applyPrecisionInvariants, and for the same reason: the backend refuses each
- * combination outright (milestones M1 and M3), so reaching one from a stale
- * localStorage entry, an imported 1D setup or a probe-adopted host default
- * would leave Restart failing with a 422 the user never chose.
+ * applyPrecisionInvariants, and for the same reason: the backend refuses the
+ * combination outright (milestone M3), so reaching it from a stale localStorage
+ * entry, an imported 1D setup or a probe-adopted host default would leave
+ * Restart failing with a 422 the user never chose.
  *
- * The relativistic variants were the third (M2) and landed on 2026-07-27, so
- * qr/cr are no longer filtered out here. A stored 2D config that this function
- * once stripped down to ['qn'] keeps whatever it was left with — there is
- * nothing to migrate, because the stripping was destructive at the time.
+ * Two of the three gates this used to enforce are gone. M2 (the relativistic
+ * variants) landed 2026-07-27, so qr/cr are no longer filtered out; M1 (float32)
+ * landed the same day, so `precision` is no longer forced to float64 and 2D now
+ * resolves it exactly as 1D does. A stored 2D config that this function once
+ * stripped down to ['qn'], or pinned to float64, keeps whatever it was left with
+ * — there is nothing to migrate, because both were destructive at the time and
+ * float64 remains a perfectly good choice.
  */
 export function applyNdimInvariants(c: SimConfig) {
   if (c.grid.ndim < 2) return
-  c.precision = 'float64'          // M1
   c.auto_expand = false            // M3
 }
 
@@ -402,23 +404,19 @@ export function markPrecisionChosen() {
  * win when the SPA could not read its default, and a hard-coded float64 sent as
  * though it were a decision is exactly how such a host got silently overridden.
  *
- * There are two exceptions, and both are the same rule: a form asking for a
- * float64-ONLY feature IS asking for float64, so it says so rather than
- * deferring.
+ * There is ONE exception, and it is the rule that a form asking for a
+ * float64-only feature IS asking for float64, so it says so rather than
+ * deferring: auto-expand (MSG_EXPAND_F32 — in single precision a contained
+ * state's own noise passes the edge trigger and the support scan reads the whole
+ * axis). Only reachable when the /device probe failed, since a probe that
+ * succeeded has already cleared auto_expand through applyPrecisionInvariants.
  *
- *  - ndim = 2, which defers float32 entirely (the backend's MSG_F32_2D,
- *    milestone M1). Stating it also keeps the exported setup document honest
- *    about the precision the run had.
- *  - auto-expand (MSG_EXPAND_F32: in single precision a contained state's own
- *    noise passes the edge trigger and the support scan reads the whole axis).
- *    Only reachable when the /device probe failed — a probe that succeeded has
- *    already cleared auto_expand through applyPrecisionInvariants.
- *
- * The 2D branch returns a LITERAL rather than c.precision, so the answer does
- * not depend on whether applyNdimInvariants has run on this config yet.
+ * ndim = 2 used to be a second exception, because float32 was refused there
+ * (M1). It landed 2026-07-27 and 2D now defers exactly as 1D does — which is
+ * the point of the symmetric resolution rule, and what lets a float32 host
+ * give a 2D session float32 without the SPA having to ask for it.
  */
 export function precisionForPayload(c: SimConfig): SimConfig['precision'] | null {
-  if (c.grid.ndim > 1) return 'float64'
   if (precisionWasStored || c.auto_expand) return c.precision
   return null
 }
@@ -462,8 +460,9 @@ export function mergeConfig(target: SimConfig, s: unknown) {
   // imported setup so it is not rejected by the backend's mode literal.
   if ((target as unknown as Record<string, unknown>).mode === 'runahead')
     target.mode = 'batch'
-  // ndim first: it FORCES float64, so running the precision invariants after
-  // it keeps the two from disagreeing about tol
+  // ndim first: both clear auto_expand, and running the precision invariants
+  // last is what guarantees tol is raised to the float32 floor for whatever
+  // precision the merge ended up with
   applyNdimInvariants(target)
   applyPrecisionInvariants(target)
 }
@@ -605,10 +604,14 @@ export function resetToDefaults(c: SimConfig) {
   // "reset to defaults" un-chooses: the form goes back to deferring to the
   // host, which is what the default IS.
   precisionWasStored = false
-  // ...but the host default may be float32, which 2D refuses (M1). Without
-  // this a reset in 2D would leave the form in the one combination the API
-  // rejects, and Restart would 422 on something nobody chose.
+  // Both invariants, at a point where a whole config is constructed. Neither
+  // fires against today's defaults (auto_expand is false and tol is 0.01), and
+  // that is the reason to call them rather than not to: this used to exist
+  // solely to undo a float32 host default in 2D, which M1 made legal, so
+  // dropping the calls with that reason would leave the ONE path that builds a
+  // config from scratch as the one path that never checks it.
   applyNdimInvariants(c)
+  applyPrecisionInvariants(c)
 }
 
 /** The whole default setup for a dimensionality. `ndim` defaults to 1 because

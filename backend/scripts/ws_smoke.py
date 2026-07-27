@@ -3,6 +3,7 @@ Headless smoke test against a LIVE server (no browser needed):
 
     .venv/bin/uvicorn main:app --port 8010 &
     .venv/bin/python scripts/ws_smoke.py [http://127.0.0.1:8010] [--ndim 2]
+    .venv/bin/python scripts/ws_smoke.py --ndim 2 --precision float32
 
 Creates a harmonic session, plays it, and asserts streaming invariants:
 monotone record indices, exact record-time spacing, unit norm after
@@ -12,6 +13,13 @@ dequantizing the SPATIAL plane, flat energy, lockstep bundles, exact seek.
 (relativistic included since milestone M2 landed on 2026-07-27), which is the
 one place the 2D record path is exercised against a real uvicorn rather than a
 TestClient.
+
+--precision is OMITTED from the payload unless given, and that default is the
+point: it is what lets the host's WIGNERF_PRECISION decide, the same thing the
+SPA does, so this script exercises the resolution rule rather than bypassing it.
+Passing float32 with --ndim 2 exercises what milestone M1 opened up (2026-07-27).
+The energy tolerance follows the precision, because single precision cannot hold
+the float64 bound and asserting it anyway would just make the flag unusable.
 """
 
 import argparse
@@ -34,8 +42,11 @@ _ap.add_argument("base", nargs="?", default="http://127.0.0.1:8010",
                  help="server base URL")
 _ap.add_argument("--ndim", type=int, default=1, choices=[1, 2],
                  help="spatial dimensions (2 = 4D phase space)")
+_ap.add_argument("--precision", default=None, choices=["float64", "float32"],
+                 help="spectral working precision; omitted by default so the "
+                      "host's WIGNERF_PRECISION decides, as the SPA does")
 _opts = _ap.parse_args()
-BASE, NDIM = _opts.base, _opts.ndim
+BASE, NDIM, PRECISION = _opts.base, _opts.ndim, _opts.precision
 
 if NDIM == 1:
     CFG = {
@@ -63,7 +74,14 @@ else:
         "record_dt": 0.05,
         "delay": 0.0,
     }
+if PRECISION is not None:
+    CFG["precision"] = PRECISION
 NVAR = len(CFG["variants"])
+# Single precision drifts E by ~1e-3 over a few hundred steps (see the
+# float64/float32 gotcha), which is the mode working as documented rather than a
+# streaming fault — this script checks the RECORD PATH, so it must not fail on
+# the one thing the precision is known to cost.
+E_TOL = 5e-2 if PRECISION == "float32" else 5e-3
 
 
 def _axes():
@@ -123,7 +141,7 @@ async def main():
                     assert abs(norm - 1.0) < 1e-2, "norm drifted: %g" % norm
             E0 = {v.vid: v.E for v in frames[0].variants}
             for v in frames[-1].variants:
-                assert abs(v.E - E0[v.vid]) < 5e-3*max(1.0, abs(E0[v.vid])), \
+                assert abs(v.E - E0[v.vid]) < E_TOL*max(1.0, abs(E0[v.vid])), \
                     "energy drift on vid %d" % v.vid
             print("streamed %d lockstep bundles up to record %d, invariants OK"
                   % (len(frames), recs[-1]))

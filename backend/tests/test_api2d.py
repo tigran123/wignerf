@@ -1,17 +1,18 @@
 """
-2D sessions through the API: the record path end to end, and the three explicit
-refusals that stand in for deferred work (milestones M1, M3 and M4 in CLAUDE.md).
+2D sessions through the API: the record path end to end, and the two explicit
+refusals that stand in for deferred work (milestones M3 and M4 in CLAUDE.md).
 
 The refusal tests are not box-ticking. Each gate replaces a feature that would
-otherwise half-work — a float32 2D run whose mixed-precision rules were never
-re-verified, an auto-expanding 4D grid with no memory guard on the doubling —
-and a gate that silently stopped firing is exactly how a half-feature ships.
-They also pin that the messages NAME the milestone, so whoever hits one learns
-what is missing rather than that "2D is broken".
+otherwise half-work — an auto-expanding 4D grid with no memory guard on the
+doubling, an mp4 export with no panel grid to render into — and a gate that
+silently stopped firing is exactly how a half-feature ships. They also pin that
+the messages NAME the milestone, so whoever hits one learns what is missing
+rather than that "2D is broken".
 
-M2 (relativistic variants) was the fourth and landed on 2026-07-27, so what
-pins it here is the opposite kind of test: qr/cr must be ACCEPTED in 2D and
-stream finite records. See tests/test_propagator2d.py for the physics.
+TWO of the four have landed, and each left the opposite kind of test behind:
+the thing the gate forbade must now be ACCEPTED and stream finite records. M2
+(relativistic qr/cr) and M1 (float32) both on 2026-07-27. See
+tests/test_propagator2d.py and tests/test_precision.py for their physics.
 """
 
 import json
@@ -114,37 +115,66 @@ def test_2d_setup_document_round_trips():
 # the deferred-work gates
 # ---------------------------------------------------------------------------
 
-def test_a_float32_host_default_does_not_block_2d(monkeypatch):
-    """A gate must refuse what was ASKED FOR. float32 is refused in 2D (M1),
-    but WIGNERF_PRECISION is a host DEFAULT, not a request — and the SPA, curl
-    and scripts/ws_smoke.py --ndim 2 all omit the field. Resolving that default
-    through the M1 gate made every 2D session on a float32 host 422 over a value
-    nobody sent (it took this whole test module down with it). An omitted
-    precision therefore resolves to float64 at ndim=2, and only an EXPLICIT
-    float32 hits the gate below."""
+def test_the_host_default_precision_now_applies_at_either_ndim(monkeypatch):
+    """ONE resolution rule at every ndim, which is what M1 bought here.
+
+    While float32 was refused in 2D, an omitted precision had to resolve to
+    float64 there — a gate must refuse what was ASKED FOR, and WIGNERF_PRECISION
+    is a host DEFAULT, not a request. Without that special case every 2D session
+    on a float32 host 422'd over a value nobody sent (the SPA, curl and
+    scripts/ws_smoke.py --ndim 2 all omit the field), and it took this whole test
+    module down with it.
+
+    With the gate gone the special case went too, so this now pins the OPPOSITE:
+    a float32 host gives a 2D session float32, exactly as it gives a 1D one."""
     monkeypatch.setattr(config, "PRECISION", "float32")
+    one_d = {"grid": dict(x1=-6.0, x2=6.0, Nx=64, p1=-7.0, p2=7.0, Np=64),
+             "potential": "x^2/2", "variants": ["qn"], "record_dt": 0.05,
+             "ic": {"type": "mixture", "components": [
+                 {"x0": 0.0, "p0": 0.0, "sigma_x": 0.7, "sigma_p": 0.7}]}}
     with TestClient(app) as client:
-        r = client.post("/api/sessions", json=cfg2())
+        for body in (cfg2(), one_d):
+            r = client.post("/api/sessions", json=body)
+            assert r.status_code == 200, r.text
+            sid = r.json()["session_id"]
+            assert client.get("/api/sessions/%s" % sid).json()["precision"] \
+                == "float32"
+            client.delete("/api/sessions/%s" % sid)
+
+
+def test_float32_2d_sessions_are_accepted_and_stream():
+    """M1's acceptance test, on the pattern M2's retirement left behind: a
+    retired gate is replaced by a test that the thing it forbade now WORKS.
+
+    float32 reaches 2D through no new code — the mixed-precision split is
+    ndim-blind (see the Propagator docstring) — so what needs pinning at THIS
+    level is the wiring: the session runs, reports the precision it was given,
+    and streams finite observables rather than the NaN a wrong dtype pairing
+    produces. The physics is in tests/test_precision.py."""
+    with TestClient(app) as client:
+        r = client.post("/api/sessions", json=cfg2(precision="float32"))
         assert r.status_code == 200, r.text
-        sid = r.json()["session_id"]
+        info = r.json()
+        sid = info["session_id"]
         assert client.get("/api/sessions/%s" % sid).json()["precision"] \
-            == "float64"
-        # ...while a 1D session on the same host still gets what it configured
-        one_d = {"grid": dict(x1=-6.0, x2=6.0, Nx=64, p1=-7.0, p2=7.0, Np=64),
-                 "potential": "x^2/2", "variants": ["qn"], "record_dt": 0.05,
-                 "ic": {"type": "mixture", "components": [
-                     {"x0": 0.0, "p0": 0.0, "sigma_x": 0.7, "sigma_p": 0.7}]}}
-        r1 = client.post("/api/sessions", json=one_d)
-        assert r1.status_code == 200, r1.text
-        sid1 = r1.json()["session_id"]
-        assert client.get("/api/sessions/%s" % sid1).json()["precision"] \
             == "float32"
-        client.delete("/api/sessions/%s" % sid1)
+        with client.websocket_connect(info["ws_url"]) as ws:
+            ws.send_text(json.dumps({"type": "play"}))
+            f = None
+            for _ in range(200):
+                m = ws.receive()
+                if m.get("bytes"):
+                    f = protocol.unpack_frame(m["bytes"])
+                    break
+            assert f is not None, "no frame arrived"
+            assert f.geom.ndim == 2
+            for v in f.variants:
+                assert v.E == v.E and abs(v.E) < 1e3, v.E
+                assert v.purity == v.purity
         client.delete("/api/sessions/%s" % sid)
 
 
 @pytest.mark.parametrize("over,needle", [
-    (dict(precision="float32"), "M1"),
     (dict(auto_expand=True), "M3"),
 ])
 def test_deferred_features_are_refused_with_their_milestone(over, needle):
@@ -283,7 +313,11 @@ def test_the_device_fit_check_is_the_operative_2d_guard(monkeypatch):
                                {"lo": -8.0, "hi": 8.0, "N": 32},
                                {"lo": -7.0, "hi": 7.0, "N": 16},
                                {"lo": -7.0, "hi": 7.0, "N": 16}]}
-    per = 32*32*16*16*config.BYTES_PER_CELL_2D
+    # float64 explicitly: these sessions omit `precision`, so they take the
+    # host default, and the fit check scales with it since M1 (112 B/cell in
+    # float32 against 208). A bare constant here would silently stop matching
+    # the server on a float32 host.
+    per = 32*32*16*16*config.bytes_per_cell(2, "float64")
     with TestClient(app) as client:
         # one worker, a card with room to spare
         free.clear()
@@ -340,7 +374,11 @@ def test_the_fit_refusal_describes_the_POOL_not_the_first_device(monkeypatch):
                                {"lo": -8.0, "hi": 8.0, "N": 32},
                                {"lo": -7.0, "hi": 7.0, "N": 16},
                                {"lo": -7.0, "hi": 7.0, "N": 16}]}
-    per = 32*32*16*16*config.BYTES_PER_CELL_2D
+    # float64 explicitly: these sessions omit `precision`, so they take the
+    # host default, and the fit check scales with it since M1 (112 B/cell in
+    # float32 against 208). A bare constant here would silently stop matching
+    # the server on a float32 host.
+    per = 32*32*16*16*config.bytes_per_cell(2, "float64")
     with TestClient(app) as client:
         # (A) NOTHING can hold one worker. Advice must not send the user after
         # another device or a shorter variant list — neither exists to be had.
@@ -401,6 +439,48 @@ def test_the_preview_refuses_what_the_session_would(monkeypatch):
         ok = client.post("/api/preview/wigner", json=dict(IC2, grid=G2,
                                                           hbar_eff=1.0))
         assert ok.status_code == 200, ok.text
+
+
+def test_the_preview_refusal_quotes_the_FORM_precision(monkeypatch):
+    """The two refusals a user sees at once must quote the SAME footprint.
+
+    Over the cell cap the Setup panel renders its own footprint line in the GRID
+    section and the preview endpoint's 422 lands under the IC plot — the same
+    quantity, side by side. The preview took no precision and so always quoted
+    float64: at 128⁴ in a float32 form that read "~52.0 GiB per variant worker"
+    under the plot against "≈ 28.00 GiB per worker" two columns away, and the
+    bigger number was the wrong one.
+
+    Note what the field does NOT mean: the preview still BUILDS in float64 on its
+    own backend, and PREVIEW_BYTES_PER_CELL stays precision-blind. This is the
+    precision of the session the grid would create, quoted in a message whose own
+    words are "per variant worker"."""
+    monkeypatch.setattr(config, "MAX_CELLS_2D", 16*16*16*16)
+    big = dict(G2)
+    big["axes"] = [{"lo": -6.0, "hi": 6.0, "N": 32}] + list(G2["axes"][1:])
+    cells = 32*16*16*16
+    with TestClient(app) as client:
+        want = {}
+        for p in ("float64", "float32"):
+            r = client.post("/api/preview/wigner",
+                            json=dict(IC2, grid=big, hbar_eff=1.0, precision=p))
+            assert r.status_code == 422, r.text
+            gib = cells*config.bytes_per_cell(2, p)/1024**3
+            assert "%.1f GiB" % gib in r.text, (p, r.text)
+            want[p] = gib
+            # ...and it is the same number the CREATE path would quote, which is
+            # the property that actually matters — one of these lands under the
+            # IC plot and the other in the header, together
+            s = client.post("/api/sessions", json=cfg2(grid=big, precision=p))
+            assert s.status_code == 422
+            assert "%.1f GiB" % gib in s.text, (p, s.text)
+        assert want["float64"] > 1.8*want["float32"], want
+        # an omitted precision resolves to the host default, exactly as
+        # SessionCreate._check resolves it — not to a hard-coded float64
+        monkeypatch.setattr(config, "PRECISION", "float32")
+        r = client.post("/api/preview/wigner",
+                        json=dict(IC2, grid=big, hbar_eff=1.0))
+        assert "%.1f GiB" % want["float32"] in r.text, r.text
 
 
 def test_the_preview_cpu_fallback_is_bounded_by_free_host_memory(monkeypatch):
@@ -476,6 +556,12 @@ def test_the_device_endpoint_carries_the_per_ndim_ceilings(monkeypatch):
         # unbounded at ndim=1: the per-axis cap already bounds a 2D array
         assert d["max_cells"]["1"] is None
         assert d["max_cells"]["2"] == config.MAX_CELLS_2D
+        # per PRECISION since M1, for the same reason the two above are per
+        # ndim: precision is restart-only too, so the form must be able to
+        # estimate for the one it is SHOWING. float32 is the smaller figure and
+        # the panel would over-report by 1.9x without it.
+        assert d["bytes_per_cell_2d"]["float64"] == 208
+        assert d["bytes_per_cell_2d"]["float32"] == 112
         assert d["bytes_per_cell_2d"] == config.BYTES_PER_CELL_2D
         # ...and the probe's cache does not freeze them
         monkeypatch.setattr(config, "MAX_GRID_2D", 64)

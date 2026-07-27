@@ -30,7 +30,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from core import boundary, describe, observables
-from core.grid import Grid, embed_window
+from core.grid import Axis, Grid, embed_window
 from core.initial import GaussianComponent, mixture_wigner
 from core.propagator import Propagator
 from core.protocol import TOL_MIN_F32
@@ -39,15 +39,36 @@ from main import app
 
 SIG = 1.0/sqrt(2.0)
 HARMONIC = dict(U=lambda x: x**2/2., gradU=(lambda x: x,))
+# the 2D counterpart: isotropic, so it is both separable and central
+HARMONIC_2D = dict(U=lambda x, y: (x**2 + y**2)/2.,
+                   gradU=(lambda x, y: x + 0.*y, lambda x, y: y + 0.*x))
 
 
-def _grid(precision, n=64):
-    return Grid.from_1d(-6.0, 6.0, n, -7.0, 7.0, n,
-                ArrayBackend(device="cpu", precision=precision))
+def _harmonic(ndim):
+    """Propagator kwargs at either dimensionality. Not interchangeable — a
+    1-argument U with a 1-tuple gradU is REFUSED at ndim=2 by _check_grad, which
+    is the point of keeping them apart rather than broadcasting one."""
+    return HARMONIC if ndim == 1 else HARMONIC_2D
+
+
+def _grid(precision, n=64, ndim=1):
+    """The 1D default n=64 is unchanged; 2D callers pass their own, because n
+    is PER AXIS and 64^4 is 16.8M cells against 64^2's 4096."""
+    b = ArrayBackend(device="cpu", precision=precision)
+    if ndim == 1:
+        return Grid.from_1d(-6.0, 6.0, n, -7.0, 7.0, n, b)
+    return Grid((Axis(-6.0, 6.0, n), Axis(-6.0, 6.0, n),
+                 Axis(-7.0, 7.0, n), Axis(-7.0, 7.0, n)), b)
 
 
 def _coherent(grid):
-    return grid.shift(mixture_wigner(grid, [GaussianComponent(2.0, 0.0, SIG, SIG)]))
+    """The same physical state at either dimensionality: a coherent packet at
+    q = (2, 0…) with zero momentum, so a 2D run is the 1D one with a spectator
+    second dimension and the two are directly comparable."""
+    nd = grid.ndim
+    c = (GaussianComponent(2.0, 0.0, SIG, SIG) if nd == 1
+         else GaussianComponent((2.0, 0.0), (0.0, 0.0), (SIG, SIG), (SIG, SIG)))
+    return grid.shift(mixture_wigner(grid, [c]))
 
 
 def _evolve(prop, W, dt, nsteps):
@@ -60,9 +81,10 @@ def _evolve(prop, W, dt, nsteps):
 # -- what must NOT change in float32 -------------------------------------
 
 
+@pytest.mark.parametrize("ndim", [1, 2])
 @pytest.mark.parametrize("quantum,relativistic",
                          [(True, False), (True, True), (False, False), (False, True)])
-def test_exponent_construction_stays_double(quantum, relativistic):
+def test_exponent_construction_stays_double(quantum, relativistic, ndim):
     """The rate meshes and H are built in float64 in BOTH modes, and are
     bitwise identical between them.
 
@@ -72,12 +94,20 @@ def test_exponent_construction_stays_double(quantum, relativistic):
     float32 session that let single precision reach _rate_mesh would not be a
     less accurate simulation, it would be a different one. The parametrization
     covers the relativistic variants precisely because they are the ones that
-    cannot survive it."""
+    cannot survive it.
+
+    ndim is the OTHER parametrization, and it is what milestone M1 turned on:
+    the multi-D Bopp shift moves every spatial argument of U together
+    (propagator.qd), so "construction stays double" had to be re-verified at 4
+    axes rather than inherited from 2. It holds bitwise, which is the honest
+    reason float32 could be allowed in 2D at all — nothing in the mixed split is
+    dimension-aware, and this is the assertion that says so."""
     props = {}
     for precision in ("float64", "float32"):
-        g = _grid(precision)
+        g = _grid(precision, n=16 if ndim > 1 else 64, ndim=ndim)
         props[precision] = Propagator(g, quantum=quantum,
-                                      relativistic=relativistic, **HARMONIC)
+                                      relativistic=relativistic,
+                                      **_harmonic(ndim))
     a, b = props["float64"], props["float32"]
     for name in ("dU_im", "dT_im", "U_mesh", "T_mesh"):
         assert getattr(b, name).dtype == np.float64, name
@@ -93,6 +123,40 @@ def test_observables_stay_float64():
     obs = observables.compute(_coherent(g), prop)
     assert obs.rho.dtype == np.float64 and obs.phi.dtype == np.float64
     assert isinstance(obs.norm, float) and isinstance(obs.purity, float)
+
+
+def test_the_2d_reduction_path_does_not_leak_float32():
+    """The same claim at 4 axes, where there is far more of it to get wrong: six
+    plane reductions and four marginals rather than one plane and two.
+
+    Run FIRST among the 2D cases when something looks wrong, because it does no
+    time stepping at all — it reduces a freshly built IC, so a failure here is a
+    dtype leak in the reduction path and nothing else. That separation matters:
+    every other float32 measurement in this file mixes the reduction path with
+    accumulated stepping error and could not tell you which one moved.
+
+    The values must also match float64 to full double tolerance, which they can:
+    initial.py builds in float64 at either precision and only worker.py casts the
+    state, so at record 0 the two modes are reducing arrays that differ by
+    nothing at all."""
+    got = {}
+    for precision in ("float64", "float32"):
+        g = _grid(precision, n=16, ndim=2)
+        prop = Propagator(g, quantum=True, **HARMONIC_2D)
+        W = _coherent(g)
+        planes = observables.reduce_planes(W, g)
+        obs = observables.compute(W, prop, planes)
+        for p in planes.values():
+            assert p.dtype == np.float64, precision
+        for m in obs.marg:
+            assert m.dtype == np.float64, precision
+        assert len(planes) == 6 and len(obs.marg) == 4
+        got[precision] = obs
+    a, b = got["float64"], got["float32"]
+    assert b.norm == pytest.approx(a.norm, abs=1e-12)
+    assert b.purity == pytest.approx(a.purity, abs=1e-12)
+    assert b.E == pytest.approx(a.E, abs=1e-12)
+    assert b.lz == pytest.approx(a.lz, abs=1e-12)
 
 
 def test_regrid_keeps_the_working_dtype():
@@ -132,6 +196,54 @@ def test_float32_really_is_single_precision():
         assert prop._ifft_mo(probe).dtype == np.complex64
 
 
+def test_float32_really_is_single_precision_in_2d():
+    """The same end-to-end dtype claim at 4 axes, and it is NOT redundant: the
+    2D path takes fft_pair's MULTI-AXIS branch (pyfftw.builders.fftn planned on
+    aligned buffers) where 1D takes the one-dimensional entry points, so the plan
+    whose dtype could be wrong is a different object built by different code.
+
+    The failure it guards against is silent in every result: a complex64 array
+    handed to a complex128 plan is copied up by auto_align_input and comes back
+    correct, at double speed and double memory — i.e. float32 would appear to
+    work while buying nothing, which at 4D is the entire reason to choose it."""
+    g = _grid("float32", n=16, ndim=2)
+    prop = Propagator(g, quantum=True, **HARMONIC_2D)
+    expU, expT = prop.exponents(0.01)
+    assert expU.dtype == np.complex64 and expT.dtype == np.complex64
+    assert expU.shape == (16, 16, 16, 16)
+    W = prop.solve_spectral(_coherent(g), expU, expT)
+    assert W.dtype == np.float32
+    if g.backend.fft_provider == "pyfftw":
+        probe = np.zeros((16,)*4, dtype=np.complex64)
+        assert prop._fft_sp(probe).dtype == np.complex64
+        assert prop._ifft_mo(probe).dtype == np.complex64
+
+
+def test_the_massless_2d_gradient_is_unchanged_by_float32():
+    """The float64-mesh half of the mixed split, checked where it is checkable
+    BITWISE rather than to a tolerance.
+
+    T = c|k| at m = 0 has a 0/0 gradient at the lattice origin and is defined as
+    0 there (see propagator._kinetic). That value comes off the grid meshes,
+    which stay float64 in both modes — so the whole gradient must be byte-for-byte
+    identical between them, at 4 axes as at 2. A tolerance-based version of this
+    could not distinguish "built in double" from "built in single and close"."""
+    for ndim in (1, 2):
+        out = {}
+        for precision in ("float64", "float32"):
+            g = _grid(precision, n=16, ndim=ndim)
+            p = Propagator(g, quantum=False, relativistic=True, mass=0.0,
+                           **_harmonic(ndim))
+            _, grads = p._kinetic()
+            ks = [g.v[ndim + i] for i in range(ndim)]
+            mesh = [k.reshape((1,)*i + (-1,) + (1,)*(ndim - 1 - i))
+                    for i, k in enumerate(ks)]
+            out[precision] = [np.asarray(grads[i](*mesh)) for i in range(ndim)]
+        for i, (a, b) in enumerate(zip(out["float64"], out["float32"])):
+            assert a.dtype == np.float64 and b.dtype == np.float64
+            assert np.array_equal(a, b), "ndim=%d axis %d" % (ndim, i)
+
+
 def test_float64_is_the_default():
     b = ArrayBackend(device="cpu")
     assert b.precision == "float64" and b.complex_dtype is np.complex128
@@ -157,13 +269,22 @@ def test_host_precision_is_the_schema_default(monkeypatch):
     assert SessionCreate(**_cfg(precision="float64")).precision == "float64"
 
 
-def test_the_host_default_never_resolves_to_a_precision_2d_refuses(monkeypatch):
-    """The resolution rule, in the one place it is written down. float32 is
-    refused at ndim=2 (M1), so the host default cannot be applied there — a
-    default is not a request, and resolving one straight into a gate refused
-    every 2D session on a float32 host over a value the client never sent."""
+def test_the_resolution_rule_is_the_same_at_every_ndim(monkeypatch):
+    """The resolution rule, in the one place it is written down.
+
+    It USED to read "float64 at ndim=2, the host default at ndim=1", because
+    float32 was refused there (M1) and a default is not a request: resolving one
+    straight into a gate refused every 2D session on a float32 host over a value
+    the client never sent. M1 landed on 2026-07-27 and took the special case with
+    it, so there is now one rule — and a 2D session on a float32 host gets
+    float32, which is the whole point, since 2D is where single precision's
+    memory saving actually matters (112 B/cell against 208).
+
+    The auto-expand gate is still here and still float64-only, and it is checked
+    alongside deliberately: it is the remaining reason the two can disagree, and
+    THAT one refuses rather than resolves, because it is asked for explicitly."""
     import config
-    from core.protocol import SessionCreate, MSG_F32_2D
+    from core.protocol import SessionCreate, MSG_EXPAND_2D
     monkeypatch.setattr(config, "PRECISION", "float32")
     g2 = {"ndim": 2, "axes": [{"lo": -6.0, "hi": 6.0, "N": 16}]*2
                              + [{"lo": -7.0, "hi": 7.0, "N": 16}]*2}
@@ -171,11 +292,15 @@ def test_the_host_default_never_resolves_to_a_precision_2d_refuses(monkeypatch):
         {"q0": [1.0, 0.0], "k0": [0.0, 0.0],
          "sigma_q": [0.7, 0.7], "sigma_k": [0.7, 0.7]}]}
     two_d = _cfg(grid=g2, ic=ic2, potential="(x^2+y^2)/2")
-    assert SessionCreate(**two_d).precision == "float64"
-    # ...and an EXPLICIT float32 there is still refused, by name
+    assert SessionCreate(**two_d).precision == "float32"
+    assert SessionCreate(**_cfg()).precision == "float32"
+    # an explicit choice still wins over the host's, at either ndim
+    assert SessionCreate(**dict(two_d, precision="float64")).precision \
+        == "float64"
+    # ...and 2D still refuses auto-expand, by name (M3)
     with pytest.raises(ValidationError) as e:
-        SessionCreate(**dict(two_d, precision="float32"))
-    assert MSG_F32_2D[:40] in str(e.value)
+        SessionCreate(**dict(two_d, precision="float64", auto_expand=True))
+    assert MSG_EXPAND_2D[:40] in str(e.value)
 
 
 def test_bad_host_precision_falls_back_to_float64(monkeypatch):
@@ -236,7 +361,11 @@ def test_float32_drift_is_bounded_and_worse_than_float64():
 
 
 def _centered(g):
-    return g.shift(mixture_wigner(g, [GaussianComponent(0.0, 0.0, SIG, SIG)]))
+    """A packet at the ORIGIN, so every axis's band mass is numerical by
+    construction and any reading above the floor is the detector's own noise."""
+    c = (GaussianComponent(0.0, 0.0, SIG, SIG) if g.ndim == 1
+         else GaussianComponent((0.0, 0.0), (0.0, 0.0), (SIG, SIG), (SIG, SIG)))
+    return g.shift(mixture_wigner(g, [c]))
 
 
 def test_float32_noise_reaches_the_float64_edge_trigger():
@@ -264,6 +393,110 @@ def test_float32_noise_reaches_the_float64_edge_trigger():
     # stops being true, the raised threshold and the auto_expand refusal can
     # both be revisited — until then they are load-bearing.
     assert masses["float32"] > boundary.EDGE_THRESHOLD
+
+
+def test_float32_in_2d_moves_real_mass_to_the_edge_band():
+    """What M1 could NOT make go away, pinned so it cannot be forgotten.
+
+    In 2D single precision genuinely migrates mass outward, and at a coarse grid
+    it is enough to raise the boundary warning on a state that is nowhere near an
+    edge. Measured 2026-07-27 on the shipping 2D default over 12000 steps: 1.0e-3
+    of the integral in the band at 32^4 against 3.1e-5 for the IDENTICAL state in
+    float64, latching the warning within ~7 s of wall clock, with purity down 2%.
+    48^4 stays clear and 64^4 flickers, so it is the coarse grid that cannot
+    carry single precision, not 2D as such.
+
+    The mass is REAL — float64 measures the truth and float32 has 30x more of it
+    — so the reading is not a detector artifact and no threshold was moved for
+    it: a band mass that grows with step count outruns any fixed value, and one
+    high enough to be safe would be past the point where real wrap does damage.
+    What changed instead was the WORDS: SimulatorView.boundaryTitle names single
+    precision as a cause in a float32 2D session, because the standing advice
+    ("restart with a larger domain") is the one remedy that cannot help here.
+
+    This asserts the ORDERING, not an absolute — the absolute grows with the run
+    length and would make a brittle test — plus the fact that float64 at the same
+    size stays clean, which is what identifies the precision as the cause."""
+    mass = {}
+    for precision in ("float64", "float32"):
+        g = _grid(precision, n=32, ndim=2)
+        prop = Propagator(g, quantum=True, **HARMONIC_2D)
+        obs = observables.compute(_evolve(prop, _centered(g), 0.01, 300), prop)
+        es = boundary.edge_report(obs.marg, g.d, precision, labels=g.labels)
+        # EdgeState's x_mass/p_mass are 1D-only spellings and RAISE at 4 axes
+        mass[precision] = max(es.mass)
+        with pytest.raises(AttributeError):
+            es.x_mass
+    assert mass["float32"] > 10*mass["float64"], mass
+    # ...and float64 at this grid is orders under its own trigger, so the
+    # difference is the precision and not the coarseness of the lattice
+    assert mass["float64"] < boundary.EDGE_THRESHOLD
+
+
+def test_float32_drift_in_2d_is_bounded_and_worse_than_float64():
+    """The 4D counterpart, and the honest cost of M1.
+
+    Same shape as the 1D test above, same anti-tautology lower bound. 32^4 and
+    50 steps rather than 16^4: at 16^4 the GRID's own error swamps the
+    precision's — measured 1.076e-3 purity drift in float64 against float32's
+    1.114e-3, a ratio of 1.04, so the test would pass with float32 switched off.
+    At 32^4 the ratio is 5.4e6.
+
+    Measured on CPU, 2026-07-27, 32^4 over 50 steps at dt = 0.01:
+        float32   norm 8.4e-8   purity 1.76e-5
+        float64   norm 4.4e-16  purity 3.3e-12
+    So single precision costs ~2x the purity per step that it costs in 1D
+    (8.4e-5 there over 200 steps at 64^2), which is what a 4-axis Strang step
+    doing more arithmetic per element looks like."""
+    drift = {}
+    for precision in ("float64", "float32"):
+        g = _grid(precision, n=32, ndim=2)
+        prop = Propagator(g, quantum=True, **HARMONIC_2D)
+        W0 = _coherent(g)
+        o0 = observables.compute(W0, prop)
+        o1 = observables.compute(_evolve(prop, W0, 0.01, 50), prop)
+        drift[precision] = (abs(o1.norm - o0.norm), abs(o1.purity - o0.purity))
+    assert drift["float32"][0] < 1e-6, "norm drift"
+    assert drift["float32"][1] < 1e-3, "purity drift"
+    assert drift["float64"][0] < 1e-12 and drift["float64"][1] < 1e-10
+    assert drift["float32"][1] > 100*drift["float64"][1]
+
+
+@pytest.mark.parametrize("ndim,n", [(1, 256), (2, 32), (2, 48)])
+def test_the_adjust_step_residual_floor_stays_under_the_tol_minimum(ndim, n):
+    """TOL_MIN_F32 must sit above the floor of the quantity it bounds, at every
+    grid the solver offers — this is the measurement M1 had to take before
+    float32 could be allowed at 4 axes, and the reason the constant did NOT move.
+
+    adjust_step shrinks dt until one full step and two half steps agree to a
+    relative tol. In single precision that comparison has a roundoff floor, and
+    below it the controller burns all 15 shrink attempts every 20 steps and never
+    converges — a run that grinds to a halt and reads as a solver bug. The floor
+    was measured at 256^2 only, and MSG_TOL_F32 said it grew with grid size, so
+    4D (16.8M cells at 64^4, 256x a 256^2 run) was the open question.
+
+    It SATURATES rather than growing (RTX 3090, 2026-07-27, dt down to 0.0025):
+        1D  256^2 9.2e-7   1024^2 1.2e-6   4096^2 1.2e-6
+        2D   32^4 2.5e-6    48^4  2.0e-6    64^4  2.2e-6
+    Worst case 2.5e-6 against TOL_MIN_F32 = 1e-5, i.e. 4x margin everywhere.
+    This test takes the same reading at the sizes it can afford on CPU; the
+    assertion is the MARGIN, because that is the property the constant needs."""
+    g = _grid("float32", n=n, ndim=ndim)
+    prop = Propagator(g, quantum=True, **_harmonic(ndim))
+    W = _evolve(prop, _coherent(g), 0.01, 20)      # a settled state, not the IC
+    # dt small enough that splitting error is far below the roundoff floor, so
+    # what is left IS the floor (float64 is at ~5e-9 here and still falling)
+    dt = 0.0025
+    eU, eT = prop.exponents(dt)
+    eUn, eTn = prop.exponents(0.5*dt)
+    W1 = prop.solve_spectral(W, eU, eT)
+    W2 = prop.solve_spectral(prop.solve_spectral(W, eUn, eTn), eUn, eTn)
+    rel = float(np.sum(np.abs(W1 - W2), dtype=np.float64)
+                / np.sum(np.abs(W1), dtype=np.float64))
+    assert rel < TOL_MIN_F32/2.0, (
+        "the float32 step-controller floor is %.3g at %s, too close to "
+        "TOL_MIN_F32 = %g — the controller would stop converging" % (
+            rel, "%d^%d" % (n, 2*ndim), TOL_MIN_F32))
 
 
 def test_float32_refuses_auto_expand():
