@@ -114,6 +114,36 @@ def devices_allowed(pool_spec):
     return pool if "cpu" in pool else pool + ["cpu"]
 
 
+def device_free_bytes(spec):
+    """Memory currently available on a device spec, or None when it cannot be
+    determined (no cupy, an unreadable /proc, a vanished card).
+
+    Asking the system rather than tracking our own sessions is deliberate, and
+    it is the same question routers/preview.py's _pick_device asks: whatever
+    else is on the card — another session, another process entirely — is
+    already reflected in the answer. On the CPU that means MemAvailable, the
+    kernel's own estimate of what can be allocated without swapping, not
+    MemFree.
+    """
+    if spec == "cpu":
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1])*1024
+        except OSError:
+            pass
+        return None
+    try:
+        cupy = _import_cupy()
+        if cupy is None:
+            return None
+        with cupy.cuda.Device(int(spec.split(":")[1]) if ":" in spec else 0) as d:
+            return int(d.mem_info[0])
+    except Exception:
+        return None
+
+
 PRECISIONS = ("float64", "float32")
 
 
@@ -202,11 +232,18 @@ class ArrayBackend:
 
     # -- FFT plan factory --------------------------------------------------
 
-    def fft_pair(self, shape, axis, dtype=None):
+    def fft_pair(self, shape, axes, dtype=None):
         """Return (fft, ifft) callables for complex arrays of the given shape
-        along the given axis, in this backend's complex_dtype unless `dtype`
-        overrides it. pyFFTW plans/buffers are owned by this backend instance
-        and must not be called from two threads at once.
+        along the given axes (a tuple), in this backend's complex_dtype unless
+        `dtype` overrides it. pyFFTW plans/buffers are owned by this backend
+        instance and must not be called from two threads at once.
+
+        A SINGLE axis takes the one-dimensional entry points, not the n-D ones
+        with a length-1 `axes`. That is not tidiness: no provider promises
+        fftn(a, axes=(0,)) is bit-identical to fft(a, axis=0), and the 1D
+        physics suite's 1e-12 bounds should not have to absorb the difference.
+        ndim=1 sessions therefore transform through exactly the code they
+        always did.
 
         The dtype is NOT cosmetic. A pyFFTW builder is planned for one dtype:
         hand a complex64 array to a complex128 plan and auto_align_input
@@ -217,25 +254,39 @@ class ArrayBackend:
         numpy.fft all return complex64 for complex64 (verified against the
         pinned numpy 2.5.1), so they ignore the argument by construction."""
         dtype = numpy.dtype(dtype or self.complex_dtype)
+        axes = tuple(axes)
+        one = len(axes) == 1
+        axis = axes[0] if one else None
         if self.fft_provider == "cupy":
             xp = self.xp
-            return (lambda a: xp.fft.fft(a, axis=axis),
-                    lambda a: xp.fft.ifft(a, axis=axis))
+            if one:
+                return (lambda a: xp.fft.fft(a, axis=axis),
+                        lambda a: xp.fft.ifft(a, axis=axis))
+            return (lambda a: xp.fft.fftn(a, axes=axes),
+                    lambda a: xp.fft.ifftn(a, axes=axes))
         if self.fft_provider == "pyfftw":
             import pyfftw
-            kw = dict(axis=axis, threads=self.fft_threads,
+            kw = dict(threads=self.fft_threads,
                       planner_effort="FFTW_ESTIMATE",
                       overwrite_input=False, auto_align_input=True,
                       auto_contiguous=True, avoid_copy=False)
             a = pyfftw.empty_aligned(shape, dtype=dtype)
-            fwd = pyfftw.builders.fft(a, **kw)
             b = pyfftw.empty_aligned(shape, dtype=dtype)
-            bwd = pyfftw.builders.ifft(b, **kw)
-            return fwd, bwd
+            if one:
+                return (pyfftw.builders.fft(a, axis=axis, **kw),
+                        pyfftw.builders.ifft(b, axis=axis, **kw))
+            return (pyfftw.builders.fftn(a, axes=axes, **kw),
+                    pyfftw.builders.ifftn(b, axes=axes, **kw))
         if self.fft_provider == "scipy":
             import scipy.fft as sfft
             workers = self.fft_threads
-            return (lambda a: sfft.fft(a, axis=axis, workers=workers),
-                    lambda a: sfft.ifft(a, axis=axis, workers=workers))
-        return (lambda a: numpy.fft.fft(a, axis=axis),
-                lambda a: numpy.fft.ifft(a, axis=axis))
+            if one:
+                return (lambda a: sfft.fft(a, axis=axis, workers=workers),
+                        lambda a: sfft.ifft(a, axis=axis, workers=workers))
+            return (lambda a: sfft.fftn(a, axes=axes, workers=workers),
+                    lambda a: sfft.ifftn(a, axes=axes, workers=workers))
+        if one:
+            return (lambda a: numpy.fft.fft(a, axis=axis),
+                    lambda a: numpy.fft.ifft(a, axis=axis))
+        return (lambda a: numpy.fft.fftn(a, axes=axes),
+                lambda a: numpy.fft.ifftn(a, axes=axes))

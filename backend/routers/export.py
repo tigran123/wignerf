@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 import config
 from core import session as sessions
 from core import videoexport
-from core.protocol import ExportSpec
+from core.protocol import MSG_EXPORT_2D, ExportSpec
 
 router = APIRouter()
 
@@ -25,6 +25,10 @@ def create_export(sid: str, spec: ExportSpec):
     s = sessions.get_session(sid)
     if s is None:
         raise HTTPException(404, "no such session")
+    # checked before ffmpeg, so a 2D user learns what is deferred rather than
+    # that their server lacks a codec
+    if s.ndim > 1:
+        raise HTTPException(422, MSG_EXPORT_2D)
     if videoexport.ffmpeg_path() is None:
         raise HTTPException(503, "ffmpeg is not installed on the server")
     if s.clock.running:

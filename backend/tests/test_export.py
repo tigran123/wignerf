@@ -95,11 +95,13 @@ def test_param_block_describes_the_first_exported_record():
 def _vframe(seed, Nx=32, Np=32):
     rng = np.random.default_rng(seed)
     wq = (rng.random((Nx, Np))*65535).astype(np.uint16)
+    # a 1D record: exactly one plane, and that plane IS W
+    plane = protocol.PlaneFrame(a=0, b=1, mode=0, wq=wq, wmin=-0.1, wmax=0.3)
     return protocol.VariantFrame(
-        vid=protocol.variant_id(True, False), wq=wq, wmin=-0.1, wmax=0.3,
-        E=1.0 + seed, x_mean=0.1, x_std=0.7, p_mean=0.0, p_std=0.7,
-        purity=1.0, dt=1e-3,
-        rho=rng.random(Nx).astype("f4"), phi=rng.random(Np).astype("f4"))
+        vid=protocol.variant_id(True, False), dt=1e-3, E=1.0 + seed,
+        purity=1.0, lz=0.0, mean=(0.1, 0.0), std=(0.7, 0.7),
+        planes=(plane,),
+        marg=(rng.random(Nx).astype("f4"), rng.random(Np).astype("f4")))
 
 
 def _stats(n=3):
@@ -123,7 +125,7 @@ def test_video_labels_match_the_ui():
     assert "ℏ = 1" in text and "ℏ_eff" not in text
     assert "mode = batch" in text
 
-    geom = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
+    geom = protocol.RecordGeom.from_1d(32, 32, -6.0, 6.0, -7.0, 7.0)
     stats = _stats()
     fig = FrameFigure(["qn"], stats, meta_columns(cfg, geom, stats, ["qn"],
                                                   0, 2, 3, 30),
@@ -160,7 +162,7 @@ def test_show_grid_covers_charts_and_w_panels():
     image, so the panels need their own lines on top (they had none)."""
     cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
                                  variants=["qn"])
-    geom = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
+    geom = protocol.RecordGeom.from_1d(32, 32, -6.0, 6.0, -7.0, 7.0)
     stats = _stats()
     meta = meta_columns(cfg, geom, stats, ["qn"], 0, 2, 3, 30)
     out = {}
@@ -199,7 +201,7 @@ def test_theme_repaints_the_frame_but_not_the_heatmap():
 
     cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
                                  variants=["qn"])
-    geom = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
+    geom = protocol.RecordGeom.from_1d(32, 32, -6.0, 6.0, -7.0, 7.0)
     stats = _stats()
     meta = meta_columns(cfg, geom, stats, ["qn"], 0, 2, 3, 30)
     seen = {}
@@ -259,8 +261,8 @@ def test_axes_follow_the_record_geometry():
     Only the VALUE scales (colour, marginal amplitude) are export-wide."""
     cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
                                  variants=["qn"])
-    small = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
-    big = protocol.RecordGeom(64, 64, -12.0, 12.0, -14.0, 14.0)
+    small = protocol.RecordGeom.from_1d(32, 32, -6.0, 6.0, -7.0, 7.0)
+    big = protocol.RecordGeom.from_1d(64, 64, -12.0, 12.0, -14.0, 14.0)
     stats = _stats(2)
     stats.x1, stats.x2, stats.p1, stats.p2 = -12.0, 12.0, -14.0, 14.0  # union
     fig = FrameFigure(["qn"], stats,
@@ -294,7 +296,7 @@ def test_axes_follow_the_record_geometry():
 def test_frame_figure_renders_distinct_frames():
     cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
                                  variants=["qn"])
-    geom = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
+    geom = protocol.RecordGeom.from_1d(32, 32, -6.0, 6.0, -7.0, 7.0)
     stats = _stats()
     meta = meta_columns(cfg, geom, stats, ["qn"], 0, 2, 3, 30)
     fig = FrameFigure(["qn"], stats, meta, width=640, height=360)
@@ -306,7 +308,7 @@ def test_frame_figure_renders_distinct_frames():
         assert len(a) == 640*360*4 and len(b) == len(a)
         assert a != b, "the frame did not change between records"
         # a regrid mid-video must be accepted (per-record geometry)
-        big = protocol.RecordGeom(64, 32, -12.0, 12.0, -7.0, 7.0)
+        big = protocol.RecordGeom.from_1d(64, 32, -12.0, 12.0, -7.0, 7.0)
         c = bytes(fig.update(2, 0.1, big, [_vframe(3, Nx=64)], 0, 2))
         assert len(c) == len(a)
     finally:
@@ -537,7 +539,7 @@ def test_layout_is_resolution_independent():
     the dpi carries the resolution."""
     cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
                                  variants=["qn"])
-    geom = protocol.RecordGeom(32, 32, -6.0, 6.0, -7.0, 7.0)
+    geom = protocol.RecordGeom.from_1d(32, 32, -6.0, 6.0, -7.0, 7.0)
     stats = _stats()
     meta = meta_columns(cfg, geom, stats, ["qn"], 0, 2, 3, 30)
     sizes = {}
@@ -563,7 +565,7 @@ def test_metadata_block_never_runs_off_the_figure():
     cfg = protocol.SessionCreate(grid=GRID, potential="x^2/2", ic=IC,
                                  variants=["qn"])
     stats = _stats()
-    meta = meta_columns(cfg, protocol.RecordGeom(32, 32, -6., 6., -7., 7.),
+    meta = meta_columns(cfg, protocol.RecordGeom.from_1d(32, 32, -6., 6., -7., 7.),
                         stats, ["qn"], 0, 2, 3, 30)
     fig = FrameFigure(["qn"], stats, meta)
     try:

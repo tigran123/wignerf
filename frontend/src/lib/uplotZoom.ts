@@ -192,3 +192,15 @@ export function createUplotZoom(opts: {
     get zoomed() { return zx != null || zy != null },
   }
 }
+
+
+/**
+ * Give a chart an HTML title. uPlot assigns `titleEl.textContent = opts.title`,
+ * so markup has to be written after construction — which is the only way to get
+ * a real subscript into "φ(p<sub>y</sub>) = ∫W dx dy dp<sub>x</sub>". Called
+ * right after makeChart(), and again on every rebuild, since the element is new.
+ */
+export function setPlotTitleHtml(chart: { root: HTMLElement }, html: string) {
+  const el = chart.root.querySelector('.u-title')
+  if (el) el.innerHTML = html
+}

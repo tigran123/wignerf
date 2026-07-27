@@ -30,7 +30,7 @@ def test_potential_preview_valid():
     d = r.json()
     assert d["ok"] and d["validity"]["quantum"] and d["validity"]["classical"]
     assert len(d["samples"]["x"]) == 400
-    assert d["extended_range"][0] < -6
+    assert d["extended_range"][0][0] < -6
 
 
 def test_potential_preview_heaviside():
@@ -38,6 +38,36 @@ def test_potential_preview_heaviside():
                     json={"expr": "Heaviside(x)", "x1": -6, "x2": 6, "grid": GRID})
     d = r.json()
     assert d["ok"] and d["validity"]["quantum"] and not d["validity"]["classical"]
+
+
+def test_the_validity_probe_follows_the_GRID_not_the_zoom():
+    """Two different questions live in this request and must not be conflated.
+
+    x1/x2 is the editor's PLOT window — it zooms, and zooming out past the
+    domain is how the interesting part of U is found. The validity boxes are
+    the SIMULATION grid, because that is what routers.sessions.compile_for will
+    probe at create time. Tie the classical gradient probe to the zoom instead
+    and the panel's verdict stops predicting the API's: zoom past a pole and the
+    badge reads ✓, the Solve gate opens, and POST /sessions 422s on a potential
+    the editor had just approved.
+    """
+    # 1/x is singular at 0, which is INSIDE the grid but outside the plot window
+    r = client.post("/api/preview/potential",
+                    json={"expr": "1/x", "x1": 1, "x2": 6, "grid": GRID})
+    d = r.json()
+    assert d["ok"] and not d["validity"]["classical"], d
+    # ...while the samples still follow the zoom, which is what they are for
+    assert d["samples"]["x"][0] == pytest.approx(1.0)
+
+    # and the converse: a pole far OUTSIDE the domain must not block Solve,
+    # however far out the plot is zoomed. 30 is clear of the extended Bopp
+    # range at this grid too, so this isolates the range plumbing.
+    r = client.post("/api/preview/potential",
+                    json={"expr": "1/(x - 30)", "x1": -50, "x2": 50,
+                          "grid": GRID})
+    d = r.json()
+    assert d["ok"] and d["validity"]["classical"] and d["validity"]["quantum"], d
+    assert d["samples"]["x"][0] == pytest.approx(-50.0)
 
 
 def test_potential_preview_rejected():
@@ -112,7 +142,7 @@ def test_preview_falls_back_to_cpu_when_the_device_path_fails():
     the same path without needing CUDA."""
     import routers.preview as pv
     saved = pv._pick_device
-    pv._pick_device = lambda cells: "cuda:99"
+    pv._pick_device = lambda cells, ndim=1: "cuda:99"
     try:
         r = client.post("/api/preview/wigner", json=CAT2)
         assert r.status_code == 200
@@ -121,13 +151,19 @@ def test_preview_falls_back_to_cpu_when_the_device_path_fails():
         pv._pick_device = saved
 
 
-def test_preview_bad_ic_is_422_not_a_cpu_retry():
-    """A malformed IC is not a device problem: it must 422 from the GPU path
-    rather than fall through and be rebuilt on the CPU just to fail again."""
+def test_preview_bad_ic_is_422_before_anything_is_built():
+    """A malformed IC is not a device problem: it must 422 without being built
+    at all, let alone built twice.
+
+    It used to be decided INSIDE the build, which is why the GPU branch had to
+    translate every ValueError into a 422 — cupy's included, so a transient
+    device failure was reported as "your IC is wrong" and skipped the CPU
+    fallback that exists for it. `initial.components_of` answers the question up
+    front for a handful of tuples and no arrays."""
     import routers.preview as pv
     calls = []
     saved_build, saved_pick = pv._build_frame, pv._pick_device
-    pv._pick_device = lambda cells: "cpu"       # _backend("cpu") always works
+    pv._pick_device = lambda cells, ndim=1: "cpu"       # _backend("cpu") always works
 
     def counting(b, req):
         calls.append(b)
@@ -139,7 +175,8 @@ def test_preview_bad_ic_is_422_not_a_cpu_retry():
             "type": "mixture", "grid": GRID,
             "components": [{"x0": 0.0, "p0": 0.0, "sigma_x": 0.5}]})
         assert r.status_code == 422
-        assert len(calls) == 1, "the IC error was retried on the CPU"
+        assert "sigma_k" in r.text, r.text
+        assert calls == [], "a bad IC reached a backend"
     finally:
         pv._build_frame, pv._pick_device = saved_build, saved_pick
 
@@ -228,7 +265,7 @@ def test_preview_gpu_and_cpu_agree():
     _cupy, pv, _spec = _gpu_preview_spec()
     gpu = client.post("/api/preview/wigner", json=CAT2)
     saved = pv._pick_device
-    pv._pick_device = lambda cells: None
+    pv._pick_device = lambda cells, ndim=1: None
     try:
         cpu = client.post("/api/preview/wigner", json=CAT2)
     finally:

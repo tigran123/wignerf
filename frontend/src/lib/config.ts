@@ -1,22 +1,47 @@
 /** Session configuration shared by the setup panels and the view. */
 
 import { C_AU } from './units'
-import type { VariantKey } from './variants'
+import { labels as axisLabels, nAxes } from './axes'
+import { ALL_VARIANTS, type VariantKey } from './variants'
 
+export type Ndim = 1 | 2
+
+export interface AxisCfg {
+  lo: number
+  hi: number
+  N: number
+}
+
+/**
+ * The FORM's grid: 2*ndim axes in core/axes.py order (all spatial, then all
+ * momentum). The legacy flat {x1, x2, Nx, p1, p2, Np} spelling is still
+ * accepted on the way IN (see normalizeGrid) so every stored browser config,
+ * exported setup document and mp4 comment tag from before 2D keeps loading —
+ * the backend's GridSpec makes the same bargain.
+ */
 export interface GridCfg {
-  x1: number
-  x2: number
-  Nx: number
-  p1: number
-  p2: number
-  Np: number
+  ndim: Ndim
+  axes: AxisCfg[]
+}
+
+/**
+ * A LIVE geometry, as `status` and every decoded frame report it. Distinct from
+ * GridCfg because it is a fact about what is running, per record, not a form
+ * value: auto-expand moves it and the panels follow the PAINTED frame.
+ */
+export interface GeomCfg {
+  ndim: number
+  lo: number[]
+  hi: number[]
+  N: number[]
 }
 
 export interface ICComponentCfg {
-  x0: number
-  p0: number
-  sigma_x: number
-  sigma_p: number | null
+  q0: number[]
+  k0: number[]
+  sigma_q: number[]
+  /** null for cat states, where it is derived per dimension as hbar/(2 sigma_q) */
+  sigma_k: number[] | null
   weight: number
   phase: number
 }
@@ -75,7 +100,260 @@ export type LiveRun = Pick<SimConfig, 'mode' | 'record_dt' | 'precision'>
   // nothing would say so.
 
 const STORAGE_KEY = 'wignerf.cfg'
-const ALL_KEYS = ['qn', 'qr', 'cn', 'cr'] as const
+const ALL_KEYS = ALL_VARIANTS
+
+/** Default axes per dimensionality. 2D starts at 64^4 = 16.8M cells, which
+ *  measures 3.25 GiB per variant worker and ~35 steps/s on an RTX 3090 — a
+ *  serious run rather than a toy, and comfortably inside the default
+ *  WIGNERF_MAX_CELLS_2D. Drop to 32 per axis for quick exploration. */
+export const DEFAULT_AXES: Record<Ndim, AxisCfg[]> = {
+  1: [{ lo: -6.0, hi: 6.0, N: 256 }, { lo: -7.0, hi: 7.0, N: 256 }],
+  // The 2D spatial box is WIDER than the 1D one at the same extents, and that
+  // is not arbitrary. boundary.edge_band is max(4, N/32) CELLS, so its physical
+  // width is max(4, N/32)*L/N: at N=256 the N/32 term wins (0.375 a.u.) but at
+  // N=64 the 4-cell floor does (0.750 a.u.) — twice as wide, reaching in to
+  // 4.6σ of a packet at x0=2 instead of 5.1σ. The default therefore tripped its
+  // OWN boundary warning at [-6,6] (3.8e-06 against a 1e-6 threshold) while the
+  // identical 1D state at N=256 did not. [-8,8] puts it at 2.1e-12 and leaves
+  // the amplitude-2 orbit room to run.
+  2: [{ lo: -8.0, hi: 8.0, N: 64 }, { lo: -8.0, hi: 8.0, N: 64 },
+      { lo: -7.0, hi: 7.0, N: 64 }, { lo: -7.0, hi: 7.0, N: 64 }],
+}
+
+/** Default potential per dimensionality (isotropic harmonic in both). */
+export const DEFAULT_POTENTIAL: Record<Ndim, string> = {
+  1: 'x^2/2',
+  2: '(x^2 + y^2)/2',
+}
+
+/**
+ * Default initial condition per dimensionality. sigma = 0.70711 (not 0.707):
+ * sigma_q*sigma_k must be >= hbar/2 = 0.5 or the default state is (marginally)
+ * sub-Heisenberg and the purity warning fires on first load — 0.70711^2 =
+ * 0.5000045.
+ *
+ * The 2D default is NOT the 1D one with a second dimension bolted on at rest.
+ * A packet at (x0, py0) = (2, 1) in the isotropic well traces an ELLIPSE rather
+ * than sliding along x with y pinned at the origin: the (x,y) plane shows an
+ * orbit, the four marginals all move, and ⟨Lz⟩ = x·py − y·px = 2 is a nonzero
+ * constant — so the 2D-only plot demonstrates the conservation it exists for
+ * instead of drawing a flat zero. A default is the first thing anyone sees;
+ * in 2D it should show the dimension they just asked for.
+ */
+export const DEFAULT_IC: Record<Ndim, ICCfg> = {
+  1: {
+    type: 'mixture',
+    components: [{ q0: [2.0], k0: [0.0], sigma_q: [0.70711],
+                   sigma_k: [0.70711], weight: 1, phase: 0 }],
+  },
+  2: {
+    type: 'mixture',
+    components: [{ q0: [2.0, 0.0], k0: [0.0, 1.0], sigma_q: [0.70711, 0.70711],
+                   sigma_k: [0.70711, 0.70711], weight: 1, phase: 0 }],
+  },
+}
+
+/** Deep copy of one component — the form mutates these in place. */
+export function cloneComponent(c: ICComponentCfg): ICComponentCfg {
+  return {
+    q0: [...c.q0], k0: [...c.k0], sigma_q: [...c.sigma_q],
+    sigma_k: c.sigma_k ? [...c.sigma_k] : null,
+    weight: c.weight, phase: c.phase,
+  }
+}
+
+/** The default IC for a dimensionality, freshly copied. */
+export function defaultIC(ndim: Ndim): ICCfg {
+  return { type: DEFAULT_IC[ndim].type,
+           components: DEFAULT_IC[ndim].components.map(cloneComponent) }
+}
+
+function num(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback
+}
+
+/** Accept either grid spelling and return the generic one. */
+export function normalizeGrid(raw: unknown): GridCfg | null {
+  if (!raw || typeof raw !== 'object') return null
+  const g = raw as Record<string, any>
+  if (Array.isArray(g.axes) && g.axes.length) {
+    const axes = g.axes.map((a: Record<string, any>) => ({
+      lo: num(a?.lo, 0), hi: num(a?.hi, 1), N: num(a?.N, 64),
+    }))
+    const ndim = (axes.length === 4 ? 2 : 1) as Ndim
+    return { ndim, axes: axes.slice(0, 2 * ndim) }
+  }
+  if (typeof g.x1 === 'number') {
+    return {
+      ndim: 1,
+      axes: [{ lo: num(g.x1, -6), hi: num(g.x2, 6), N: num(g.Nx, 256) },
+             { lo: num(g.p1, -7), hi: num(g.p2, 7), N: num(g.Np, 256) }],
+    }
+  }
+  return null
+}
+
+/** Accept either IC-component spelling and return the generic one. */
+export function normalizeComponent(raw: unknown): ICComponentCfg {
+  const c = (raw ?? {}) as Record<string, any>
+  const arr = (v: unknown, fb: number[]): number[] =>
+    Array.isArray(v) && v.length ? v.map((x) => num(x, 0)) : fb
+  if (!Array.isArray(c.q0) && typeof c.x0 === 'number') {
+    return {
+      q0: [num(c.x0, 0)], k0: [num(c.p0, 0)], sigma_q: [num(c.sigma_x, 0.5)],
+      sigma_k: c.sigma_p == null ? null : [num(c.sigma_p, 0.5)],
+      weight: num(c.weight, 1), phase: num(c.phase, 0),
+    }
+  }
+  return {
+    q0: arr(c.q0, [0]), k0: arr(c.k0, [0]), sigma_q: arr(c.sigma_q, [0.5]),
+    sigma_k: c.sigma_k == null ? null : arr(c.sigma_k, [0.5]),
+    weight: num(c.weight, 1), phase: num(c.phase, 0),
+  }
+}
+
+/** The form grid as a live-geometry object, for the display before the first
+ *  frame lands (and for the IC preview's axes). */
+export function geomOf(g: GridCfg): GeomCfg {
+  return {
+    ndim: g.ndim,
+    lo: g.axes.map((a) => a.lo),
+    hi: g.axes.map((a) => a.hi),
+    N: g.axes.map((a) => a.N),
+  }
+}
+
+/** Total grid cells — the number that actually bounds 2D memory. */
+export function gridCells(g: GridCfg): number {
+  return g.axes.reduce((n, a) => n * a.N, 1)
+}
+
+/**
+ * The per-axis N values the Setup panel offers: powers of two up to the host's
+ * ceiling FOR THIS NDIM, plus whatever the form currently holds.
+ *
+ * It lives here, not in SetupPanel, so it can be pinned by a unit test rather
+ * than eyeballed through the DOM — the same reason `lib/potentialCuts.ts` was
+ * extracted. Both of its bugs were invisible in the component: the list was
+ * built against the RUNNING session's cap, so a form switched to 2D over a live
+ * 1D session offered N up to 4096 where the API refuses anything past 128, and a
+ * form switched back to 1D over a live 2D session collapsed to a single option
+ * (cap 128, loop starting at 256, body never entered).
+ *
+ * Two floors matter:
+ *  - 2D starts at 32, not 16. `boundary._band_mass` reports nothing below 32
+ *    cells per axis — the edge band would otherwise cover a quarter of the axis
+ *    — so a 16⁴ session has no boundary watch at all and says so nowhere.
+ *    Starting at 32 means every grid on offer has a working one, and it matches
+ *    DEFAULT_AXES's own "drop to 32 per axis for quick exploration". 16⁴ stays
+ *    reachable through the API and through an imported config, which the
+ *    `current` merge below keeps listed.
+ *  - the start is clamped to `cap`, or a host that lowered WIGNERF_MAX_GRID
+ *    (which CLAUDE.md recommends on VRAM-constrained hosts) would get an empty
+ *    1D list the same way.
+ *
+ * `current` values are always listed even when over cap, so an imported
+ * oversized setup renders its own value rather than a blank select; the API
+ * refuses it at Restart with a message naming the ceiling.
+ */
+export function axisSizeOptions(ndim: number, cap: number,
+                                current: number[] = []): number[] {
+  const top = Math.max(cap, 16)
+  const out: number[] = []
+  for (let n = Math.min(ndim > 1 ? 32 : 256, top); n <= top; n *= 2) out.push(n)
+  for (const n of current) if (!out.includes(n)) out.push(n)
+  return out.sort((a, b) => a - b)
+}
+
+/**
+ * Switch the form's dimensionality IN PLACE, rebuilding what cannot carry
+ * over. Grid axes and IC components are per-dimension, so going 1D -> 2D has
+ * to invent a second dimension's worth of both: the new axes copy the defaults
+ * and each component's second dimension mirrors its first, centred at the
+ * origin, which is the least surprising state to land in (a separable product
+ * of what was there). Going back drops it.
+ */
+export function setNdim(c: SimConfig, ndim: Ndim) {
+  if (c.grid.ndim === ndim) return
+  const wasDefaultU = c.potential === DEFAULT_POTENTIAL[c.grid.ndim]
+  const keep = c.grid.axes
+  // The BOX carries over — a 2D run wants the same extents its 1D counterpart
+  // had — but the RESOLUTION is re-chosen, because N means a different thing
+  // in each: the cell count is N² against N⁴. Propagating a 1D 256 gave
+  // 256⁴ = 4.3e9 cells, over the per-axis cap AND the cell ceiling, so the
+  // first Restart after a switch failed on a grid nobody chose. min() rather
+  // than a flat reset, so a deliberately SMALL choice survives the switch.
+  const box = ndim === 2
+    ? [keep[0]!, keep[0]!, keep[1]!, keep[1]!]   // y mirrors x, py mirrors px
+    : [keep[0]!, keep[2]!]                       // keep x and px, drop y/py
+  // ...EXCEPT when the box is still the source ndim's default, in which case
+  // take the TARGET ndim's default box — the same "only if untouched" rule the
+  // potential gets below, and for a sharper reason. Carrying [-6,6] into 2D
+  // reproduces exactly the case DEFAULT_AXES[2] was widened to avoid: the edge
+  // band is max(4, N/32) CELLS, so at N=64 the 4-cell floor makes it 0.750 a.u.
+  // — reaching in to 4.60σ of the default packet at x0=2 — and the fresh 2D
+  // default tripped its OWN boundary warning on the first Restart (measured band
+  // mass 3.78e-06 against a 1e-6 trigger; analytic tail 2.15e-06, so real mass,
+  // not detector noise). At [-8,8] the same band sits at 7.07σ: 2.12e-12.
+  // A box the user CHOSE still carries over untouched — that is their domain,
+  // and silently widening it would be worse than a warning.
+  const boxWasDefault = keep.every((a, i) => {
+    const d = DEFAULT_AXES[c.grid.ndim]![i]!
+    return a.lo === d.lo && a.hi === d.hi
+  })
+  const src = boxWasDefault ? DEFAULT_AXES[ndim] : box
+  const next = DEFAULT_AXES[ndim].map((d, i) => ({
+    // extents from whichever source applies; N always the user's own choice,
+    // capped at the target's default (a 1D 256 is 4.3e9 cells at ndim=2)
+    lo: src[i]!.lo, hi: src[i]!.hi, N: Math.min(box[i]!.N, d.N),
+  }))
+  c.grid.ndim = ndim
+  c.grid.axes.splice(0, c.grid.axes.length, ...next)
+  for (const k of c.ic.components) {
+    if (ndim === 2) {
+      k.q0 = [k.q0[0]!, 0]
+      k.k0 = [k.k0[0]!, 0]
+      k.sigma_q = [k.sigma_q[0]!, k.sigma_q[0]!]
+      k.sigma_k = k.sigma_k ? [k.sigma_k[0]!, k.sigma_k[0]!] : null
+    } else {
+      k.q0 = [k.q0[0]!]
+      k.k0 = [k.k0[0]!]
+      k.sigma_q = [k.sigma_q[0]!]
+      k.sigma_k = k.sigma_k ? [k.sigma_k[0]!] : null
+    }
+  }
+  // U(x) cannot mean U(x,y): only replace it if the user never edited it away
+  // from the default, so a hand-written potential is never silently discarded.
+  if (wasDefaultU) c.potential = DEFAULT_POTENTIAL[ndim]
+  applyNdimInvariants(c)
+}
+
+/**
+ * The three things a 2D run cannot do in this cut, applied to the config
+ * rather than argued with at Restart time — the exact counterpart of
+ * applyPrecisionInvariants, and for the same reason: the backend refuses each
+ * combination outright (milestones M1-M3), so reaching one from a stale
+ * localStorage entry, an imported 1D setup or a probe-adopted host default
+ * would leave Restart failing with a 422 the user never chose.
+ */
+export function applyNdimInvariants(c: SimConfig) {
+  if (c.grid.ndim < 2) return
+  c.precision = 'float64'          // M1
+  c.auto_expand = false            // M3
+  const nonrel = c.variants.filter((v) => v === 'qn' || v === 'cn')   // M2
+  if (nonrel.length !== c.variants.length)
+    c.variants.splice(0, c.variants.length,
+                      ...(nonrel.length ? nonrel : (['qn'] as VariantKey[])))
+}
+
+/** Axis labels for this config's dimensionality ('x','p' / 'x','y','px','py'). */
+export function gridLabels(c: SimConfig): readonly string[] {
+  return axisLabels(c.grid.ndim)
+}
+
+export function gridAxisCount(c: SimConfig): number {
+  return nAxes(c.grid.ndim)
+}
 
 /**
  * The HOST's default precision (WIGNERF_PRECISION, reported by GET /device).
@@ -123,15 +401,23 @@ export function markPrecisionChosen() {
  * win when the SPA could not read its default, and a hard-coded float64 sent as
  * though it were a decision is exactly how such a host got silently overridden.
  *
- * auto-expand is the exception. It is float64-only (the backend's
- * MSG_EXPAND_F32: in single precision a contained state's own noise passes the
- * edge trigger and the support scan reads the whole axis), so a form asking for
- * it IS asking for float64 — say so rather than defer, or a float32 host plus
- * this payload is a 422 the user never chose. Only reachable when the /device
- * probe failed: a probe that succeeded has already cleared auto_expand through
- * applyPrecisionInvariants.
+ * There are two exceptions, and both are the same rule: a form asking for a
+ * float64-ONLY feature IS asking for float64, so it says so rather than
+ * deferring.
+ *
+ *  - ndim = 2, which defers float32 entirely (the backend's MSG_F32_2D,
+ *    milestone M1). Stating it also keeps the exported setup document honest
+ *    about the precision the run had.
+ *  - auto-expand (MSG_EXPAND_F32: in single precision a contained state's own
+ *    noise passes the edge trigger and the support scan reads the whole axis).
+ *    Only reachable when the /device probe failed — a probe that succeeded has
+ *    already cleared auto_expand through applyPrecisionInvariants.
+ *
+ * The 2D branch returns a LITERAL rather than c.precision, so the answer does
+ * not depend on whether applyNdimInvariants has run on this config yet.
  */
 export function precisionForPayload(c: SimConfig): SimConfig['precision'] | null {
+  if (c.grid.ndim > 1) return 'float64'
   if (precisionWasStored || c.auto_expand) return c.precision
   return null
 }
@@ -147,12 +433,15 @@ export function precisionForPayload(c: SimConfig): SimConfig['precision'] | null
 export function mergeConfig(target: SimConfig, s: unknown) {
   if (!s || typeof s !== 'object') return
   const src = s as Record<string, any>
-  if (src.grid && typeof src.grid === 'object') Object.assign(target.grid, src.grid)
+  const g = normalizeGrid(src.grid)
+  if (g) {
+    target.grid.ndim = g.ndim
+    target.grid.axes.splice(0, target.grid.axes.length, ...g.axes)
+  }
   if (Array.isArray(src.ic?.components) && src.ic.components.length) {
     target.ic.type = src.ic.type === 'cat' ? 'cat' : 'mixture'
     target.ic.components.splice(0, target.ic.components.length,
-                                ...src.ic.components.map(
-                                  (c: Record<string, unknown>) => ({ ...c })))
+                                ...src.ic.components.map(normalizeComponent))
   }
   // An older setup file or mp4 has no `precision` key; absent keys are
   // skipped, so an import of one lands on float64 — the safe direction.
@@ -172,6 +461,9 @@ export function mergeConfig(target: SimConfig, s: unknown) {
   // imported setup so it is not rejected by the backend's mode literal.
   if ((target as unknown as Record<string, unknown>).mode === 'runahead')
     target.mode = 'batch'
+  // ndim first: it FORCES float64, so running the precision invariants after
+  // it keeps the two from disagreeing about tol
+  applyNdimInvariants(target)
   applyPrecisionInvariants(target)
 }
 
@@ -237,14 +529,24 @@ export function importConfig(target: SimConfig, doc: unknown) {
   if (!cfg.grid || typeof cfg.grid !== 'object' || typeof cfg.potential !== 'string'
       || !cfg.ic || !Array.isArray(cfg.ic.components))
     throw new Error('not a wignerf setup file (no grid/potential/IC)')
-  for (const k of ['x1', 'x2', 'p1', 'p2', 'Nx', 'Np'] as const)
-    if (typeof cfg.grid[k] !== 'number' || !Number.isFinite(cfg.grid[k]))
-      throw new Error(`grid.${k} is missing or not a number`)
-  // the API enforces this too, but a clear message here beats a 422 after
-  // the user presses Restart
-  for (const k of ['Nx', 'Np'] as const)
-    if (cfg.grid[k] % 2 !== 0) throw new Error(`grid.${k} must be even`)
+  const ng = normalizeGrid(cfg.grid)
+  if (!ng) throw new Error('grid is neither {ndim, axes} nor {x1, x2, Nx, ...}')
+  const names = axisLabels(ng.ndim)
+  if (ng.axes.length !== 2 * ng.ndim)
+    throw new Error(`a ${ng.ndim}D grid needs ${2 * ng.ndim} axes, got ${ng.axes.length}`)
+  ng.axes.forEach((a, i) => {
+    for (const k of ['lo', 'hi', 'N'] as const)
+      if (typeof a[k] !== 'number' || !Number.isFinite(a[k]))
+        throw new Error(`grid axis ${names[i]}: ${k} is missing or not a number`)
+    if (!(a.hi > a.lo)) throw new Error(`grid axis ${names[i]}: need hi > lo`)
+    // the API enforces this too, but a clear message here beats a 422 after
+    // the user presses Restart
+    if (a.N % 2 !== 0) throw new Error(`grid axis ${names[i]}: N must be even`)
+  })
   if (!cfg.ic.components.length) throw new Error('the IC has no components')
+  const nd = normalizeComponent(cfg.ic.components[0]).q0.length
+  if (nd !== ng.ndim)
+    throw new Error(`the grid is ${ng.ndim}D but the IC components are ${nd}D`)
   if (cfg.ic.type !== 'mixture' && cfg.ic.type !== 'cat')
     throw new Error(`unknown IC type "${cfg.ic.type}"`)
   if (Array.isArray(cfg.variants)
@@ -268,13 +570,21 @@ export function saveConfig(c: SimConfig) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(c))
 }
 
-/** Restore the whole setup to defaults IN PLACE — the view holds the
- *  config in a long-lived reactive object, so nested objects/arrays must
- *  be mutated, not replaced, for existing bindings to keep working (the
- *  deep watcher then persists the defaults to localStorage). */
+/**
+ * Restore the whole setup to defaults IN PLACE — the view holds the config in a
+ * long-lived reactive object, so nested objects/arrays must be mutated, not
+ * replaced, for existing bindings to keep working (the deep watcher then
+ * persists the defaults to localStorage).
+ *
+ * DIMENSIONALITY SURVIVES. ndim is the choice of PROBLEM, not a setting within
+ * one: a 2D user pressing "reset" wants this potential/grid/IC replaced by the
+ * 2D defaults, not to be dropped back into a 1D simulation they would then have
+ * to switch out of again. Everything ndim-dependent — grid axes, U, the IC —
+ * comes from defaultConfig(ndim) for exactly that reason.
+ */
 export function resetToDefaults(c: SimConfig) {
-  const d = defaultConfig()
-  Object.assign(c.grid, d.grid)
+  const d = defaultConfig(c.grid.ndim)
+  c.grid.axes.splice(0, c.grid.axes.length, ...d.grid.axes)
   c.ic.type = d.ic.type
   c.ic.components.splice(0, c.ic.components.length, ...d.ic.components)
   c.variants.splice(0, c.variants.length, ...d.variants)
@@ -294,21 +604,20 @@ export function resetToDefaults(c: SimConfig) {
   // "reset to defaults" un-chooses: the form goes back to deferring to the
   // host, which is what the default IS.
   precisionWasStored = false
+  // ...but the host default may be float32, which 2D refuses (M1). Without
+  // this a reset in 2D would leave the form in the one combination the API
+  // rejects, and Restart would 422 on something nobody chose.
+  applyNdimInvariants(c)
 }
 
-export function defaultConfig(): SimConfig {
+/** The whole default setup for a dimensionality. `ndim` defaults to 1 because
+ *  that is what a first-ever load gets; every other caller passes the one it
+ *  is resetting WITHIN. */
+export function defaultConfig(ndim: Ndim = 1): SimConfig {
   return {
-    grid: { x1: -6.0, x2: 6.0, Nx: 256, p1: -7.0, p2: 7.0, Np: 256 },
-    potential: 'x^2/2',
-    ic: {
-      type: 'mixture',
-      // sigma = 0.70711 (not 0.707): sigma_x*sigma_p must be >= hbar/2 = 0.5
-      // or the default state is (marginally) sub-Heisenberg and the purity
-      // warning fires on first load. 0.70711^2 = 0.5000045.
-      components: [
-        { x0: 2.0, p0: 0.0, sigma_x: 0.70711, sigma_p: 0.70711, weight: 1, phase: 0 },
-      ],
-    },
+    grid: { ndim, axes: DEFAULT_AXES[ndim].map((a) => ({ ...a })) },
+    potential: DEFAULT_POTENTIAL[ndim],
+    ic: defaultIC(ndim),
     variants: ['qn', 'cn'],
     mass: 1.0,
     c: C_AU,

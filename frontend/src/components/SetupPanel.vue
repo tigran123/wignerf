@@ -6,8 +6,10 @@
  */
 import { computed, ref, watch } from 'vue'
 import PotentialEditor from './PotentialEditor.vue'
-import { applyPrecisionInvariants, markPrecisionChosen, resetToDefaults,
-         TOL_MIN_F32, type GridCfg, type LivePhysics, type LiveRun,
+import { labelHtml } from '../lib/axes'
+import { applyPrecisionInvariants, axisSizeOptions, gridCells, gridLabels,
+         markPrecisionChosen, resetToDefaults, setNdim, TOL_MIN_F32,
+         type GeomCfg, type LivePhysics, type LiveRun,
          type SimConfig } from '../lib/config'
 
 const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
@@ -16,7 +18,11 @@ const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
                             // there a run for U(x)'s "Apply live" to reach —
                             // status.running is true during playback too)
                             computing?: boolean
-                            liveGrid?: GridCfg | null; maxGrid?: number
+                            liveGrid?: GeomCfg | null; maxGrid?: number
+                            // 2D memory facts (status): the total-cell ceiling
+                            // and the measured device bytes per cell per worker
+                            maxCells?: number | null
+                            bytesPerCell?: number | null
                             livePhysics?: LivePhysics | null
                             liveRun?: LiveRun | null
                             // true once the session has COMPUTED records — before
@@ -67,6 +73,17 @@ const runStale = computed(() =>
   (['mode', 't2', 'record_dt'] as const).some(runDiffers))
 
 const f32 = computed(() => props.cfg.precision === 'float32')
+// auto-expand is gated by float32 (single-precision noise trips its own
+// detector) AND by 2D (no memory guard on a 4-axis doubling) — two different
+// reasons, one disabled state, so the marker and tooltip pick the right words
+const expandGated = computed(() => f32.value || props.cfg.grid.ndim > 1)
+// ...and precision itself is gated by 2D, which defers float32 (M1). Same
+// treatment as auto-expand rather than a control whose value is silently put
+// back: applyNdimInvariants forces float64 in payload(), so picking float32
+// here used to leave the select amber against a value no restart could send —
+// and, on a fresh session, made syncFreshSessionToForm build TWO of them (its
+// loop re-reads the form after restart(), and restart() had moved it back).
+const precisionGated = computed(() => props.cfg.grid.ndim > 1)
 
 // The two float32 refusals, worded once each. They live in TOOLTIPS and in the
 // one-off amber note below, never in a standing paragraph: this panel is a
@@ -85,6 +102,27 @@ const AUTO_EXPAND_F32_HELP = 'Unavailable in float32, and refused by the API: a'
   + ' new domain reads the whole axis, so the domain would double for no'
   + ' physical reason. Boundary detection still runs on a raised threshold and'
   + ' still warns you. Restart in float64 to auto-expand.'
+const AUTO_EXPAND_2D_HELP = 'Not available for 2D runs yet, and refused by the'
+  + ' API (milestone M3): in 4D every axis doubling doubles a multi-GiB working'
+  + ' set, so the planner needs a memory guard it does not yet have. Boundary'
+  + ' DETECTION still runs on all four axes and will warn you — size the domain'
+  + ' by hand.'
+const PRECISION_HELP = 'spectral working precision. float64 is the physics'
+  + ' setting. float32 is a PREVIEW mode: ~3.3-3.8× faster and ~58% of the VRAM'
+  + ' on CUDA (no speedup on CPU), but purity and energy drift by ~1e-4 with the'
+  + ' same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the'
+  + ' relativistic shear. The exponents are built in double either way.'
+const PRECISION_2D_HELP = 'Not available for 2D runs yet, and refused by the'
+  + ' API (milestone M1): the mixed-precision rules — float64 meshes and'
+  + ' exponent construction, single-precision stepping — have not been'
+  + " re-verified for the correlated 2D Bopp shift, and adjust_step's"
+  + ' single-precision residual floor was measured at 256² only. It is the first'
+  + ' 2D follow-up precisely because memory is the binding 2D constraint.'
+const NDIM_HELP = 'spatial dimensions. 1D solves W(x,p,t); 2D solves'
+  + ' W(x,y,px,py,t) and streams the six pairwise 2D projections instead of the'
+  + ' 4D array. Restart-only, and it rebuilds the grid, the initial condition'
+  + ' and (if untouched) U. NB 2D defers float32, relativistic variants,'
+  + ' auto-expand and mp4 export — the API refuses each with the reason.'
 const TOL_HELP = 'adaptive-step relative tolerance'
 // toExponential: JS prints 1e-5 as "0.00001", which is neither how the field is
 // typed nor how the backend's own refusal words it
@@ -226,8 +264,8 @@ const computeStale = computed(() =>
  * t₂=100" was really the old interactive session and computed straight past
  * t=100). Keep every group named.
  */
-const WHAT_APPLIES_HELP = 'U(x), m, c, ℏ, tol, t dir and auto-expand apply LIVE'
-  + ' at the frontier — the numeric fields on blur/Enter, U(x) via its own'
+const WHAT_APPLIES_HELP = 'U, m, c, ℏ, tol, t dir and auto-expand apply LIVE'
+  + ' at the frontier — the numeric fields on blur/Enter, U via its own'
   + ' "Apply live" button. Grid, IC, variants, RUN (mode, t₂, Δt rec) and'
   + ' COMPUTE (precision, device, history) need a session restart — the form'
   + ' marks any of those in amber while it disagrees with the running session.'
@@ -242,19 +280,58 @@ function pending(field: keyof LivePhysics) {
 const pendingPhysics = computed(() =>
   (['mass', 'c', 'hbar_eff', 'tol'] as const).some(pending))
 
-// Nx/Np choices follow the SERVER's per-axis ceiling (WIGNERF_MAX_GRID,
-// reported in status) instead of a hardcoded list; the form's current
-// values stay listed even if a lower-capped backend would reject them,
-// so the select never renders blank.
-const sizeOptions = computed(() => {
-  const out: number[] = []
-  for (let n = 256; n <= Math.max(props.maxGrid ?? 4096, 256); n *= 2) out.push(n)
-  for (const v of [props.cfg.grid.Nx, props.cfg.grid.Np])
-    if (!out.includes(v)) out.push(v)
-  return out.sort((a, b) => a - b)
+const ndim = computed(() => props.cfg.grid.ndim)
+const axisNames = computed(() => gridLabels(props.cfg))
+// with real subscripts for the table's name column (see lib/axes.ts labelHtml)
+const axisNamesHtml = computed(() =>
+  axisNames.value.map((_, i) => labelHtml(ndim.value, i)))
+
+// Per-axis size choices follow the HOST's ceiling for the ndim this form is
+// SHOWING — WIGNERF_MAX_GRID / _MAX_GRID_2D, from /api/device, not from
+// `status`, which reports the ceiling of the ndim that is RUNNING. See
+// lib/config.axisSizeOptions for the floors and for what reading it off the
+// session did to both directions of a dims switch.
+const sizeOptions = computed(() => axisSizeOptions(
+  ndim.value, props.maxGrid ?? (ndim.value > 1 ? 128 : 4096),
+  props.cfg.grid.axes.map((a) => a.N)))
+
+const cells = computed(() => gridCells(props.cfg.grid))
+const overCells = computed(() =>
+  props.maxCells != null && cells.value > props.maxCells)
+
+/**
+ * Estimated device footprint. Shown for 2D ONLY, and not as decoration: at N^4
+ * this is the number that decides whether a session starts at all, and finding
+ * out by OOM after pressing Restart is the failure this line exists to prevent.
+ * The per-card figure assumes the workers spread evenly over the pool, which is
+ * what session.assign_devices does.
+ */
+const footprint = computed(() => {
+  const bpc = props.bytesPerCell
+  if (ndim.value < 2 || !bpc) return ''
+  const per = cells.value * bpc / 1024 ** 3
+  const nv = props.cfg.variants.length
+  const ndev = Math.max(1, props.liveDevices?.length ?? props.hostPool?.length ?? 1)
+  const perCard = per * Math.ceil(nv / ndev)
+  const cardsNote = ndev > 1 ? ` · ${perCard.toFixed(2)} GiB/device` : ''
+  return `≈ ${per.toFixed(2)} GiB per worker${cardsNote} · ${cells.value.toLocaleString()} cells`
 })
 
+/** Switching dimensionality rebuilds grid + IC, so it is restart-only. */
+function onNdimChange(v: string) {
+  setNdim(props.cfg, v === '2' ? 2 : 1)
+  emit('dirty')
+}
+
 const showGrid = defineModel<boolean>('showGrid', { required: true })
+const showCells = defineModel<boolean>('showCells', { required: true })
+
+const CELL_LINES_HELP =
+  'The lattice W is actually computed on, drawn faintly on the W panels and the'
+  + ' IC preview, with the boundary watch\'s outer edge-band cells brighter —'
+  + ' so the "in the outer N cells" in that warning points at something you can'
+  + ' see. Dropped automatically when more than ~200 cell lines would land in'
+  + ' the visible window; zoom in and they come back.'
 
 const emit = defineEmits<{
   (e: 'restart'): void
@@ -268,8 +345,15 @@ const emit = defineEmits<{
  *  localStorage keys and stay untouched. */
 function resetSetup() {
   if (!confirm('Reset the ENTIRE setup (grid, potential, physics, run mode, IC, variants) to defaults?')) return
+  // A reset that changed NOTHING is not a change. Emitting `dirty`
+  // unconditionally put "setup changed — restart to apply" over a form that
+  // was already at the defaults — most visibly right after clearing local
+  // data, where the very first thing the user can press announces a
+  // divergence that does not exist. Same rule the backend's apply_params
+  // follows: compare, and say nothing when the whole message is a no-op.
+  const before = JSON.stringify(props.cfg)
   resetToDefaults(props.cfg)
-  emit('dirty')
+  if (JSON.stringify(props.cfg) !== before) emit('dirty')
 }
 
 // Auto-expand can move the SESSION's domain away from the form's grid;
@@ -278,14 +362,32 @@ function resetSetup() {
 const liveDiffers = computed(() => {
   const lg = props.liveGrid
   if (!lg) return false
-  const g = props.cfg.grid
-  return lg.x1 !== g.x1 || lg.x2 !== g.x2 || lg.Nx !== g.Nx
-      || lg.p1 !== g.p1 || lg.p2 !== g.p2 || lg.Np !== g.Np
+  const ax = props.cfg.grid.axes
+  // A DIMENSIONALITY change is not what this line is for. It exists for one
+  // case — auto-expand moved the session's domain away from the form, and
+  // "adopt" copies the expanded window back — which only means anything within
+  // one ndim. Across a switch it printed the running 1D box under a 2D form,
+  // reading as if that were the 2D grid; and `adopt` would have been an active
+  // trap, silently reverting grid.ndim to 1 while the IC stayed 2D, which the
+  // API then refuses. The dims marker beside the heading already says it.
+  if (lg.ndim !== props.cfg.grid.ndim) return false
+  if (lg.N.length !== ax.length) return true
+  return ax.some((a, i) =>
+    a.lo !== lg.lo[i] || a.hi !== lg.hi[i] || a.N !== lg.N[i])
 })
 const fmt = (v: number) => String(+v.toFixed(4))
+const liveText = computed(() => {
+  const lg = props.liveGrid
+  if (!lg) return ''
+  const box = lg.lo.map((lo, i) => `[${fmt(lo)}, ${fmt(lg.hi[i]!)}]`).join(' × ')
+  return `${box} ${lg.N.join('×')}`
+})
 function adoptLive() {
-  if (!props.liveGrid) return
-  Object.assign(props.cfg.grid, props.liveGrid)
+  const lg = props.liveGrid
+  if (!lg) return
+  props.cfg.grid.ndim = lg.ndim === 2 ? 2 : 1
+  props.cfg.grid.axes.splice(0, props.cfg.grid.axes.length,
+    ...lg.N.map((N, i) => ({ lo: lg.lo[i]!, hi: lg.hi[i]!, N })))
   emit('dirty')
 }
 </script>
@@ -297,6 +399,7 @@ function adoptLive() {
       :grid="props.cfg.grid" :hbar-eff="props.cfg.hbar_eff"
       :live="live" :computing="computing ?? false" :variants="props.cfg.variants"
       :live-expr="props.livePhysics?.potential ?? null"
+      :live-ndim="props.liveGrid?.ndim ?? null"
       @apply-live="(expr) => emit('apply-live', { U: expr })"
       @validity="(v) => emit('potential-validity', v)"
       @grid-dirty="emit('dirty')"
@@ -367,64 +470,93 @@ function adoptLive() {
     </section>
 
     <section class="space-y-1.5">
-      <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Grid</h3>
-      <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-muted">x₁,x₂</span>
-          <input v-model.number="props.cfg.grid.x1" type="number" step="any"
-                 class="wf-num" @change="emit('dirty')" />
-          <input v-model.number="props.cfg.grid.x2" type="number" step="any"
-                 class="wf-num" @change="emit('dirty')" />
-        </label>
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-muted">p₁,p₂</span>
-          <input v-model.number="props.cfg.grid.p1" type="number" step="any"
-                 class="wf-num" @change="emit('dirty')" />
-          <input v-model.number="props.cfg.grid.p2" type="number" step="any"
-                 class="wf-num" @change="emit('dirty')" />
-        </label>
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-muted">Nx</span>
-          <select v-model.number="props.cfg.grid.Nx" class="wf-num" @change="emit('dirty')">
-            <option v-for="n in sizeOptions" :key="n" :value="n">{{ n }}</option>
+      <div class="flex items-baseline justify-between">
+        <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Grid</h3>
+        <!-- restart-only: dimensionality fixes the grid, the IC and the whole
+             worker construction. Amber when it differs from the run, exactly
+             like the other restart-only fields. -->
+        <label class="flex items-center gap-1 text-xs"
+               :class="liveGrid && liveGrid.ndim !== ndim ? 'text-warn' : 'text-muted'"
+               :title="NDIM_HELP">
+          <span>dims</span>
+          <select :value="String(ndim)" class="wf-num !w-14"
+                  @change="onNdimChange(($event.target as HTMLSelectElement).value)">
+            <option value="1">1D</option>
+            <option value="2">2D</option>
           </select>
-        </label>
-        <label class="flex items-center gap-1">
-          <span class="w-10 text-muted">Np</span>
-          <select v-model.number="props.cfg.grid.Np" class="wf-num" @change="emit('dirty')">
-            <option v-for="n in sizeOptions" :key="n" :value="n">{{ n }}</option>
-          </select>
-        </label>
-        <!-- The two toggles SHARE a row: in portrait the first column is what
-             the W panels are competing with, so a checkbox that needs half a
-             line must not take a whole one. Labels are short and the tooltips
-             carry the full meaning. In float32 auto-expand takes the full width
-             instead, because its "— float64 only" suffix wraps in half of a
-             narrow column — and a wrapped cell drags its row-mate taller too,
-             so pairing them there would COST a line rather than save one. The
-             common case keeps the saving; the marker keeps its full wording.
-             The float32 gate on auto-expand is stated three ways, none of them a
-             standing paragraph: the "float64 only" suffix (permanent, and the
-             only one a touch device gets), the tooltip (the full reason), and
-             the one-off amber note in Compute when the switch is made. -->
-        <label class="flex items-center gap-1 select-none"
-               :class="f32 ? 'cursor-not-allowed col-span-2' : 'cursor-pointer'"
-               :title="f32 ? AUTO_EXPAND_F32_HELP : AUTO_EXPAND_HELP">
-          <input type="checkbox" v-model="props.cfg.auto_expand" :disabled="f32"
-                 @change="emit('apply-live', { auto_expand: props.cfg.auto_expand })" />
-          <span :class="f32 ? 'text-dim' : 'text-fg-3'">auto-expand<template
-            v-if="f32"> — float64 only</template></span>
-        </label>
-        <label class="flex items-center gap-1 cursor-pointer select-none"
-               title="axis grid lines on all plots, the W panels and the IC preview">
-          <input type="checkbox" v-model="showGrid" />
-          <span class="text-fg-3">grid lines</span>
         </label>
       </div>
+      <!-- One row per phase-space axis: name, lo, hi, N. A table rather than
+           four labelled rows because at 2D there are FOUR axes, and "x₁,x₂"
+           style labels would spend the width twice over in a 320px column. -->
+      <div class="grid grid-cols-[1.2rem_1fr_1fr_3.6rem] gap-x-1 gap-y-1 text-xs
+                  items-center">
+        <span></span>
+        <span class="text-muted text-[10px]">lo</span>
+        <span class="text-muted text-[10px]">hi</span>
+        <span class="text-muted text-[10px]">N</span>
+        <template v-for="(a, i) in props.cfg.grid.axes" :key="i">
+          <span class="text-muted italic" v-html="axisNamesHtml[i]"></span>
+          <input v-model.number="a.lo" type="number" step="any"
+                 class="wf-num" @change="emit('dirty')" />
+          <input v-model.number="a.hi" type="number" step="any"
+                 class="wf-num" @change="emit('dirty')" />
+          <select v-model.number="a.N" class="wf-num" @change="emit('dirty')">
+            <option v-for="n in sizeOptions" :key="n" :value="n">{{ n }}</option>
+          </select>
+        </template>
+      </div>
+      <div class="flex items-center gap-x-3 gap-y-1 flex-wrap text-xs">
+        <!-- All THREE toggles share one row: in portrait the first column is
+             what the W panels are competing with, so a checkbox that needs a
+             third of a line must not take a whole one. Natural widths (flex,
+             not equal thirds) plus short labels are what make three fit inside
+             320px — verified at the real width, per the UI-debugging note in
+             CLAUDE.md. flex-wrap is only a safety valve.
+             That budget is why auto-expand's gate marker is "(1D)" / "(f64)"
+             rather than a spelled-out clause: it stays PERMANENT and visible,
+             which is the load-bearing part (a touch device gets no hover), and
+             the full reason lives in the tooltip. The float32 gate is still
+             stated three ways, none of them a standing paragraph: this marker,
+             the tooltip, and the one-off amber note in Compute at the switch. -->
+        <label class="flex items-center gap-1 select-none"
+               :class="expandGated ? 'cursor-not-allowed' : 'cursor-pointer'"
+               :title="ndim > 1 ? AUTO_EXPAND_2D_HELP
+                       : (f32 ? AUTO_EXPAND_F32_HELP : AUTO_EXPAND_HELP)">
+          <input type="checkbox" v-model="props.cfg.auto_expand"
+                 :disabled="expandGated"
+                 @change="emit('apply-live', { auto_expand: props.cfg.auto_expand })" />
+          <span :class="expandGated ? 'text-dim' : 'text-fg-3'">auto-expand<template
+            v-if="ndim > 1"> (1D)</template><template
+            v-else-if="f32"> (f64)</template></span>
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer select-none"
+               title="axis grid lines at nice value intervals — on all plots, the W panels and the IC preview">
+          <input type="checkbox" v-model="showGrid" />
+          <span class="text-fg-3">grid</span>
+        </label>
+        <label class="flex items-center gap-1 cursor-pointer select-none"
+               :title="CELL_LINES_HELP">
+          <input type="checkbox" v-model="showCells" />
+          <span class="text-fg-3">cells</span>
+        </label>
+      </div>
+      <!-- 2D only: what this grid will cost a card, BEFORE the restart that
+           would find out by OOM. Red once past the host's cell ceiling, which
+           is the refusal the create call would return. -->
+      <p v-if="footprint" class="text-xs tabular-nums"
+         :class="overCells ? 'text-error' : 'text-fg-3'"
+         :title="overCells
+           ? `over the host's WIGNERF_MAX_CELLS_2D (${maxCells?.toLocaleString()}) — creating this session will be refused`
+           : 'estimated device memory per variant worker at this grid. Mostly '
+             + 'NOT the state: W is real (float64, 8 B/cell), and the rest is '
+             + 'the step\'s machinery at full shape — two exponent slots '
+             + '(2 complex meshes each), the dU/dT rate meshes, the FFT work '
+             + 'arrays and adjust_step\'s two candidate states.'">
+        {{ footprint }}<template v-if="overCells"> — over the host cap</template>
+      </p>
       <p v-if="liveDiffers" class="text-xs text-warn">
-        live: [{{ fmt(liveGrid!.x1) }}, {{ fmt(liveGrid!.x2) }}] ×
-        [{{ fmt(liveGrid!.p1) }}, {{ fmt(liveGrid!.p2) }}]
-        {{ liveGrid!.Nx }}×{{ liveGrid!.Np }}
+        live: {{ liveText }}
         <button class="underline ml-1" title="copy the live domain into the setup so a restart reproduces it"
                 @click="adoptLive">adopt</button>
       </p>
@@ -480,15 +612,20 @@ function adoptLive() {
            ~100px, which an inline label plus a select showing "float64" does
            not fit. Stacked still costs two lines instead of three. -->
       <div class="grid grid-cols-3 gap-x-2 gap-y-1 text-xs">
+        <!-- The "(1D)" marker is the same permanent, line-free gate marker
+             auto-expand carries, for the same reason: a touch device has no
+             hover, and the full reason belongs in the tooltip. -->
         <label class="flex flex-col gap-0.5 min-w-0"
-               title="spectral working precision. float64 is the physics setting. float32 is a PREVIEW mode: ~3.3-3.8× faster and ~58% of the VRAM on CUDA (no speedup on CPU), but purity and energy drift by ~1e-4 with the same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the relativistic shear. The exponents are built in double either way.">
-          <span class="text-muted">precision</span>
+               :title="precisionGated ? PRECISION_2D_HELP : PRECISION_HELP">
+          <span :class="precisionGated ? 'text-dim' : 'text-muted'">precision<template
+            v-if="precisionGated"> (1D)</template></span>
           <!-- onPrecisionChange marks the choice (until the user operates THIS
                control the form only holds a placeholder and the create payload
                omits precision, so the host's WIGNERF_PRECISION decides) and
                applies the float32 invariants synchronously — see its comment
                for why a watcher is too late. -->
           <select v-model="props.cfg.precision" class="wf-num"
+                  :disabled="precisionGated"
                   :class="runDiffers('precision') ? 'text-warn' : ''"
                   @change="onPrecisionChange()">
             <option value="float64">float64</option>
@@ -560,7 +697,7 @@ function adoptLive() {
                 @click="emit('restart')">Restart session</button>
         <button class="flex-1 py-1.5 rounded bg-raised hover:bg-raised-hover
                        text-fg-2 whitespace-nowrap"
-                title="restore grid, U(x), physics, run mode, IC and variants to their defaults"
+                title="restore grid, U, physics, run mode, IC and variants to the defaults FOR THE CURRENT DIMENSIONALITY (dims itself is kept)"
                 @click="resetSetup">Reset to defaults</button>
       </div>
     </section>

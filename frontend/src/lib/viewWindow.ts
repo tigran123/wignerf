@@ -52,7 +52,12 @@ export function isZoomed(v: ViewWindow): boolean {
   return v.x0 > 0 || v.x1 < 1 || v.y0 > 0 || v.y1 < 1
 }
 
-interface Domain { x1: number; x2: number; p1: number; p2: number }
+/**
+ * The physical extents of the two axes a panel shows: `a` is horizontal, `b`
+ * vertical (drawn upward). Named by POSITION rather than by x/p, because at
+ * ndim=2 a panel may show any of six axis pairs.
+ */
+export interface Domain { a1: number; a2: number; b1: number; b2: number }
 
 /** Remap a fraction window so it keeps showing the same PHYSICAL region
  *  after the domain changed (auto-expand regrid). Un-zoomed windows stay
@@ -60,8 +65,8 @@ interface Domain { x1: number; x2: number; p1: number; p2: number }
  *  (view entirely outside the new domain) reset. */
 export function remapView(v: ViewWindow, od: Domain, nd: Domain): void {
   if (!isZoomed(v)) return
-  const fx = (f: number) => (od.x1 + f * (od.x2 - od.x1) - nd.x1) / (nd.x2 - nd.x1)
-  const fy = (f: number) => (od.p1 + f * (od.p2 - od.p1) - nd.p1) / (nd.p2 - nd.p1)
+  const fx = (f: number) => (od.a1 + f * (od.a2 - od.a1) - nd.a1) / (nd.a2 - nd.a1)
+  const fy = (f: number) => (od.b1 + f * (od.b2 - od.b1) - nd.b1) / (nd.b2 - nd.b1)
   const x0 = Math.max(0, fx(v.x0))
   const x1 = Math.min(1, fx(v.x1))
   const y0 = Math.max(0, fy(v.y0))

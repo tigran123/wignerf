@@ -10,7 +10,22 @@
  * be.
  */
 export function apiErrorText(e: unknown): string {
-  const detail = (e as { response?: { data?: { detail?: unknown } } })
+  const err = e as { response?: { data?: unknown } }
+  // A responseType:'arraybuffer' request (the IC preview fetches a binary frame
+  // bundle) hands back its ERROR body as bytes too, so `data` is an ArrayBuffer
+  // holding the JSON envelope. Decoding it here rather than at the call site is
+  // what keeps the rule in CLAUDE.md true — a failed API call goes through this
+  // function, never through data.detail — and is why the IC editor used to
+  // print a raw {"detail":"..."} blob under its plot.
+  if (err?.response?.data instanceof ArrayBuffer) {
+    try {
+      const txt = new TextDecoder().decode(err.response.data)
+      return apiErrorText({ response: { data: JSON.parse(txt) } })
+    } catch {
+      return new TextDecoder().decode(err.response.data) || String(e)
+    }
+  }
+  const detail = (err as { response?: { data?: { detail?: unknown } } })
     ?.response?.data?.detail
   if (typeof detail === 'string' && detail) return detail
   if (Array.isArray(detail) && detail.length) {

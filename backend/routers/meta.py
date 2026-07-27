@@ -5,6 +5,7 @@ from functools import lru_cache
 from fastapi import APIRouter
 
 import config
+from core import axes as axes_mod
 from core.xp import ArrayBackend, devices_allowed, resolve_devices
 
 router = APIRouter()
@@ -51,4 +52,23 @@ def health():
 
 @router.get("/device")
 def device():
-    return _probe_backend()
+    """Host facts the setup form needs BEFORE it can create anything.
+
+    The per-ndim ceilings live here rather than on `status` because `status`
+    reports them for the ndim of the session that is RUNNING — `config.max_grid`
+    is resolved once, at creation — while the form has to describe the ndim it is
+    SHOWING, and `dims` is restart-only, so the two disagree for as long as a
+    switch sits ahead of its restart. Reading them off `status` made the Setup
+    panel offer N up to 4096 for a 2D grid the API refuses past 128, hide the 2D
+    footprint estimate entirely (its `bytes_per_cell` is 1D-null) and, in the
+    other direction, collapse the 1D N select to a single option.
+
+    Deliberately OUTSIDE `_probe_backend`'s lru_cache: these are cheap env
+    reads, they must follow a monkeypatched `config` in the tests, and the
+    probe's own error path must carry them too. Spread rather than mutate — that
+    dict IS the cache.
+    """
+    return {**_probe_backend(),
+            "max_grid": {str(n): config.max_grid(n) for n in axes_mod.NDIMS},
+            "max_cells": {str(n): config.max_cells(n) for n in axes_mod.NDIMS},
+            "bytes_per_cell_2d": config.BYTES_PER_CELL_2D}

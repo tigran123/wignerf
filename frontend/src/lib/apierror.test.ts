@@ -8,6 +8,34 @@ import { apiErrorText } from './apierror'
  * one readable sentence buried in it. These messages are written to be read.
  */
 describe('apiErrorText', () => {
+  it('unwraps an arraybuffer error body', () => {
+    // responseType:'arraybuffer' (the IC preview) returns the ERROR body as
+    // bytes too. Without this the IC editor printed the raw JSON envelope —
+    // {"detail":"..."} — under its plot.
+    const bytes = new TextEncoder().encode(
+      JSON.stringify({ detail: 'the grid has 128⁴ = 268,435,456 cells' }))
+    const buf = bytes.buffer.slice(bytes.byteOffset,
+                                   bytes.byteOffset + bytes.byteLength)
+    expect(apiErrorText({ response: { data: buf } }))
+      .toBe('the grid has 128⁴ = 268,435,456 cells')
+  })
+
+  it('unwraps an arraybuffer body carrying a pydantic array', () => {
+    const bytes = new TextEncoder().encode(JSON.stringify({
+      detail: [{ msg: 'Value error, N must be even', loc: ['body', 'grid'] }] }))
+    const buf = bytes.buffer.slice(bytes.byteOffset,
+                                   bytes.byteOffset + bytes.byteLength)
+    expect(apiErrorText({ response: { data: buf } }))
+      .toBe('grid: N must be even')
+  })
+
+  it('falls back to the raw text when the body is not JSON', () => {
+    const bytes = new TextEncoder().encode('upstream exploded')
+    const buf = bytes.buffer.slice(bytes.byteOffset,
+                                   bytes.byteOffset + bytes.byteLength)
+    expect(apiErrorText({ response: { data: buf } })).toBe('upstream exploded')
+  })
+
   it('passes our own HTTPException string through', () => {
     expect(apiErrorText({ response: { data: { detail: 'nothing to export' } } }))
       .toBe('nothing to export')

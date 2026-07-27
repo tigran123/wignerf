@@ -1,23 +1,36 @@
 <script setup lang="ts">
-/** The diagnostics column: marginals, E(t), ΔX·ΔP(t), purity γ(t). */
+/**
+ * The diagnostics column: one marginal per phase-space axis, then E(t), one
+ * ΔQ·ΔK(t) per spatial dimension, purity γ(t), and — in 2D only — ⟨Lz⟩(t).
+ *
+ * So 1D shows five plots as it always did, and 2D shows nine. The column
+ * scrolls rather than overlaying pairs: colour and dash already mean "variant",
+ * and an overlay would have to encode the axis in line width.
+ */
+import { computed } from 'vue'
 import MarginalsPlot from './MarginalsPlot.vue'
 import SeriesPlot from './SeriesPlot.vue'
 import type { Frame } from '../lib/protocol'
-import type { GridCfg } from '../lib/config'
+import type { GeomCfg } from '../lib/config'
 import type { VariantKey } from '../lib/variants'
 
-defineProps<{
+const props = defineProps<{
   frameSource: (h: (f: Frame) => void) => () => void
   sessionId: string | null
   variants: VariantKey[]
-  grid: GridCfg
+  /** live geometry (form values until the first frame lands) */
+  geom: GeomCfg
   lastFrame: Frame | null
   showGrid: boolean
   plotsKey: string
-  // batch compute streams no frames — the colorbar and marginals (frame-fed)
-  // are dimmed; the series plots below stay live (they poll REST, not frames)
+  // batch compute streams no frames — the marginals (frame-fed) are dimmed;
+  // the series plots below stay live (they poll REST, not frames)
   batchComputing?: boolean
 }>()
+
+const ndim = computed(() => props.geom.ndim)
+const axisIdx = computed(() => props.geom.N.map((_, i) => i))
+const dims = computed(() => Array.from({ length: ndim.value }, (_, i) => i))
 </script>
 
 <template>
@@ -31,23 +44,29 @@ defineProps<{
            range) and one shared bar mislabelled the rest, and this is the
            tallest of the three portrait columns, so a row spent here is a row
            the panels start later by. See Colorbar.vue. -->
-      <MarginalsPlot :key="'r' + plotsKey" :frame-source="frameSource"
-                     :variants="variants" which="rho" :show-grid="showGrid"
-                     :a1="grid.x1" :a2="grid.x2" :n="grid.Nx" />
-      <MarginalsPlot :key="'p' + plotsKey" :frame-source="frameSource"
-                     :variants="variants" which="phi" :show-grid="showGrid"
-                     :a1="grid.p1" :a2="grid.p2" :n="grid.Np" />
+      <MarginalsPlot v-for="a in axisIdx" :key="'m' + a + plotsKey"
+                     :frame-source="frameSource" :variants="variants"
+                     :axis="a" :ndim="ndim" :show-grid="showGrid"
+                     :a1="geom.lo[a]!" :a2="geom.hi[a]!" :n="geom.N[a]!" />
     </div>
     <!-- cursor-t: the painted frame's time, so the series carry the same
          moving marker the exported video does -->
     <SeriesPlot :key="'e' + plotsKey" :session-id="sessionId"
-                :variants="variants" which="E" :show-grid="showGrid"
-                :cursor-t="lastFrame?.t ?? null" />
-    <SeriesPlot :key="'u' + plotsKey" :session-id="sessionId"
-                :variants="variants" which="uncertainty" :show-grid="showGrid"
-                :cursor-t="lastFrame?.t ?? null" />
+                :variants="variants" which="E" :ndim="ndim"
+                :show-grid="showGrid" :cursor-t="lastFrame?.t ?? null" />
+    <SeriesPlot v-for="d in dims" :key="'u' + d + plotsKey"
+                :session-id="sessionId" :variants="variants"
+                which="uncertainty" :dim="d" :ndim="ndim"
+                :show-grid="showGrid" :cursor-t="lastFrame?.t ?? null" />
     <SeriesPlot :key="'g' + plotsKey" :session-id="sessionId"
-                :variants="variants" which="purity" :show-grid="showGrid"
-                :cursor-t="lastFrame?.t ?? null" />
+                :variants="variants" which="purity" :ndim="ndim"
+                :show-grid="showGrid" :cursor-t="lastFrame?.t ?? null" />
+    <!-- angular momentum exists only in 2D, and is the one invariant there
+         that no 1D run has: conserved by a central U, not by an anisotropic
+         one, which makes it the fastest visual check that a 2D potential is
+         what you think it is -->
+    <SeriesPlot v-if="ndim > 1" :key="'lz' + plotsKey" :session-id="sessionId"
+                :variants="variants" which="lz" :ndim="ndim"
+                :show-grid="showGrid" :cursor-t="lastFrame?.t ?? null" />
   </div>
 </template>

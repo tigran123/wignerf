@@ -3,10 +3,19 @@ Human-readable descriptions of a session: the analytic initial condition and
 the parameter block that make an exported video self-contained (everything
 needed to reproduce the run is ON the frame).
 
-Plain Unicode text ONLY — never matplotlib mathtext: U(x) is user input
-("x^2/2", "Abs(x)", ...) and would either fail to parse or render as
-nonsense in math mode. The same facts also go into the mp4 metadata tag as
-JSON (`config_json`), which is what a machine should read back.
+Plain Unicode text ONLY — never matplotlib mathtext, for TWO independent
+reasons, and the second one is the one that keeps getting rediscovered:
+
+1. U(x) is user input ("x^2/2", "Abs(x)", ...) and would either fail to parse
+   or render as nonsense in math mode.
+2. mathtext is SLOW. It was measured to slow the export's plots down
+   enormously and was removed from them for that reason — it is matplotlib's
+   own renderer rather than LaTeX, which makes it sound free, and it is not.
+   `usetex=True` being the slow one is a fact about matplotlib in general, not
+   about this figure: do not reason from it back to "so mathtext is cheap".
+
+The same facts also go into the mp4 metadata tag as JSON (`config_json`),
+which is what a machine should read back.
 
 No matplotlib import here on purpose: this module is pure string work and
 is unit-tested as such.
@@ -32,56 +41,86 @@ def _shift(var, v):
     return "%s %s %s" % (var, "−" if f > 0 else "+", _num(abs(f)))
 
 
-def _sigma_p_of(comp, ic_type, hbar_eff):
-    """sigma_p as the solver uses it (derived for cat states — see
-    initial.minimal_sigma_p; components carry their own for mixtures)."""
+def _sigma_k_of(comp, ic_type, hbar_eff):
+    """sigma_k per dimension as the solver uses it (derived for cat states —
+    see initial.minimal_sigma_p; components carry their own for mixtures)."""
     if ic_type == "cat":
-        return hbar_eff/(2.*comp.sigma_x)
-    return comp.sigma_p
+        return tuple(hbar_eff/(2.*s) for s in comp.sigma_q)
+    return tuple(comp.sigma_k)
 
 
-def ic_expression(ic, hbar_eff):
+def _ax_labels(ndim):
+    from . import axes as ax
+    return ax.labels(ndim)
+
+
+def _vec(parts, sep=", "):
+    """"2" for one value, "(2, 1.67)" for several — tuple notation only where
+    there IS a tuple, so 1D text reads exactly as it always did."""
+    return parts[0] if len(parts) == 1 else "(%s)" % sep.join(parts)
+
+
+def ic_expression(ic, hbar_eff, ndim=None):
     """The initial condition as an analytic expression, with the concrete
     numbers substituted. Returns a list of text lines.
 
-    - mixture: W(x,p,0) itself (initial.mixture_wigner) — a weighted sum of
-      normalized Gaussian blobs.
-    - cat: the WAVEFUNCTION psi(x,0) (initial.cat_wigner builds W from the
+    - mixture: W itself (initial.mixture_wigner) — a weighted sum of
+      normalized Gaussian blobs, one factor per phase-space axis.
+    - cat: the WAVEFUNCTION psi (initial.cat_wigner builds W from the
       pairwise cross-Wigner closed form, which is far longer to print and
       carries no extra information): W = Wigner[psi] is the complete and
-      compact specification.
+      compact specification. In 2D each packet is the separable product over
+      dimensions that cat_wigner assumes, so the same one-line form per
+      dimension is exact.
     """
+    from . import axes as ax
     comps = list(ic.components)
     hbar = float(hbar_eff)
+    nd = ndim if ndim is not None else comps[0].ndim
+    labels = ax.labels(nd)
+    args = ",".join(labels)
+    # psi lives on configuration space only — "psi(x,p,0)" would be nonsense
+    qargs = ",".join(labels[:nd])
+
     if ic.type == "cat":
         terms = []
         for c in comps:
             amp = "√%s·" % _num(c.weight) if c.weight != 1.0 else ""
             phase = "e^(i%s)·" % _num(c.phase) if c.phase else ""
-            u = "(%s)" % _shift("x", c.x0)
-            terms.append(
-                "%s%s(2π·%s²)^(−1/4)·exp(−%s²/(4·%s²) + i·%s·%s/ℏ)"
-                % (amp, phase, _num(c.sigma_x), u, _num(c.sigma_x),
-                   _num(c.p0), u))
-        lines = ["IC (cat state, ℏ = %s):  W(x,p,0) = Wigner[ψ],  ψ(x,0) = "
-                 "S^(−1/2)·[" % _num(hbar)]
+            factors = []
+            for i in range(nd):
+                q, s = labels[i], _num(c.sigma_q[i])
+                u = "(%s)" % _shift(q, c.q0[i])
+                factors.append("(2π·%s²)^(−1/4)·exp(−%s²/(4·%s²) + i·%s·%s/ℏ)"
+                               % (s, u, s, _num(c.k0[i]), u))
+            terms.append("%s%s%s" % (amp, phase, "·".join(factors)))
+        lines = ["IC (cat state, ℏ = %s):  W(%s,0) = Wigner[ψ],  ψ(%s,0) = "
+                 "S^(−1/2)·[" % (_num(hbar), args, qargs)]
         lines.append("    " + "  +  ".join(terms) + " ]")
-        sig = ", ".join("σ%d = %s (σp = %s)"
-                        % (j + 1, _num(c.sigma_x),
-                           _num(_sigma_p_of(c, "cat", hbar)))
-                        for j, c in enumerate(comps))
+        klabel = _vec(["σ%s" % l for l in labels[nd:]], sep=",")
+        sig = ", ".join(
+            "σ%d = %s (%s = %s)"
+            % (j + 1, _vec([_num(s) for s in c.sigma_q]), klabel,
+               _vec([_num(s) for s in _sigma_k_of(c, "cat", hbar)]))
+            for j, c in enumerate(comps))
         lines.append("    with %s;  S = ⟨ψ|ψ⟩ (analytic normalization)" % sig)
         return lines
 
     wtot = sum(c.weight for c in comps)
     terms = []
     for c in comps:
-        sp = _sigma_p_of(c, "mixture", hbar)
-        amp = c.weight/(wtot*2.*3.141592653589793*c.sigma_x*sp)
-        terms.append("%s·exp(−(%s)²/(2·%s²) − (%s)²/(2·%s²))"
-                     % (_num(amp), _shift("x", c.x0), _num(c.sigma_x),
-                        _shift("p", c.p0), _num(sp)))
-    return ["IC (Gaussian mixture):  W(x,p,0) = ",
+        sk = _sigma_k_of(c, "mixture", hbar)
+        amp = c.weight/wtot
+        for i in range(nd):
+            amp /= 2.*3.141592653589793*c.sigma_q[i]*sk[i]
+        parts = []
+        for i in range(nd):
+            parts.append("(%s)²/(2·%s²)" % (_shift(labels[i], c.q0[i]),
+                                            _num(c.sigma_q[i])))
+            parts.append("(%s)²/(2·%s²)" % (_shift(labels[nd + i], c.k0[i]),
+                                            _num(sk[i])))
+        terms.append("%s·exp(−%s)" % (_num(amp), " − ".join(parts)))
+    return ["IC (Gaussian mixture):  W(%s,0) = " % args,
             "    " + "  +  ".join(terms)]
 
 
@@ -128,11 +167,12 @@ def param_lines(cfg, param_log=(), k0=None, k1=None):
     frames that follow it."""
     st = state_at(cfg, param_log, k0)
     at = lambda f: st.get(f, getattr(cfg, f))
+    nd = cfg.grid.ndim
     # label the fields exactly as the UI does: ℏ (not hbar_eff — the Physics
     # panel calls it ℏ). The mode's wire value ("batch"/"interactive") is also
     # its display label, so no remapping is needed.
     lines = [
-        "U(x) = %s" % at("potential"),
+        "U(%s) = %s" % (",".join(_ax_labels(nd)[:nd]), at("potential")),
         "m = %s   c = %s   ℏ = %s   tol = %s"
         % (_num(at("mass")), _num(at("c")), _num(at("hbar_eff")),
            _num(at("tol"))),
@@ -155,7 +195,8 @@ def param_lines(cfg, param_log=(), k0=None, k1=None):
         before = e.get("before") or {}
         parts = []
         for field, v in e["applied"].items():
-            label = FIELD_LABEL.get(field, field)
+            label = ("U(%s)" % ",".join(_ax_labels(nd)[:nd]) if field == "U"
+                     else FIELD_LABEL.get(field, field))
             if field in before:
                 parts.append("%s %s → %s" % (label, _value(field, before[field]),
                                              _value(field, v)))

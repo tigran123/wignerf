@@ -21,7 +21,7 @@ from core.xp import ArrayBackend
 
 DEVICE = os.environ.get("WIGNERF_GPU_DEVICE", "cuda:1")
 
-HARMONIC = dict(U=lambda x: x**2/2., dUdx=lambda x: x)
+HARMONIC = dict(U=lambda x: x**2/2., gradU=(lambda x: x,))
 IC = [GaussianComponent(2.0, 0.0, 0.707, 0.707)]
 
 
@@ -35,9 +35,9 @@ def gb():
 
 def _evolve(backend, nsteps, N=256, dt=0.01):
     with backend.device():
-        g = Grid(-6.0, 6.0, N, -7.0, 7.0, N, backend)
+        g = Grid.from_1d(-6.0, 6.0, N, -7.0, 7.0, N, backend)
         prop = Propagator(g, quantum=True, **HARMONIC)
-        W = g.shift2d(mixture_wigner(g, IC))
+        W = g.shift(mixture_wigner(g, IC))
         expU, expT = prop.exponents(dt)
         for _ in range(nsteps):
             W = prop.solve_spectral(W, expU, expT)
@@ -54,8 +54,8 @@ def test_cpu_gpu_parity(gb):
 
 def test_gpu_quantize_roundtrip(gb):
     with gb.device():
-        g = Grid(-6.0, 6.0, 128, -7.0, 7.0, 128, gb)
-        W = g.shift2d(mixture_wigner(g, IC))
+        g = Grid.from_1d(-6.0, 6.0, 128, -7.0, 7.0, 128, gb)
+        W = g.shift(mixture_wigner(g, IC))
         wq, wmin, wmax = quantize(W, gb)
     assert isinstance(wq, np.ndarray) and wq.dtype == np.uint16
     Wd = dequantize(wq, wmin, wmax)

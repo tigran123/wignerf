@@ -29,11 +29,11 @@ def backend():
 
 @pytest.fixture(scope="module")
 def grid(backend):
-    return Grid(-6.0, 6.0, 64, -7.0, 7.0, 64, backend)
+    return Grid.from_1d(-6.0, 6.0, 64, -7.0, 7.0, 64, backend)
 
 
 def harmonic():
-    return dict(U=lambda x: x**2/2., dUdx=lambda x: x)
+    return dict(U=lambda x: x**2/2., gradU=(lambda x: x,))
 
 
 def coherent_w0(grid):
@@ -78,7 +78,7 @@ def test_quantum_equals_classical_exponents(grid):
 def test_quantum_equals_classical_evolution(grid):
     q = Propagator(grid, quantum=True, **harmonic())
     c = Propagator(grid, quantum=False, **harmonic())
-    W0 = grid.shift2d(coherent_w0(grid))
+    W0 = grid.shift(coherent_w0(grid))
     Wq = evolve(q, W0, 0.01, 200)
     Wc = evolve(c, W0, 0.01, 200)
     assert float(np.max(np.abs(Wq - Wc))) < 1e-10
@@ -86,7 +86,7 @@ def test_quantum_equals_classical_evolution(grid):
 
 def test_norm_conserved(grid):
     prop = Propagator(grid, quantum=True, **harmonic())
-    W0 = grid.shift2d(coherent_w0(grid))
+    W0 = grid.shift(coherent_w0(grid))
     n0 = float(W0.sum())*grid.dx*grid.dp
     W = evolve(prop, W0, 0.01, 200)
     n = float(W.sum())*grid.dx*grid.dp
@@ -98,7 +98,7 @@ def test_coherent_state_revival(grid):
     (up to 2nd-order splitting error)."""
     prop = Propagator(grid, quantum=True, **harmonic())
     W0n = coherent_w0(grid)
-    W0 = grid.shift2d(W0n)
+    W0 = grid.shift(W0n)
     n = 2000
     W = evolve(prop, W0, 2.*pi/n, n)
     rel_l1 = float(np.sum(np.abs(W - W0)))/float(np.sum(np.abs(W0)))
@@ -108,7 +108,7 @@ def test_coherent_state_revival(grid):
 def test_center_follows_classical_trajectory(grid):
     """At t = pi/2 the packet centre must sit at (x, p) = (0, -2)."""
     prop = Propagator(grid, quantum=True, **harmonic())
-    W = evolve(prop, grid.shift2d(coherent_w0(grid)), (pi/2.)/500, 500)
+    W = evolve(prop, grid.shift(coherent_w0(grid)), (pi/2.)/500, 500)
     obs = observables.compute(W, prop)
     assert abs(obs.x_mean - 0.0) < 1e-3
     assert abs(obs.p_mean - (-2.0)) < 1e-3
@@ -120,7 +120,7 @@ def test_time_reversal(grid):
     # 600 steps. The bound is set well above that but far below any
     # physical signal.
     prop = Propagator(grid, quantum=True, **harmonic())
-    W0 = grid.shift2d(coherent_w0(grid))
+    W0 = grid.shift(coherent_w0(grid))
     W = evolve(prop, W0, 0.01, 300)
     W = evolve(prop, W, -0.01, 300)
     assert float(np.max(np.abs(W - W0))) < 1e-7
@@ -128,7 +128,7 @@ def test_time_reversal(grid):
 
 def test_energy_flat(grid):
     prop = Propagator(grid, quantum=True, **harmonic())
-    W = grid.shift2d(coherent_w0(grid))
+    W = grid.shift(coherent_w0(grid))
     E0 = observables.compute(W, prop).E
     # Coherent state at (2,0): E = (x0^2+p0^2)/2 + hbar*omega/2 = 2.5
     assert abs(E0 - 2.5) < 1e-6
@@ -142,7 +142,7 @@ def test_observables_shift_consistency(grid, backend):
     bugs, the likeliest porting error)."""
     prop = Propagator(grid, quantum=True, **harmonic())
     Wn = coherent_w0(grid)
-    obs = observables.compute(grid.shift2d(Wn), prop)
+    obs = observables.compute(grid.shift(Wn), prop)
 
     x = backend.asnumpy(grid.xv)[:, None]
     p = backend.asnumpy(grid.pv)[None, :]
@@ -164,7 +164,7 @@ def test_relativistic_matches_nonrel_at_large_c(grid):
     precision to cancellation — deliberate choice, do not 'strengthen'.)"""
     nr = Propagator(grid, quantum=True, relativistic=False, **harmonic())
     re = Propagator(grid, quantum=True, relativistic=True, c=1e4, **harmonic())
-    W0 = grid.shift2d(coherent_w0(grid))
+    W0 = grid.shift(coherent_w0(grid))
     Wn = evolve(nr, W0, 0.01, 100)
     Wr = evolve(re, W0, 0.01, 100)
     assert float(np.max(np.abs(Wn - Wr))) < 1e-6
@@ -177,8 +177,8 @@ def test_hbar_eff_to_zero_is_classical_limit(grid):
     """For anharmonic U = x^4/4 the Moyal corrections are O(hbar_eff^2):
     shrinking hbar_eff must drive the quantum evolution toward the
     classical one for the SAME (positive) Cauchy data."""
-    quartic = dict(U=lambda x: x**4/4., dUdx=lambda x: x**3)
-    W0 = grid.shift2d(mixture_wigner(
+    quartic = dict(U=lambda x: x**4/4., gradU=(lambda x: x**3,))
+    W0 = grid.shift(mixture_wigner(
         grid, [GaussianComponent(1.5, 0.0, 0.7, 0.7)]))
     Wc = evolve(Propagator(grid, quantum=False, **quartic), W0, 0.002, 250)
 
@@ -194,14 +194,14 @@ def test_hbar_eff_to_zero_is_classical_limit(grid):
 def test_adjust_step_shrinks_dt(grid):
     """A deliberately huge dt must be shrunk by the adaptive controller."""
     prop = Propagator(grid, quantum=True, tol=1e-3, **harmonic())
-    W0 = grid.shift2d(coherent_w0(grid))
+    W0 = grid.shift(coherent_w0(grid))
     _, dt, _, _ = prop.adjust_step(1.0, W0)
     assert 0 < dt < 1.0
 
 
 def test_adjust_step_negative_dt(grid):
     prop = Propagator(grid, quantum=True, tol=1e-3, **harmonic())
-    W0 = grid.shift2d(coherent_w0(grid))
+    W0 = grid.shift(coherent_w0(grid))
     _, dt, _, _ = prop.adjust_step(-1.0, W0)
     assert -1.0 < dt < 0
 
@@ -212,7 +212,7 @@ def _shear_diag(grid, dt, T, **kw):
     drift|) — the three numbers that separate anharmonic shear from numerics."""
     prop = Propagator(grid, **harmonic(), **kw)
     expU, expT = prop.exponents(dt)
-    W = grid.shift2d(coherent_w0(grid))
+    W = grid.shift(coherent_w0(grid))
     excess, E, gamma = [], [], []
     for i in range(int(T/dt)):
         W = prop.solve_spectral(W, expU, expT)

@@ -9,7 +9,7 @@
 
 import { ref, shallowRef } from 'vue'
 import { api } from '../api'
-import type { GridCfg } from '../lib/config'
+import type { GeomCfg } from '../lib/config'
 import { perfDrop, perfFrame, perfMsg, perfStage } from '../lib/perf'
 import { decodeFrame, type Frame } from '../lib/protocol'
 
@@ -22,9 +22,17 @@ export interface VariantStatus {
 }
 
 export interface BoundaryState {
+  /** names of the axes whose edge band is over threshold ('x', 'py', ...) */
   axes: string[]
-  x_mass: number
-  p_mass: number
+  /** edge-band mass per axis, keyed by axis name */
+  mass: Record<string, number>
+  /** band WIDTH in cells per side, per axis — quoted by the warning. Server-
+   *  supplied on purpose: re-deriving boundary.edge_band here would let the
+   *  rule drift from the one the mass was measured with. */
+  band?: Record<string, number>
+  // the flat 1D spelling rides along at ndim=1 (see session.grid_payload)
+  x_mass?: number
+  p_mass?: number
 }
 
 /** Server 'boundary' event: W's support entered the edge band. */
@@ -42,7 +50,7 @@ export interface RegridEvent {
   at_record: number
   epoch: number
   kind: Record<string, 'move' | 'double'>
-  grid: GridCfg
+  grid: GeomCfg
 }
 
 /** Server 'params_applied' event: the fields that ACTUALLY changed at the
@@ -79,7 +87,11 @@ export interface SessionStatus {
   hbar_eff: number
   tol: number
   // live grid (auto-expand regrids move it away from the setup form's)
-  grid: GridCfg
+  ndim: number
+  grid: GeomCfg
+  max_cells: number | null
+  /** device bytes per cell per worker, 2D only — for the footprint estimate */
+  bytes_per_cell: number | null
   auto_expand: boolean
   max_grid: number
   // restart-only, so this is the run's own precision — the header badges
@@ -119,8 +131,11 @@ export interface ProgressEvent {
   // computed them), so the control bar's E / ΔX·ΔP / γ stay live through a
   // batch run that streams no frames. Absent until the first record lands.
   per_variant: { variant: string; steps_per_sec: number; steps_total: number
-                 E?: number; x_std?: number; p_std?: number
-                 purity?: number }[]
+                 E?: number; purity?: number; lz?: number
+                 /** per phase-space axis; std[i]*std[ndim+i] is dimension i */
+                 mean?: number[]; std?: number[]
+                 // the flat 1D spelling rides along at ndim=1
+                 x_std?: number; p_std?: number }[]
 }
 
 export interface SessionInfo {

@@ -27,6 +27,7 @@ from math import pi, sqrt
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from core import boundary, describe, observables
 from core.grid import Grid, embed_window
@@ -37,16 +38,16 @@ from core.xp import ArrayBackend
 from main import app
 
 SIG = 1.0/sqrt(2.0)
-HARMONIC = dict(U=lambda x: x**2/2., dUdx=lambda x: x)
+HARMONIC = dict(U=lambda x: x**2/2., gradU=(lambda x: x,))
 
 
 def _grid(precision, n=64):
-    return Grid(-6.0, 6.0, n, -7.0, 7.0, n,
+    return Grid.from_1d(-6.0, 6.0, n, -7.0, 7.0, n,
                 ArrayBackend(device="cpu", precision=precision))
 
 
 def _coherent(grid):
-    return grid.shift2d(mixture_wigner(grid, [GaussianComponent(2.0, 0.0, SIG, SIG)]))
+    return grid.shift(mixture_wigner(grid, [GaussianComponent(2.0, 0.0, SIG, SIG)]))
 
 
 def _evolve(prop, W, dt, nsteps):
@@ -78,7 +79,7 @@ def test_exponent_construction_stays_double(quantum, relativistic):
         props[precision] = Propagator(g, quantum=quantum,
                                       relativistic=relativistic, **HARMONIC)
     a, b = props["float64"], props["float32"]
-    for name in ("dU_im", "dT_im", "H"):
+    for name in ("dU_im", "dT_im", "U_mesh", "T_mesh"):
         assert getattr(b, name).dtype == np.float64, name
         assert np.array_equal(getattr(a, name), getattr(b, name)), name
 
@@ -98,11 +99,10 @@ def test_regrid_keeps_the_working_dtype():
     """embed_window must not upcast a float32 state back to float64 — that
     would silently double the working set at exactly the moment (auto-expand)
     the domain just got bigger."""
-    from dataclasses import replace
     from core.grid import GridState
-    old = GridState(x0=-6.0, p0=-7.0, dx=12.0/64, dp=14.0/64,
-                    ox=0, op=0, Nx=64, Np=64)
-    new = replace(old, ox=-32, Nx=128)          # doubled along x, support centred
+    old = GridState.from_1d(x0=-6.0, p0=-7.0, dx=12.0/64, dp=14.0/64,
+                            ox=0, op=0, Nx=64, Np=64)
+    new = old.moved(0, -32, 128)                # doubled along x, support centred
     for dtype in (np.float64, np.float32):
         Wn = np.ones((64, 64), dtype=dtype)
         out = embed_window(Wn, old, new, np)
@@ -128,8 +128,8 @@ def test_float32_really_is_single_precision():
     assert W.dtype == np.float32
     if g.backend.fft_provider == "pyfftw":
         probe = np.zeros((64, 64), dtype=np.complex64)
-        assert prop._fft0(probe).dtype == np.complex64
-        assert prop._ifft1(probe).dtype == np.complex64
+        assert prop._fft_sp(probe).dtype == np.complex64
+        assert prop._ifft_mo(probe).dtype == np.complex64
 
 
 def test_float64_is_the_default():
@@ -141,14 +141,41 @@ def test_host_precision_is_the_schema_default(monkeypatch):
     """WIGNERF_PRECISION must actually DRIVE the default, not merely be
     advertised. It was decorative once: `/api/device` reported float32 while
     every session that omitted the field was built with a hard-coded float64,
-    so the setting silently did nothing."""
+    so the setting silently did nothing.
+
+    Both baselines are pinned with monkeypatch rather than assumed: run the
+    suite ON a float32 host (WIGNERF_PRECISION=float32, which this project
+    supports) and a test that reads the ambient default fails for a reason that
+    has nothing to do with what it is checking."""
     import config
     from core.protocol import SessionCreate
+    monkeypatch.setattr(config, "PRECISION", "float64")
     assert SessionCreate(**_cfg()).precision == "float64"
     monkeypatch.setattr(config, "PRECISION", "float32")
     assert SessionCreate(**_cfg()).precision == "float32"
     # an explicit choice still wins over the host's
     assert SessionCreate(**_cfg(precision="float64")).precision == "float64"
+
+
+def test_the_host_default_never_resolves_to_a_precision_2d_refuses(monkeypatch):
+    """The resolution rule, in the one place it is written down. float32 is
+    refused at ndim=2 (M1), so the host default cannot be applied there — a
+    default is not a request, and resolving one straight into a gate refused
+    every 2D session on a float32 host over a value the client never sent."""
+    import config
+    from core.protocol import SessionCreate, MSG_F32_2D
+    monkeypatch.setattr(config, "PRECISION", "float32")
+    g2 = {"ndim": 2, "axes": [{"lo": -6.0, "hi": 6.0, "N": 16}]*2
+                             + [{"lo": -7.0, "hi": 7.0, "N": 16}]*2}
+    ic2 = {"type": "mixture", "components": [
+        {"q0": [1.0, 0.0], "k0": [0.0, 0.0],
+         "sigma_q": [0.7, 0.7], "sigma_k": [0.7, 0.7]}]}
+    two_d = _cfg(grid=g2, ic=ic2, potential="(x^2+y^2)/2")
+    assert SessionCreate(**two_d).precision == "float64"
+    # ...and an EXPLICIT float32 there is still refused, by name
+    with pytest.raises(ValidationError) as e:
+        SessionCreate(**dict(two_d, precision="float32"))
+    assert MSG_F32_2D[:40] in str(e.value)
 
 
 def test_bad_host_precision_falls_back_to_float64(monkeypatch):
@@ -209,7 +236,7 @@ def test_float32_drift_is_bounded_and_worse_than_float64():
 
 
 def _centered(g):
-    return g.shift2d(mixture_wigner(g, [GaussianComponent(0.0, 0.0, SIG, SIG)]))
+    return g.shift(mixture_wigner(g, [GaussianComponent(0.0, 0.0, SIG, SIG)]))
 
 
 def test_float32_noise_reaches_the_float64_edge_trigger():
@@ -226,7 +253,7 @@ def test_float32_noise_reaches_the_float64_edge_trigger():
         g = _grid(precision, n=256)
         prop = Propagator(g, quantum=True, **HARMONIC)
         obs = observables.compute(_evolve(prop, _centered(g), 0.01, 600), prop)
-        es = boundary.edge_report(obs.rho, obs.phi, g.dx, g.dp, precision)
+        es = boundary.edge_report(obs.marg, g.d, precision)
         masses[precision] = max(es.x_mass, es.p_mass)
         # whatever the noise, the SESSION's own threshold must stay quiet —
         # a permanent boundary alarm on a contained state is a broken warning

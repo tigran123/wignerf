@@ -32,13 +32,17 @@ import time
 import uuid
 import weakref
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
+import config
+
+from . import axes as axes_mod
 from . import boundary, videoexport
 from .grid import GridState
 from .history import FrameHistory
 from .potential import PotentialError, compile_potential
-from .protocol import MSG_EXPAND_F32, MSG_TOL_F32, TOL_MIN_F32, VARIANTS
+from .protocol import (MSG_EXPAND_2D, MSG_EXPAND_F32, MSG_TOL_F32,
+                       TOL_MIN_F32, VARIANTS)
 from .worker import SolverWorker
 from .xp import resolve_devices
 
@@ -95,6 +99,36 @@ class RegridPlan:
     epoch: int
     k_star: int
     state: GridState
+
+
+def grid_payload(state):
+    """A GridState (or Grid) as the status/regrid JSON fact. Carries the
+    generic per-axis tuples AND, at ndim=1, the flat x/p spelling the SPA has
+    always read — so the wire stays compatible while both sides are
+    generalized."""
+    lo, hi, N = state.lo, state.hi, state.N
+    d = {"ndim": state.ndim, "lo": list(lo), "hi": list(hi), "N": list(N),
+         "labels": list(axes_mod.labels(state.ndim))}
+    if state.ndim == 1:
+        d.update(x1=lo[0], x2=hi[0], Nx=N[0], p1=lo[1], p2=hi[1], Np=N[1])
+    return d
+
+
+def _edge_state(mass, axes, band=None):
+    """Boundary-watch fact: the per-axis edge-band mass keyed by axis name,
+    plus the tripped names. x_mass/p_mass ride along at ndim=1 for the same
+    reason grid_payload keeps x1/x2.
+
+    `band` is the per-axis band WIDTH in cells per side. It travels on the wire
+    so the warning can say "the outer 4 cells" without the frontend
+    re-implementing boundary.edge_band — a rule that would then be free to drift
+    from the one the number was actually measured with."""
+    d = {"axes": axes, "mass": mass}
+    if band is not None:
+        d["band"] = band
+    if len(mass) == 2:
+        d.update(x_mass=mass["x"], p_mass=mass["p"])
+    return d
 
 
 def assign_devices(variant_keys, devices):
@@ -265,7 +299,8 @@ class SessionClock:
 
 class SimSession:
     def __init__(self, cfg, compiled_potential, loop, device, fft_threads,
-                 history_bytes, max_grid=4096, history_mb_max=None):
+                 history_bytes, max_grid=4096, history_mb_max=None,
+                 max_cells=None):
         self.id = uuid.uuid4().hex[:12]
         self.cfg = cfg
         self.compiled_potential = compiled_potential
@@ -279,14 +314,23 @@ class SimSession:
         # toggleable like tol (session-level policy, no worker involvement)
         self.auto_expand = cfg.auto_expand
         self.max_grid = int(max_grid)
+        # total-cell ceiling; None at ndim=1, where max_grid already bounds it
+        self.max_cells = None if max_cells is None else int(max_cells)
         # the host's history ceiling, reported so the Setup panel can bound its
         # own field the way max_grid bounds the Nx/Np selects
         self.history_mb_max = int(history_mb_max if history_mb_max is not None
                                   else history_bytes//(1024*1024))
+        self.ndim = cfg.grid.ndim
+        self.axis_labels = axes_mod.labels(self.ndim)
         self._edge_lock = threading.Lock()
         self._edge = {}              # slot -> latest EdgeState
         self._edge_posted = []       # axes signature of the last boundary msg
-        self.boundary_state = {"axes": [], "x_mass": 0.0, "p_mass": 0.0}
+        # Per-slot debounce state for that signature: {slot: (up, down, on)},
+        # counters per axis. A slot reports once per record, so counting its own
+        # calls counts records — which is why this is per slot and not on the
+        # aggregate (a 4-variant session calls report_edge four times a record).
+        self._edge_runs = {}
+        self.boundary_state = _edge_state({l: 0.0 for l in self.axis_labels}, [])
         # live grid window on the frozen lattice; regrids replace it at
         # commit time (workers switch their propagators at plan.k_star)
         self.grid_state = GridState.from_spec(cfg.grid)
@@ -333,6 +377,46 @@ class SimSession:
         self.post_msg({"type": "error", "message": message, "detail": detail})
 
     # thread-safe: called from worker threads after every record
+    def _confirm_edge(self, slot, edge):
+        """This slot's CONFIRMED tripped axes: an axis is admitted only after
+        boundary.EDGE_CONFIRM consecutive records over its floor and dropped
+        only after that many consecutive records under it.
+
+        Without this, a band mass sitting in its own numerical noise flips the
+        signature every record or two and the UI's warning strobes — measured 79
+        state changes in a 201-record 32^4 run, and 243 WS events in 25 s in a
+        browser, which moved the W panels by a header line every time. The delay
+        is free for real physics: an approach to the edge grows monotonically
+        over tens of records, so it is announced 3 records later, while noise
+        (whose sign flips) essentially never survives four in a row. See
+        boundary.py's docstring for the measured table.
+        """
+        n = len(self.axis_labels)
+        hot = set(edge.tripped)
+        if slot not in self._edge_runs:
+            # The FIRST reading is taken as measured, not confirmed: an IC that
+            # starts at the edge must warn at its first record rather than four
+            # records later (a paused session may only ever have that one). It
+            # is only a CHANGE from it that has to be confirmed — which is what
+            # strobes, and which record 0 never does (measured band mass 3.2e-8
+            # at 32^4, three orders under the trigger, because the noise this
+            # gate exists for is generated by the EVOLUTION, not by the IC).
+            self._edge_runs[slot] = ([0]*n, [0]*n, set(hot))
+            return self._edge_runs[slot][2]
+        up, down, on = self._edge_runs[slot]
+        for a in range(n):
+            if a in hot:
+                up[a] += 1
+                down[a] = 0
+                if up[a] >= boundary.EDGE_CONFIRM:
+                    on.add(a)
+            else:
+                down[a] += 1
+                up[a] = 0
+                if down[a] >= boundary.EDGE_CONFIRM:
+                    on.discard(a)
+        return on
+
     def report_edge(self, slot, k, edge):
         """Aggregate per-variant edge-band state; post a 'boundary' event
         only when the set of tripped axes changes (never per-record spam —
@@ -341,16 +425,23 @@ class SimSession:
         record until a plan commits or the state clears)."""
         with self._edge_lock:
             self._edge[slot] = edge
-            axes = sorted({a for e in self._edge.values() for a in e.axes})
-            x_mass = max(e.x_mass for e in self._edge.values())
-            p_mass = max(e.p_mass for e in self._edge.values())
-            self.boundary_state = {"axes": axes, "x_mass": x_mass,
-                                   "p_mass": p_mass}
+            self._confirm_edge(slot, edge)
+            # union over variants of each one's CONFIRMED axes
+            axes = sorted({self.axis_labels[a]
+                           for _, _, on in self._edge_runs.values()
+                           for a in on})
+            mass = {self.axis_labels[a]:
+                    max(e.mass[a] for e in self._edge.values())
+                    for a in range(len(self.axis_labels))}
+            # the band is a property of the LIVE window (it is N/32 per axis, so
+            # a regrid changes it), and it is what the warning quotes
+            band = {self.axis_labels[a]: boundary.edge_band(n)
+                    for a, n in enumerate(self.grid_state.N)}
+            self.boundary_state = _edge_state(mass, axes, band)
             if axes != self._edge_posted:
                 self._edge_posted = axes
-                self.post_msg({"type": "boundary", "record": k, "axes": axes,
-                               "x_mass": x_mass, "p_mass": p_mass,
-                               "action": "warn"})
+                self.post_msg({"type": "boundary", "record": k,
+                               "action": "warn", **self.boundary_state})
             if not axes:
                 self._capped_posted = False
                 self._invalid_posted = False
@@ -371,9 +462,9 @@ class SimSession:
             return self._regrid_plan
 
     def validation_grid(self):
-        """Duck-typed grid (.x1/.x2/.x_extended) for live-U validity checks:
-        the live window, unioned with the pre-regrid one while a plan is
-        pending (the old window keeps evolving until k_star)."""
+        """GridState for live-U validity checks: the live window, unioned with
+        the pre-regrid one while a plan is pending (the old window keeps
+        evolving until k_star)."""
         with self._edge_lock:
             gs = self.grid_state
             if self._plan_pending() and self._prev_grid_state is not None:
@@ -382,11 +473,14 @@ class SimSession:
 
     def _potential_invalid(self, expr, win, hbar_eff):
         """Probe expr's validity for the active variant families on the
-        window `win` (its extended Bopp range under `hbar_eff`). Returns a
+        window `win` (its extended Bopp box under `hbar_eff`). Returns a
         reason string, or None when valid."""
+        nd = win.ndim
         try:
-            cp = compile_potential(expr, x_range=(win.x1, win.x2),
-                                   x_extended=win.x_extended(hbar_eff))
+            cp = compile_potential(
+                expr, ndim=nd,
+                ranges=tuple((win.lo[a], win.hi[a]) for a in range(nd)),
+                extended=win.extended(hbar_eff)[:nd])
         except PotentialError as e:
             return str(e)
         needs_q = any(VARIANTS[v]["quantum"] for v in self.cfg.variants)
@@ -414,39 +508,34 @@ class SimSession:
             _t, geom, frames = rec
             if geom != gs.geom():
                 return                 # regrid landed under us: retry later
-            sx = [boundary.support_cells(vf.rho, gs.dx) for vf in frames]
-            sp = [boundary.support_cells(vf.phi, gs.dp) for vf in frames]
-            lo_x, hi_x = min(a for a, _ in sx), max(b for _, b in sx)
-            lo_p, hi_p = min(a for a, _ in sp), max(b for _, b in sp)
-            x_plan = boundary.plan_axis(gs.ox, gs.Nx, lo_x, hi_x,
-                                        self.max_grid) if "x" in axes else None
-            p_plan = boundary.plan_axis(gs.op, gs.Np, lo_p, hi_p,
-                                        self.max_grid) if "p" in axes else None
+            labels = self.axis_labels
             new, kinds, capped = gs, {}, []
-            for ax, pl in (("x", x_plan), ("p", p_plan)):
-                if pl is None:
+            for a in range(gs.n_axes):
+                if labels[a] not in axes:
                     continue
+                sup = [boundary.support_cells(vf.marg[a], gs.d[a])
+                       for vf in frames]
+                pl = boundary.plan_axis(gs.offset[a], gs.N[a],
+                                        min(s[0] for s in sup),
+                                        max(s[1] for s in sup), self.max_grid)
                 if pl.kind == "capped":
-                    capped.append(ax)
-                elif ax == "x":
-                    new = replace(new, ox=pl.offset, Nx=pl.n)
-                    kinds["x"] = pl.kind
+                    capped.append(labels[a])
                 else:
-                    new = replace(new, op=pl.offset, Np=pl.n)
-                    kinds["p"] = pl.kind
+                    new = new.moved(a, pl.offset, pl.n)
+                    kinds[labels[a]] = pl.kind
             if capped and not self._capped_posted:
                 self._capped_posted = True
                 self.post_msg({"type": "boundary", "record": k,
-                               "axes": capped, "action": "capped",
-                               "max_grid": self.max_grid,
-                               "x_mass": self.boundary_state["x_mass"],
-                               "p_mass": self.boundary_state["p_mass"]})
+                               "action": "capped", "max_grid": self.max_grid,
+                               **{**self.boundary_state, "axes": capped}})
             if new == gs:
                 return
-            if (new.ox, new.Nx) != (gs.ox, gs.Nx):
-                # the extended Bopp range moves with the x-window (dp is
-                # frozen, so its half-width never changes): revalidate U on
-                # the union of old and new windows BEFORE committing
+            if any(new.offset[a] != gs.offset[a] or new.N[a] != gs.N[a]
+                   for a in range(gs.ndim)):
+                # the extended Bopp box moves with the SPATIAL windows (the
+                # momentum cell sizes are frozen, so its half-widths never
+                # change): revalidate U on the union of old and new windows
+                # BEFORE committing
                 reason = self._potential_invalid(self.cfg.potential,
                                                  gs.union(new),
                                                  self.cfg.hbar_eff)
@@ -454,11 +543,9 @@ class SimSession:
                     if not self._invalid_posted:
                         self._invalid_posted = True
                         self.post_msg({"type": "boundary", "record": k,
-                                       "axes": axes,
                                        "action": "invalid_potential",
                                        "message": "cannot expand: %s" % reason,
-                                       "x_mass": self.boundary_state["x_mass"],
-                                       "p_mass": self.boundary_state["p_mass"]})
+                                       **self.boundary_state})
                     return
             k_star = max(self.history.variant_frontier(s)
                          for s in range(len(self.workers))) + 2
@@ -469,11 +556,9 @@ class SimSession:
                                                   k_star, new)
             self.post_msg({"type": "regrid", "at_record": plan.k_star,
                            "epoch": plan.epoch, "kind": kinds,
-                           "grid": {"x1": new.x1, "x2": new.x2, "Nx": new.Nx,
-                                    "p1": new.p1, "p2": new.p2, "Np": new.Np}})
-        log.info("session %s: regrid epoch %d at record %d: %s -> "
-                 "[%g, %g]x[%g, %g] %dx%d", self.id, plan.epoch, plan.k_star,
-                 kinds, new.x1, new.x2, new.p1, new.p2, new.Nx, new.Np)
+                           "grid": grid_payload(new)})
+        log.info("session %s: regrid epoch %d at record %d: %s -> %s",
+                 self.id, plan.epoch, plan.k_star, kinds, new.describe())
         self.clock.kick()
 
     # called from the router/streamer coroutines
@@ -516,6 +601,15 @@ class SimSession:
         if new.get("auto_expand") and self.cfg.precision == "float32":
             self.post_msg({"type": "error", "code": "bad_auto_expand",
                            "message": MSG_EXPAND_F32})
+            new.pop("auto_expand")
+            old.pop("auto_expand")
+        # ...and for exactly the same reason in 2D: the create-time refusal
+        # (milestone M3) is otherwise two clicks away, and what it prevents —
+        # a 4-axis planner with no memory guard doubling a multi-GiB footprint
+        # — reads as the solver dying, not as a setting.
+        if new.get("auto_expand") and self.ndim > 1:
+            self.post_msg({"type": "error", "code": "bad_auto_expand",
+                           "message": MSG_EXPAND_2D})
             new.pop("auto_expand")
             old.pop("auto_expand")
         if not new:
@@ -643,10 +737,15 @@ class SimSession:
             "c": self.cfg.c,
             "hbar_eff": self.cfg.hbar_eff,
             "tol": self.cfg.tol,
-            "grid": {"x1": gs.x1, "x2": gs.x2, "Nx": gs.Nx,
-                     "p1": gs.p1, "p2": gs.p2, "Np": gs.Np},
+            "grid": grid_payload(gs),
+            "ndim": self.ndim,
             "auto_expand": self.auto_expand,
             "max_grid": self.max_grid,
+            "max_cells": self.max_cells,
+            # device bytes per grid cell per worker, so the Setup panel can
+            # show a footprint before a restart rather than after an OOM
+            "bytes_per_cell": (config.BYTES_PER_CELL_2D if self.ndim > 1
+                               else None),
             # restart-only, so this is the run's own precision, not a live
             # value that can drift from the form. The SPA badges float32.
             "precision": self.cfg.precision,
@@ -691,11 +790,11 @@ class SimSession:
 
 
 def create_session(cfg, compiled_potential, device, fft_threads, history_bytes,
-                   max_grid=4096, history_mb_max=None):
+                   max_grid=4096, history_mb_max=None, max_cells=None):
     loop = asyncio.get_running_loop()
     s = SimSession(cfg, compiled_potential, loop, device, fft_threads,
                    history_bytes, max_grid=max_grid,
-                   history_mb_max=history_mb_max)
+                   history_mb_max=history_mb_max, max_cells=max_cells)
     with _LOCK:
         SESSIONS[s.id] = s
     s.start()

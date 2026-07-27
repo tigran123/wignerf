@@ -20,7 +20,7 @@
  *   uC = the color scale — equal to uQ when autoscaling, or a locked pair.
  */
 
-import type { VariantFrame } from '../lib/protocol'
+import type { PlaneFrame } from '../lib/protocol'
 import { bwrLUT } from '../lib/colormaps'
 import { perfInfo, perfStage } from '../lib/perf'
 
@@ -182,18 +182,23 @@ export class WignerRenderer {
     this.np = Np
   }
 
-  /** Upload one variant's quantized W. wq is (Nx, Np) row-major, i.e. the
-   *  texture is Np wide (p) and Nx tall (x). */
-  upload(v: VariantFrame, Nx: number, Np: number) {
+  /** Upload one quantized 2D plane. Its data is (na, nb) row-major, i.e. the
+   *  texture is nb wide (the plane's second axis) and na tall (its first).
+   *
+   *  This is why a 4D phase space needs no renderer change at all: a plane
+   *  reduction is exactly the 2D array a 1D W was, still fftshifted in both of
+   *  its own axes, so the shader's half-period unshift, the manual bilinear
+   *  and the periodic wrap all apply unaltered. */
+  upload(p: PlaneFrame) {
     const gl = this.gl
     if (!gl) return
     const t0 = performance.now()
-    this.ensureTexture(Nx, Np)
+    this.ensureTexture(p.na, p.nb)
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.texW)
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, Np, Nx,
-      gl.RED_INTEGER, gl.UNSIGNED_SHORT, v.wq)
-    this.q = [v.wmin, v.wmax]
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, p.nb, p.na,
+      gl.RED_INTEGER, gl.UNSIGNED_SHORT, p.data)
+    this.q = [p.wmin, p.wmax]
     perfStage('upload', performance.now() - t0)
   }
 

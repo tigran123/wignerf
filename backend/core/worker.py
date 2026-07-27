@@ -16,14 +16,14 @@ import threading
 import traceback
 from time import monotonic
 
-from . import boundary, initial, observables
+from . import boundary, frame, initial
 from .grid import GridState, embed_window
 from .propagator import Propagator
-from .protocol import VARIANTS, VariantFrame, variant_id
-from .quantize import quantize
+from .protocol import VARIANTS, variant_id
 from .xp import ArrayBackend
 
 log = logging.getLogger(__name__)
+
 
 
 class SolverWorker(threading.Thread):
@@ -121,22 +121,22 @@ class SolverWorker(threading.Thread):
             # dataclass arithmetic), so record geometry and lattice points
             # agree with the scheduler bitwise
             self._grid_state = GridState.from_spec(cfg.grid)
-            g, Wnat, _ = initial.from_spec(
+            g, Wnat, _, _ = initial.from_spec(
                 cfg.grid, cfg.ic, cfg.hbar_eff, backend,
                 grid=self._grid_state.make_grid(backend))
-            U, dUdx = self.session.compiled_potential.for_backend(backend)
+            U, gradU = self.session.compiled_potential.for_backend(backend)
             prop = Propagator(g, mass=cfg.mass, c=cfg.c, hbar_eff=cfg.hbar_eff,
-                              tol=cfg.tol, U=U, dUdx=dUdx, **self.flavor)
+                              tol=cfg.tol, U=U, gradU=gradU, **self.flavor)
             if not self._finite(prop, backend):
                 raise ValueError("non-finite propagator exponents "
-                                 "(check U(x), mass, c)")
+                                 "(check U, mass, c)")
             # The IC is built in float64 (initial.py is precision-independent);
             # adopt the working dtype HERE so record 0 is measured on the same
             # footing as every record after it. solve_spectral would do it at
             # step 1 anyway, which would leave record 0 — the Cauchy data every
             # later record is compared against — as the one frame with
             # double-precision observables.
-            W = g.shift2d(Wnat).astype(backend.real_dtype, copy=False)
+            W = g.shift(Wnat).astype(backend.real_dtype, copy=False)
             t = cfg.t1
             self.dt = cfg.record_dt/8.
             self._emit(0, t, W, prop, backend)      # record 0 = the Cauchy data
@@ -225,21 +225,15 @@ class SolverWorker(threading.Thread):
         return W, t_tgt    # land exactly on the record time (no drift)
 
     def _emit(self, k, t, W, prop, backend):
-        wq, wmin, wmax = quantize(W, backend)
-        obs = observables.compute(W, prop)
-        vf = VariantFrame(vid=variant_id(**self.flavor), wq=wq,
-                          wmin=wmin, wmax=wmax, E=obs.E,
-                          x_mean=obs.x_mean, x_std=obs.x_std,
-                          p_mean=obs.p_mean, p_std=obs.p_std,
-                          purity=obs.purity,
-                          dt=self.dt, rho=obs.rho, phi=obs.phi)
+        vf, obs = frame.build(W, prop.grid, prop.hbar_eff, prop=prop,
+                              dt=self.dt, vid=variant_id(**self.flavor))
         self.session.history.put(k, t, self.slot, vf, self._grid_state.geom())
-        # boundary watch every record: O(Nx+Np) host sums on the marginals
+        # boundary watch every record: O(sum N) host sums on the marginals
         # observables already brought over — no extra device sync
         self.session.report_edge(
             self.slot, k,
-            boundary.edge_report(obs.rho, obs.phi, prop.grid.dx, prop.grid.dp,
-                                 backend.precision))
+            boundary.edge_report(obs.marg, prop.grid.d, backend.precision,
+                                 labels=prop.grid.labels))
         self.session.notify_frame()
         # a landing record may open the skew gate for waiting siblings
         self.session.clock.kick()
@@ -258,22 +252,20 @@ class SolverWorker(threading.Thread):
         ever interpolated. The transform runs in natural order (the window
         overlap is contiguous there; fftshifted order would split it)."""
         old, new = self._grid_state, plan.state
-        Wnew = embed_window(prop.grid.unshift2d(W), old, new, backend.xp)
+        Wnew = embed_window(prop.grid.unshift(W), old, new, backend.xp)
         g = new.make_grid(backend)
         prop.set_grid(g)
         if not self._finite(prop, backend):
             # the session pre-validated U on the new window, so this is a
             # genuine invariant break -> the worker-death path pauses the run
             raise ValueError("non-finite propagator exponents after regrid "
-                             "to [%g, %g]x[%g, %g]"
-                             % (new.x1, new.x2, new.p1, new.p2))
+                             "to %s" % new.describe())
         self._grid_state = new
         self._exp_clear()
         self.force_adjust = True
-        log.info("%s: regrid epoch %d applied at k>=%d: [%g, %g]x[%g, %g] %dx%d",
-                 self.name, plan.epoch, plan.k_star,
-                 new.x1, new.x2, new.p1, new.p2, new.Nx, new.Np)
-        return g.shift2d(Wnew)
+        log.info("%s: regrid epoch %d applied at k>=%d: %s",
+                 self.name, plan.epoch, plan.k_star, new.describe())
+        return g.shift(Wnew)
 
     # -- commands -----------------------------------------------------------
 
@@ -285,13 +277,13 @@ class SolverWorker(threading.Thread):
                 return
             if cmd.get("kind") != "params":
                 continue
-            prev = dict(U=prop.U, dUdx=prop.dUdx, mass=prop.mass, c=prop.c,
+            prev = dict(U=prop.U, gradU=prop.gradU, mass=prop.mass, c=prop.c,
                         hbar_eff=prop.hbar_eff, tol=prop.tol)
             try:
                 kwargs = {}
                 if cmd.get("cp") is not None:
-                    U, dUdx = cmd["cp"].for_backend(backend)
-                    kwargs.update(U=U, dUdx=dUdx)
+                    U, gradU = cmd["cp"].for_backend(backend)
+                    kwargs.update(U=U, gradU=gradU)
                 for f in ("mass", "c", "hbar_eff", "tol"):
                     if cmd.get(f) is not None:
                         kwargs[f] = cmd[f]

@@ -164,20 +164,34 @@ function commitT() {
  * (which is already being sent), exactly as `t` does above. Without this the
  * readouts sat at "—" while the series plots two panels away were live.
  */
-const obs = computed<{ E: number; uncert: number; purity: number } | null>(() => {
+/** The uncertainty PRODUCT per spatial dimension: std[i]*std[ndim+i]. One
+ *  number in 1D, two in 2D — a single "ΔX·ΔP" would silently report only the
+ *  x dimension of a run where y is the interesting one. */
+function products(std: number[]): number[] {
+  const nd = std.length / 2
+  return Array.from({ length: nd }, (_, i) => std[i]! * std[nd + i]!)
+}
+
+const obs = computed<{ E: number; uncert: number[]; purity: number } | null>(() => {
   if (batchComputing.value) {
     const v = props.progress?.per_variant[0]
-    if (!v || v.E == null || v.x_std == null || v.p_std == null
-        || v.purity == null) return null
-    return { E: v.E, uncert: v.x_std*v.p_std, purity: v.purity }
+    if (!v || v.E == null || v.std == null || v.purity == null) return null
+    return { E: v.E, uncert: products(v.std), purity: v.purity }
   }
   const v = props.lastFrame?.variants[0]
-  return v ? { E: v.E, uncert: v.xStd*v.pStd, purity: v.purity } : null
+  return v ? { E: v.E, uncert: products(v.std), purity: v.purity } : null
 })
+const ndim = computed(() => props.lastFrame?.ndim
+  ?? ((props.progress?.per_variant[0]?.std?.length ?? 2) / 2))
+const uncertLabel = computed(() => ndim.value > 1
+  ? 'ΔX·ΔPx, ΔY·ΔPy ='
+  : 'ΔX·ΔP =')
 const eHa = computed(() => obs.value ? obs.value.E.toPrecision(6) : '—')
 const eEv = computed(() =>
   obs.value ? (obs.value.E*AU_ENERGY_EV).toFixed(3) : '—')
-const uncert = computed(() => obs.value ? obs.value.uncert.toFixed(4) : '—')
+const uncert = computed(() => obs.value
+  ? obs.value.uncert.map((u) => u.toFixed(4)).join(', ')
+  : '—')
 const purity = computed(() => obs.value ? obs.value.purity.toFixed(6) : '—')
 const stepInfo = computed(() => {
   // Tag each variant with its device only when the pool actually has
@@ -236,7 +250,8 @@ const stepInfo = computed(() => {
     <div class="tabular-nums w-64 truncate shrink-0"><span class="text-fg-3">E =</span>
       <span class="wf-fixnum w-[9ch]">{{ eHa }}</span>
       Ha (<span class="wf-fixnum w-[8ch]">{{ eEv }}</span> eV)</div>
-    <div class="tabular-nums w-36 truncate shrink-0"><span class="text-fg-3">ΔX·ΔP =</span> {{ uncert }}</div>
+    <div class="tabular-nums truncate shrink-0"
+         :class="ndim > 1 ? 'w-60' : 'w-36'"><span class="text-fg-3">{{ uncertLabel }}</span> {{ uncert }}</div>
     <div class="tabular-nums w-36 truncate shrink-0"
          :title="'purity of the first active variant'"><span class="text-fg-3">γ =</span> {{ purity }}</div>
     <div class="ml-auto min-w-0 truncate text-right text-xs text-muted tabular-nums"

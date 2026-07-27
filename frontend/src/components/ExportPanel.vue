@@ -151,11 +151,21 @@ const running = computed(() => props.status?.running ?? false)
 // records), but a DISABLED button whose only explanation is a tooltip is
 // how this feature first looked broken. Opening the panel explains the
 // gate, and Render pauses the run first.
+// mp4 export of a 2D run is deferred (milestone M4 in CLAUDE.md): the export
+// figure needs a plane-set panel grid, four marginals, <Lz> and the (2 pi h)^2
+// purity scale. The SETUP half of this panel works for 2D from the first cut —
+// which is why the button stays live and the gate is stated in the panel rather
+// than the whole thing being disabled: downloading and importing a setup is
+// exactly what a 2D user is here for.
+const is2d = computed(() => (props.status?.ndim ?? 1) > 1)
 const disabled = computed(() => !hasHistory.value || !props.sessionId)
 const disabledWhy = computed(() =>
   !hasHistory.value ? 'nothing computed yet'
-    : 'render the computed range to an mp4 video, or save/load this '
-      + "simulation's setup")
+    : is2d.value
+      ? "save/load this simulation's setup (mp4 export of 2D runs is not "
+        + 'available yet — milestone M4)'
+      : 'render the computed range to an mp4 video, or save/load this '
+        + "simulation's setup")
 
 /** t of a record index, from the timeline's own linear mapping. */
 function tOf(k: number): string {
@@ -412,10 +422,18 @@ onBeforeUnmount(() => clearInterval(poll))
       <h4 class="font-semibold text-fg-2">Export</h4>
 
       <h5 class="text-muted uppercase tracking-wider text-[11px] pt-1">
-        Video (mp4) — the computed range
+        Video (mp4) — the computed range<template v-if="is2d"> — 1D only for
+        now</template>
       </h5>
 
-      <div class="grid grid-cols-[3.5rem_1fr] gap-x-2 gap-y-1.5 items-center">
+      <p v-if="is2d" class="text-warn">
+        mp4 export of 2D runs is not available yet (milestone M4): the export
+        figure needs a plane-set panel grid, four marginals, ⟨Lz⟩ and the
+        (2πℏ)² purity scale. The run's SETUP below does work — download it and
+        re-import it to reproduce this run exactly.
+      </p>
+
+      <div v-if="!is2d" class="grid grid-cols-[3.5rem_1fr] gap-x-2 gap-y-1.5 items-center">
         <span class="text-muted">records</span>
         <div class="flex items-center gap-1">
           <input v-model.number="form.k0" type="number" class="wf-num w-20"
@@ -492,14 +510,14 @@ onBeforeUnmount(() => clearInterval(poll))
         </div>
       </div>
 
-      <p class="text-fg-3">
+      <p v-if="!is2d" class="text-fg-3">
         {{ frames }} frames → {{ duration.toFixed(1) }} s of video, {{ jobTheme }}
         theme, grid lines {{ showGrid ? 'on' : 'off' }} (follows the setup panel).
         Each frame carries the panels, the marginals, the E/ΔX·ΔP/γ series
         and the parameters + IC needed to reproduce the run.
       </p>
 
-      <p v-if="running" class="text-warn">
+      <p v-if="running && !is2d" class="text-warn">
         The session is still computing. Rendering needs a paused session —
         Render will pause it first (computation resumes with Solve).
       </p>
@@ -520,7 +538,7 @@ onBeforeUnmount(() => clearInterval(poll))
         </p>
       </div>
 
-      <div class="flex items-center gap-2 pt-1">
+      <div v-if="!is2d" class="flex items-center gap-2 pt-1">
         <button class="wf-solid px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 font-medium"
                 :disabled="busy || frames < 1
                            || job?.state === 'running' || job?.state === 'queued'"

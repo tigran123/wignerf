@@ -4,24 +4,43 @@ Binary frame-bundle format shared by the WebSocket stream and the
 scripts/gen_fixture.py dumps a golden bundle consumed by the frontend
 decoder's vitest, so the two implementations are cross-checked.
 
-All little-endian; sections are 4-byte aligned so the JS decoder can create
-zero-copy TypedArray views.
+All little-endian; every section length is a multiple of 4 and the header
+length a multiple of 8, so the JS decoder can create zero-copy TypedArray
+views at any of them (Uint16Array needs 2-byte offsets, Float32Array 4).
 
-Header (64 bytes):
+A record carries a LIST OF 2D PLANES, not the state: W(x,y,px,py) can be
+neither drawn nor sent, so a 2D session streams the six pairwise projections
+(core.axes.PLANES) instead. At ndim=1 the list holds exactly one plane whose
+complement is empty — i.e. W itself — so 1D is the general case, not a
+special one.
+
+Header (2*ndim axes; 64 bytes at ndim=1, 104 at ndim=2):
   u8  magic 0x57 ('W') | u8 version | u8 msg_type | u8 n_variants
-  u32 record index | f64 t | u32 Nx | u32 Np | u32 flags | u32 reserved
-  f64 x1 | f64 x2 | f64 p1 | f64 p2
+  u32 record index | f64 t | u32 flags
+  u8  ndim | u8 n_planes | u8 n_marginals | u8 reserved       (24 bytes)
+  u32 N[a]                    for each of the 2*ndim axes
+  f64 lo[a] | f64 hi[a]       for each of the 2*ndim axes
 
 Grid geometry is a PER-RECORD fact (auto-expand may move/double the domain
-mid-run), so every frame carries its own Nx/Np AND extents — a replayed
+mid-run), so every frame carries its own axis counts AND extents — a replayed
 record must decode with the geometry it was computed on, never the
 session's current one.
 
 Per variant (contiguous, n_variants times):
-  u8 variant id (bit0 quantum, bit1 relativistic), 3 pad bytes,
-  f32 Wmin, Wmax, E, x_mean, x_std, p_mean, p_std, purity, dt  (40 bytes)
-  u16[Nx*Np] W  quantized, row-major [ix][ip], fftshifted order
-  f32[Nx] rho, f32[Np] phi                                     (natural order)
+  u8 variant id (bit0 quantum, bit1 relativistic) | u8 n_planes | u16 pad
+  f32 dt | f32 E | f32 purity | f32 lz                        (20 bytes)
+  f32 mean[a], f32 std[a]     for each of the 2*ndim axes
+  per plane:
+    u8 axis_a | u8 axis_b | u8 mode | u8 pad | f32 Wmin | f32 Wmax
+    u16[N[a]*N[b]] quantized plane, row-major [ia][ib], fftshifted order
+  per axis:
+    f32[N[a]] marginal density                               (natural order)
+
+The plane dimensions are implied by (axis_a, axis_b) and the header's N, so
+they are not repeated. `mode` is the reduction kind — only projection (0) is
+defined; cuts are milestone M5 and need no version bump. `lz` is <x*py - y*px>,
+present always and 0.0 at ndim=1, because one fixed layout per ndim is easier
+to keep right on both sides than a conditional field.
 
 This module also holds the pydantic JSON schemas: grid/IC/session-config
 (shared by the REST routers) and the client->server WebSocket control
@@ -38,17 +57,20 @@ import numpy
 from pydantic import BaseModel, Field, model_validator
 
 import config
+from . import axes as axes_mod
 from .xp import C_AU
 
 MAGIC = 0x57
-VERSION = 3          # v3: per-record grid geometry (f64 x1,x2,p1,p2 in header)
+VERSION = 4          # v4: per-record ndim, a list of 2D planes and 2*ndim
+                     # marginals (1D is one plane = W); v3 was 2 fixed axes
 MSG_FRAME = 1
 
 FLAG_LIVE_PREVIEW = 1 << 0
 FLAG_REPLAY = 1 << 1
 
-_HDR = struct.Struct("<BBBBIdIIIIdddd")
-_VHDR = struct.Struct("<B3x9f")
+_HDR = struct.Struct("<BBBBIdIBBBB")     # 24 bytes, then N[] then lo/hi[]
+_VHDR = struct.Struct("<BBH4f")          # 20 bytes, then mean/std[]
+_PHDR = struct.Struct("<BBBB2f")         # 12 bytes, then the u16 plane
 
 
 def variant_id(quantum, relativistic):
@@ -69,43 +91,225 @@ VARIANTS = {
 # Pydantic schemas (REST + WS control)
 # ---------------------------------------------------------------------------
 
+class AxisSpec(BaseModel):
+    # `le` is only a sanity rail (a 16384² uint16 frame is already 512 MiB);
+    # the OPERATIVE ceilings are WIGNERF_MAX_GRID / WIGNERF_MAX_GRID_2D and
+    # WIGNERF_MAX_CELLS_2D, enforced at session creation and for auto-expand
+    # doublings
+    lo: float
+    hi: float
+    N: int = Field(ge=4, le=16384)
+
+
 class GridSpec(BaseModel):
-    # le is only a sanity rail (a 16384² uint16 frame is already 512 MiB);
-    # the OPERATIVE per-axis ceiling is WIGNERF_MAX_GRID (default 4096),
-    # enforced at session creation and for auto-expand doublings
-    x1: float
-    x2: float
-    Nx: int = Field(ge=4, le=16384)
-    p1: float
-    p2: float
-    Np: int = Field(ge=4, le=16384)
+    """The phase-space box, `2*ndim` axes in core.axes order (all spatial, then
+    all momentum). The legacy {x1, x2, Nx, p1, p2, Np} shape is accepted and
+    converted, so a stored browser config, an exported setup document and an
+    mp4 comment tag from before 2D existed all still load."""
+    ndim: Literal[1, 2] = 1
+    axes: list[AxisSpec] = Field(min_length=2, max_length=4)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy(cls, v):
+        if isinstance(v, dict) and "axes" not in v and "x1" in v:
+            try:
+                v = dict(ndim=1, axes=[
+                    dict(lo=v["x1"], hi=v["x2"], N=v["Nx"]),
+                    dict(lo=v["p1"], hi=v["p2"], N=v["Np"])])
+            except KeyError as e:
+                raise ValueError("a 1D grid needs x1, x2, Nx, p1, p2, Np "
+                                 "(missing %s)" % e) from None
+        return v
 
     @model_validator(mode="after")
     def _check(self):
-        if not (self.x2 > self.x1 and self.p2 > self.p1):
-            raise ValueError("require x2 > x1 and p2 > p1")
-        if self.Nx % 2 or self.Np % 2:
-            raise ValueError("Nx and Np must be even")
+        if len(self.axes) != 2*self.ndim:
+            raise ValueError("a %dD grid needs %d axes (got %d)"
+                             % (self.ndim, 2*self.ndim, len(self.axes)))
+        names = axes_mod.labels(self.ndim)
+        for i, a in enumerate(self.axes):
+            if not a.hi > a.lo:
+                raise ValueError("axis %s: require hi > lo" % names[i])
+            if a.N % 2:
+                raise ValueError("N%s must be even" % names[i])
         return self
+
+    @property
+    def d(self):
+        return tuple((a.hi - a.lo)/a.N for a in self.axes)
+
+    @property
+    def cells(self):
+        """Total grid cells — the operative memory scale, not the per-axis N."""
+        n = 1
+        for a in self.axes:
+            n *= a.N
+        return n
+
+    def extended(self, hbar_eff):
+        """Per-axis real range the quantum propagator evaluates U (spatial
+        axes) and T (momentum axes) on: half-width hbar*theta_amp/2, set by
+        the CONJUGATE axis's cell size."""
+        d = self.d
+        out = []
+        for a in range(2*self.ndim):
+            h = hbar_eff*(pi/d[axes_mod.conjugate(self.ndim, a)])/2.
+            out.append((self.axes[a].lo - h, self.axes[a].hi + h))
+        return tuple(out)
+
+    def spatial_extended(self, hbar_eff):
+        """Just the spatial half — what compile_potential takes."""
+        return self.extended(hbar_eff)[:self.ndim]
+
+    def spatial_ranges(self):
+        return tuple((a.lo, a.hi) for a in self.axes[:self.ndim])
+
+    # -- 1D-only spellings (see grid.Grid._only1d) -------------------------
+
+    def _only1d(self, name):
+        if self.ndim != 1:
+            raise AttributeError("GridSpec.%s is a 1D-only spelling; this "
+                                 "grid has ndim=%d" % (name, self.ndim))
+
+    @property
+    def x1(self):
+        self._only1d("x1"); return self.axes[0].lo
+
+    @property
+    def x2(self):
+        self._only1d("x2"); return self.axes[0].hi
+
+    @property
+    def Nx(self):
+        self._only1d("Nx"); return self.axes[0].N
+
+    @property
+    def p1(self):
+        self._only1d("p1"); return self.axes[1].lo
+
+    @property
+    def p2(self):
+        self._only1d("p2"); return self.axes[1].hi
+
+    @property
+    def Np(self):
+        self._only1d("Np"); return self.axes[1].N
 
     def theta_half_range(self, hbar_eff):
         """hbar*theta_amp/2: how far beyond [x1, x2] the quantum propagator
         evaluates U."""
-        dp = (self.p2 - self.p1)/self.Np
-        return hbar_eff*(pi/dp)/2.
+        self._only1d("theta_half_range")
+        return hbar_eff*(pi/self.d[1])/2.
 
     def x_extended(self, hbar_eff):
-        h = self.theta_half_range(hbar_eff)
-        return (self.x1 - h, self.x2 + h)
+        self._only1d("x_extended")
+        return self.extended(hbar_eff)[0]
+
+
+def grid_limit_error(grid, n_variants=1):
+    """The host's ceilings for this grid, as a message — or None if it fits.
+
+    SHARED by session creation and the IC preview, and that sharing is the
+    point. The preview builds the FULL state at the session's grid, so a grid
+    a session would refuse is one the preview must not try to allocate either.
+    While it did not check, a form grid of 256⁴ (4.3e9 cells) — one dims switch
+    away from the 1D default, with no Restart pressed — sent the preview to its
+    CPU fallback, where it allocated 34 GiB arrays until the kernel OOM-killed
+    the server. The create-time refusal the user would eventually have seen came
+    far too late; nothing had ever bounded the preview.
+    """
+    nd = grid.ndim
+    cap = config.max_grid(nd)
+    names = axes_mod.labels(nd)
+    over = [names[i] for i, a in enumerate(grid.axes) if a.N > cap]
+    if over:
+        return ("N%s may not exceed %s=%d on this host"
+                % ("/N".join(over),
+                   "WIGNERF_MAX_GRID" if nd == 1 else "WIGNERF_MAX_GRID_2D",
+                   cap))
+    cells = config.max_cells(nd)
+    if cells is not None and grid.cells > cells:
+        per = grid.cells*config.BYTES_PER_CELL_2D/1024**3
+        # N⁴ when every axis matches, the product otherwise. The user reads this
+        # on every keystroke past the cap, so it states the numbers and the
+        # remedy and nothing else — the reasoning behind the cap lives in
+        # config.py and CLAUDE.md, not in a message shown a hundred times.
+        ns = [a.N for a in grid.axes]
+        shape = ("%d⁴" % ns[0] if len(set(ns)) == 1
+                 else "×".join(str(n) for n in ns))
+        total = ("" if n_variants == 1
+                 else ", %.1f GiB for %d variants" % (per*n_variants, n_variants))
+        return ("the grid has %s = %s cells, over WIGNERF_MAX_CELLS_2D=%s — "
+                "~%.1f GiB per variant worker%s. Reduce an axis."
+                % (shape, format(grid.cells, ","), format(cells, ","),
+                   per, total))
+    return None
 
 
 class ICComponent(BaseModel):
-    x0: float
-    p0: float
-    sigma_x: float = Field(gt=0)
-    sigma_p: Optional[float] = Field(default=None, gt=0)  # ignored/derived for cat
+    """One Gaussian packet: ndim values per geometry field. The legacy
+    {x0, p0, sigma_x, sigma_p} shape is accepted and converted."""
+    q0: list[float] = Field(min_length=1, max_length=2)
+    k0: list[float] = Field(min_length=1, max_length=2)
+    sigma_q: list[float] = Field(min_length=1, max_length=2)
+    # ignored/derived per dimension for cat states
+    sigma_k: Optional[list[float]] = Field(default=None, min_length=1,
+                                           max_length=2)
     weight: float = Field(default=1.0, gt=0)
     phase: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy(cls, v):
+        if isinstance(v, dict) and "q0" not in v and "x0" in v:
+            sp_ = v.get("sigma_p")
+            v = dict(q0=[v["x0"]], k0=[v["p0"]], sigma_q=[v["sigma_x"]],
+                     sigma_k=None if sp_ is None else [sp_],
+                     weight=v.get("weight", 1.0), phase=v.get("phase", 0.0))
+        return v
+
+    @model_validator(mode="after")
+    def _check(self):
+        n = len(self.q0)
+        for name in ("k0", "sigma_q", "sigma_k"):
+            f = getattr(self, name)
+            if f is not None and len(f) != n:
+                raise ValueError("component %s has %d values, q0 has %d"
+                                 % (name, len(f), n))
+        if any(s <= 0 for s in self.sigma_q):
+            raise ValueError("sigma_q must be positive")
+        if self.sigma_k is not None and any(s <= 0 for s in self.sigma_k):
+            raise ValueError("sigma_k must be positive")
+        return self
+
+    @property
+    def ndim(self):
+        return len(self.q0)
+
+    # -- 1D-only spellings -------------------------------------------------
+
+    def _only1d(self, name):
+        if self.ndim != 1:
+            raise AttributeError("ICComponent.%s is a 1D-only spelling; this "
+                                 "component is %dD" % (name, self.ndim))
+
+    @property
+    def x0(self):
+        self._only1d("x0"); return self.q0[0]
+
+    @property
+    def p0(self):
+        self._only1d("p0"); return self.k0[0]
+
+    @property
+    def sigma_x(self):
+        self._only1d("sigma_x"); return self.sigma_q[0]
+
+    @property
+    def sigma_p(self):
+        self._only1d("sigma_p")
+        return None if self.sigma_k is None else self.sigma_k[0]
 
 
 class ICSpec(BaseModel):
@@ -143,6 +347,36 @@ MSG_EXPAND_F32 = (
     "precision float64 to auto-expand, or size the domain by hand.")
 
 
+# The first 2D cut ships without float32, relativistic variants, auto-expand
+# and mp4 export — milestones M1..M4 in CLAUDE.md, all four wanted and all four
+# out only until the physics core is verified. Each is refused explicitly here
+# rather than half-working: a gate that says what it stands in for cannot be
+# mistaken for settled scope, and cannot be relaxed by accident.
+MSG_F32_2D = (
+    "float32 is not available for 2D runs yet (milestone M1): the mixed-"
+    "precision rules — float64 meshes and exponent construction, single-"
+    "precision stepping — have not been re-verified for the correlated 2D Bopp "
+    "shift, and adjust_step's single-precision residual floor was measured at "
+    "256² only. It is the first 2D follow-up precisely because memory is the "
+    "binding 2D constraint. Use precision float64.")
+MSG_REL_2D = (
+    "relativistic variants (qr, cr) are not available for 2D runs yet "
+    "(milestone M2): T = c√(px²+py²+m²c²) drops out of the solver for free, but "
+    "the mc² cancellation inside the 4D kinetic difference is unverified and the "
+    "massless gradient is singular on the whole origin rather than at one "
+    "point. Use qn and/or cn.")
+MSG_EXPAND_2D = (
+    "auto-expand is not available for 2D runs yet (milestone M3): in 4D every "
+    "axis doubling doubles a multi-GiB working set, so the planner needs a "
+    "memory guard it does not have. Boundary DETECTION still runs on all four "
+    "axes and will warn you; size the domain by hand.")
+MSG_EXPORT_2D = (
+    "mp4 export is not available for 2D runs yet (milestone M4): the export "
+    "figure needs a plane-set panel grid, four marginals, ⟨Lz⟩ and the (2πℏ)² "
+    "purity scale. The run's SETUP document (GET /sessions/{id}/setup) does "
+    "work, and re-importing it reproduces the run.")
+
+
 class SessionCreate(BaseModel):
     grid: GridSpec
     potential: str
@@ -167,14 +401,19 @@ class SessionCreate(BaseModel):
     # noise 150x the relativistic shear). Restart-only — it decides the FFT plan
     # dtype at worker construction — and never inferred, always chosen.
     #
-    # The default is the HOST's WIGNERF_PRECISION, not a literal: a hard-coded
-    # "float64" here made that env var decorative — `/api/device` advertised it
-    # while every session that omitted the field silently ran float64.
-    # default_factory (not a module-level constant) so a test or an embedder
-    # that patches config.PRECISION is honoured, and validate_default so a bad
-    # value is caught here as well as in config._precision().
-    precision: Literal["float64", "float32"] = Field(
-        default_factory=lambda: config.PRECISION, validate_default=True)
+    # None = "whatever the host is configured for" (WIGNERF_PRECISION), which
+    # is the SPA's normal state until the user operates the control. It is
+    # resolved in _check, NOT by a default_factory, and that distinction is
+    # load-bearing: at ndim=2 float32 is refused outright (M1), so a factory
+    # would hand _check a float32 the client never sent and 422 EVERY 2D
+    # session on a float32 host — the SPA, curl, and scripts/ws_smoke.py
+    # --ndim 2 alike. A gate must refuse what was ASKED FOR, so the host
+    # default resolves to float64 where float32 is not on offer.
+    #
+    # A hard-coded "float64" here would be worse still: it made the env var
+    # decorative once — `/api/device` advertised float32 while every session
+    # that omitted the field silently ran float64.
+    precision: Optional[Literal["float64", "float32"]] = None
     # Per-session overrides of the host defaults. None = use the host's
     # (WIGNERF_DEVICE / WIGNERF_HISTORY_MB). A session may NARROW the host's
     # policy, never widen it: history_mb is clamped to the host ceiling, and an
@@ -182,8 +421,19 @@ class SessionCreate(BaseModel):
     device: Optional[str] = Field(default=None, max_length=200)
     history_mb: Optional[int] = Field(default=None, ge=64)
 
+    @property
+    def ndim(self):
+        return self.grid.ndim
+
     @model_validator(mode="after")
     def _check(self):
+        # Resolve the host default FIRST, so every check below reads a concrete
+        # value — and resolve it to float64 at ndim=2, where float32 is not a
+        # choice this build offers (M1). Assignment here does not re-enter
+        # validation (validate_assignment is off).
+        if self.precision is None:
+            self.precision = ("float64" if self.grid.ndim > 1
+                              else config.PRECISION)
         if len(set(self.variants)) != len(self.variants):
             raise ValueError("duplicate variants")
         if self.mode == "batch" and self.t2 is None:
@@ -199,6 +449,21 @@ class SessionCreate(BaseModel):
             raise ValueError(MSG_TOL_F32 % self.tol)
         if self.precision == "float32" and self.auto_expand:
             raise ValueError(MSG_EXPAND_F32)
+        nd = self.grid.ndim
+        bad = [c for c in self.ic.components if c.ndim != nd]
+        if bad:
+            raise ValueError("the grid is %dD but %d initial-condition "
+                             "component(s) carry %d coordinate(s) each"
+                             % (nd, len(bad), bad[0].ndim))
+        if nd > 1:
+            # only reachable for an EXPLICIT float32 — an omitted precision
+            # resolved to float64 above rather than colliding with this gate
+            if self.precision == "float32":
+                raise ValueError(MSG_F32_2D)
+            if any(VARIANTS[v]["relativistic"] for v in self.variants):
+                raise ValueError(MSG_REL_2D)
+            if self.auto_expand:
+                raise ValueError(MSG_EXPAND_2D)
         return self
 
 
@@ -287,34 +552,130 @@ ClientMsg = Annotated[
 
 @dataclass(frozen=True)
 class RecordGeom:
-    """Grid geometry of one record — travels in every frame header."""
-    Nx: int
-    Np: int
-    x1: float
-    x2: float
-    p1: float
-    p2: float
+    """Grid geometry of one record — travels in every frame header. Frozen
+    tuples, so history.py's cross-variant geometry-equality invariant (all
+    variants of a record share one grid) still works by value."""
+    ndim: int
+    N: tuple
+    lo: tuple
+    hi: tuple
+
+    @classmethod
+    def from_1d(cls, Nx, Np, x1, x2, p1, p2):
+        return cls(1, (Nx, Np), (x1, p1), (x2, p2))
+
+    def extent(self, a):
+        return (self.lo[a], self.hi[a])
+
+    # -- 1D-only spellings (see grid.Grid._only1d) -------------------------
+
+    def _only1d(self, name):
+        if self.ndim != 1:
+            raise AttributeError("RecordGeom.%s is a 1D-only spelling; this "
+                                 "record is %dD" % (name, self.ndim))
+
+    @property
+    def Nx(self):
+        self._only1d("Nx"); return self.N[0]
+
+    @property
+    def Np(self):
+        self._only1d("Np"); return self.N[1]
+
+    @property
+    def x1(self):
+        self._only1d("x1"); return self.lo[0]
+
+    @property
+    def x2(self):
+        self._only1d("x2"); return self.hi[0]
+
+    @property
+    def p1(self):
+        self._only1d("p1"); return self.lo[1]
+
+    @property
+    def p2(self):
+        self._only1d("p2"); return self.hi[1]
+
+
+@dataclass
+class PlaneFrame:
+    """One quantized 2D reduction of a state: the (a, b) plane, in the surviving
+    axes' fftshifted order, with its OWN range — the reductions of one state
+    differ in scale by orders of magnitude, so one shared colour range would
+    render most panels blank."""
+    a: int
+    b: int
+    mode: int              # axes.MODE_PROJECTION (cuts are milestone M5)
+    wq: numpy.ndarray      # uint16 (N[a], N[b])
+    wmin: float
+    wmax: float
 
 
 @dataclass
 class VariantFrame:
     vid: int
-    wq: numpy.ndarray      # uint16 (Nx, Np), fftshifted order
-    wmin: float
-    wmax: float
-    E: float
-    x_mean: float
-    x_std: float
-    p_mean: float
-    p_std: float
-    purity: float          # gamma = 2*pi*hbar_eff * int W^2 dx dp
     dt: float
-    # float64 (Nx,)/(Np,), natural order — in BOTH precision modes: the
+    E: float
+    purity: float          # gamma = (2*pi*hbar_eff)^ndim * int W^2
+    lz: float              # <x*py - y*px>; 0.0 at ndim=1
+    mean: tuple            # per phase-space axis
+    std: tuple
+    planes: tuple          # PlaneFrame, in axes.PLANES order
+    # float64 (N[a],) per axis, natural order — in BOTH precision modes: the
     # observable reductions accumulate and leave in double whatever the solver
     # works in (see core/observables.py), which is what keeps history.py's byte
     # accounting and the <f4 wire codec identical either way.
-    rho: numpy.ndarray
-    phi: numpy.ndarray
+    marg: tuple
+
+    @property
+    def ndim(self):
+        return len(self.marg)//2
+
+    # -- 1D-only spellings (see grid.Grid._only1d) -------------------------
+
+    def _only1d(self, name):
+        if self.ndim != 1:
+            raise AttributeError("VariantFrame.%s is a 1D-only spelling; this "
+                                 "frame is %dD — use planes/marg/mean/std"
+                                 % (name, self.ndim))
+
+    @property
+    def wq(self):
+        self._only1d("wq"); return self.planes[0].wq
+
+    @property
+    def wmin(self):
+        self._only1d("wmin"); return self.planes[0].wmin
+
+    @property
+    def wmax(self):
+        self._only1d("wmax"); return self.planes[0].wmax
+
+    @property
+    def x_mean(self):
+        self._only1d("x_mean"); return self.mean[0]
+
+    @property
+    def x_std(self):
+        self._only1d("x_std"); return self.std[0]
+
+    @property
+    def p_mean(self):
+        self._only1d("p_mean"); return self.mean[1]
+
+    @property
+    def p_std(self):
+        self._only1d("p_std"); return self.std[1]
+
+    @property
+    def rho(self):
+        self._only1d("rho"); return self.marg[0]
+
+    @property
+    def phi(self):
+        self._only1d("phi"); return self.marg[1]
 
 
 @dataclass
@@ -327,43 +688,75 @@ class DecodedFrame:
 
 
 def pack_frame(record, t, geom, variants, flags=0):
+    nax = 2*geom.ndim
+    nplanes = len(variants[0].planes) if variants else 0
     parts = [_HDR.pack(MAGIC, VERSION, MSG_FRAME, len(variants),
-                       record, t, geom.Nx, geom.Np, flags, 0,
-                       geom.x1, geom.x2, geom.p1, geom.p2)]
+                       record, t, flags, geom.ndim, nplanes, nax, 0),
+             numpy.asarray(geom.N, dtype="<u4").tobytes(),
+             numpy.asarray([v for a in range(nax)
+                            for v in (geom.lo[a], geom.hi[a])],
+                           dtype="<f8").tobytes()]
     for v in variants:
-        parts.append(_VHDR.pack(v.vid, v.wmin, v.wmax, v.E,
-                                v.x_mean, v.x_std, v.p_mean, v.p_std,
-                                v.purity, v.dt))
-        parts.append(numpy.ascontiguousarray(v.wq, dtype="<u2").tobytes())
-        parts.append(numpy.ascontiguousarray(v.rho, dtype="<f4").tobytes())
-        parts.append(numpy.ascontiguousarray(v.phi, dtype="<f4").tobytes())
+        parts.append(_VHDR.pack(v.vid, len(v.planes), 0,
+                                v.dt, v.E, v.purity, v.lz))
+        parts.append(numpy.asarray(
+            [x for a in range(nax) for x in (v.mean[a], v.std[a])],
+            dtype="<f4").tobytes())
+        for pl in v.planes:
+            parts.append(_PHDR.pack(pl.a, pl.b, pl.mode, 0, pl.wmin, pl.wmax))
+            parts.append(numpy.ascontiguousarray(pl.wq, dtype="<u2").tobytes())
+        for m in v.marg:
+            parts.append(numpy.ascontiguousarray(m, dtype="<f4").tobytes())
     return b"".join(parts)
 
 
 def unpack_frame(buf):
     """Host-side decoder (tests, ws_smoke.py). Returns a DecodedFrame."""
-    (magic, version, msg, nv, record, t, Nx, Np, flags, _,
-     x1, x2, p1, p2) = _HDR.unpack_from(buf, 0)
+    (magic, version, msg, nv, record, t, flags,
+     ndim, nplanes, nmarg, _) = _HDR.unpack_from(buf, 0)
     if magic != MAGIC:
         raise ValueError("bad magic 0x%02x" % magic)
     if version != VERSION:
         raise ValueError("protocol version %d != %d" % (version, VERSION))
     if msg != MSG_FRAME:
         raise ValueError("unexpected msg_type %d" % msg)
+    nax = 2*ndim
+    if nmarg != nax:
+        raise ValueError("ndim %d wants %d marginals, header says %d"
+                         % (ndim, nax, nmarg))
     off = _HDR.size
+    N = tuple(int(n) for n in numpy.frombuffer(
+        buf, dtype="<u4", count=nax, offset=off))
+    off += 4*nax
+    ext = numpy.frombuffer(buf, dtype="<f8", count=2*nax, offset=off)
+    off += 8*2*nax
+    geom = RecordGeom(ndim, N, tuple(ext[0::2]), tuple(ext[1::2]))
+
     variants = []
     for _ in range(nv):
-        vid, wmin, wmax, E, xm, xs, pm, ps, pur, dt = _VHDR.unpack_from(buf, off)
+        vid, npl, _pad, dt, E, purity, lz = _VHDR.unpack_from(buf, off)
         off += _VHDR.size
-        wq = numpy.frombuffer(buf, dtype="<u2", count=Nx*Np, offset=off).reshape(Nx, Np)
-        off += 2*Nx*Np
-        rho = numpy.frombuffer(buf, dtype="<f4", count=Nx, offset=off)
-        off += 4*Nx
-        phi = numpy.frombuffer(buf, dtype="<f4", count=Np, offset=off)
-        off += 4*Np
-        variants.append(VariantFrame(vid, wq, wmin, wmax, E, xm, xs, pm, ps,
-                                     pur, dt, rho, phi))
+        ms = numpy.frombuffer(buf, dtype="<f4", count=2*nax, offset=off)
+        off += 4*2*nax
+        planes = []
+        for _ in range(npl):
+            a, b, mode, _p, wmin, wmax = _PHDR.unpack_from(buf, off)
+            off += _PHDR.size
+            n = N[a]*N[b]
+            wq = numpy.frombuffer(buf, dtype="<u2", count=n,
+                                  offset=off).reshape(N[a], N[b])
+            off += 2*n
+            planes.append(PlaneFrame(a, b, mode, wq, wmin, wmax))
+        marg = []
+        for a in range(nax):
+            marg.append(numpy.frombuffer(buf, dtype="<f4", count=N[a],
+                                         offset=off))
+            off += 4*N[a]
+        variants.append(VariantFrame(
+            vid=vid, dt=dt, E=E, purity=purity, lz=lz,
+            mean=tuple(float(x) for x in ms[0::2]),
+            std=tuple(float(x) for x in ms[1::2]),
+            planes=tuple(planes), marg=tuple(marg)))
     if off != len(buf):
         raise ValueError("trailing bytes: %d != %d" % (off, len(buf)))
-    return DecodedFrame(record, t, RecordGeom(Nx, Np, x1, x2, p1, p2),
-                        flags, variants)
+    return DecodedFrame(record, t, geom, flags, variants)

@@ -6,7 +6,18 @@
  */
 import type { VariantKey } from './variants'
 
-export type PlotId = 'rho' | 'phi' | 'E' | 'uncertainty' | 'purity'
+/**
+ * Plot ids. The marginals are keyed by AXIS index and the uncertainty products
+ * by spatial DIMENSION, because a 2D run has four of the former and two of the
+ * latter. The old 'rho'/'phi' keys simply stop matching, which costs a user
+ * their hidden-series choices once and nothing else.
+ */
+export type PlotId =
+  | `marg${number}`
+  | 'E'
+  | `uncertainty${number}`
+  | 'purity'
+  | 'lz'
 
 const KEY = 'wignerf.hiddenSeries'
 

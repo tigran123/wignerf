@@ -25,6 +25,10 @@ labels only (`frontend/src/lib/units.ts`).
 - `backend/` — FastAPI (uv-managed Python 3.12 venv, port **8010**;
   urantia-library owns 8000). `main.py` is pure wiring; routes in
   `routers/`; all physics/infra in `core/` (no FastAPI imports there).
+  Two `core/` modules are the dimensionality seams: `axes.py` (what the axes
+  ARE — labels, array order, conjugation, the plane set, every display title)
+  and `frame.py` (state → the quantized 2D planes + marginals + scalars of one
+  record). Read `axes.py` first when touching anything multi-D.
 - `frontend/` — Vue 3 + TypeScript + Vite 8 + Tailwind 4, composables (no
   Pinia), hash routing. Built SPA is served statically by FastAPI when
   `frontend/dist` exists; in dev, Vite proxies `/api` (incl. WebSocket).
@@ -43,6 +47,63 @@ source) is what keeps startup fast. See `README.md`.
 
 ## Architecture (see the plan in git history / memory for rationale)
 
+- **Dimensionality: ONE generic core over `ndim ∈ {1, 2}`** (added 2026-07-26).
+  1D solves W(x,p,t) on `(Nx,Np)`; 2D solves W(x,y,px,py,t) on
+  `(Nx,Ny,Npx,Npy)`. There is no second solver — 1D is `ndim=1` of the same
+  code, which is deliberate: this project navigates by diagnostics, and two
+  propagators that could quietly disagree would poison exactly that.
+  `core/axes.py` is the single source of axis truth (labels, the array-order
+  split, the plane set, every display title), mirrored by
+  `frontend/src/lib/axes.ts` and by `render_mpl.py` — change a title string in
+  one and change it in all three. **ARRAY ORDER is (q…, k…)**: all spatial axes
+  then all momentum axes, so `ndim=1` is `(x,p)` exactly as before.
+  **CONJUGATION is index-matched** — θ_i is the dual of k_i and lives on array
+  axis `ndim+i`, λ_i is the dual of q_i and lives on axis `i` — stated once in
+  `axes.conjugate` and derived everywhere from it, because a wrong pairing is
+  the classic multi-D error and is silent.
+  `Grid` takes a tuple of `Axis(lo, hi, n, d, anchor)` and exposes `N/lo/hi/d`
+  tuples, `v` (natural-order vectors), `C`/`D` (shifted coordinate and dual
+  meshes) and `dV`. Every 1D-only spelling — `grid.dx`, `gs.ox`,
+  `geom.Nx`, `vf.rho`, `obs.x_std`, `es.x_mass`, `cp.dUdx` — survives as a
+  compatibility property that **RAISES at ndim > 1** rather than returning axis
+  0/1, so a call site nobody generalized fails loudly instead of computing a
+  wrong number. That is what made the migration tractable; do not soften it.
+  **What is DEFERRED in 2D and why**: float32, relativistic variants,
+  auto-expand and mp4 export are milestones M1–M4 (see the milestone table
+  below), each refused with a message naming its milestone at create time and,
+  for auto-expand, on the live `ParamChange` path too. `applyNdimInvariants`
+  (`lib/config.ts`) mirrors the first three in the FORM for the same reason
+  `applyPrecisionInvariants` exists: the panel can be unmounted and an import
+  can reach the combination from outside it.
+- **2D streams PLANE REDUCTIONS, never the state.** W(x,y,px,py) can be neither
+  drawn nor sent, so each worker reduces it on the device to the six pairwise
+  2D projections (`axes.PLANES`) plus one 1D marginal per axis, and the 4D array
+  never leaves the GPU. **Measured at 64⁴: 50.0 KiB per variant per record
+  against 33 MiB for the raw state** — so the browser-receive ceiling and
+  `WIGNERF_HISTORY_MB` both stop being 2D constraints, and scrubbing is instant.
+  At `ndim=1` the single plane's complement is EMPTY, so that plane *is* W: 1D
+  is the general case, not a special one, and `quantize` sees the identical
+  array it always did. Each plane keeps its OWN range and therefore its own
+  colorbar — the six reductions of one state differ by orders of magnitude (a
+  spatial density against a signed reduced Wigner function), so one shared range
+  would render most panels blank. `core/frame.py` builds a record, shared by
+  `worker._emit` and `routers/preview.py` so a session frame and an IC preview
+  frame come out of one code path. Observables follow: everything but the purity
+  comes from reductions (⟨H⟩ = ∫U·n_q + ∫T·n_k, moments from the 1D marginals,
+  ⟨Lz⟩ from the two mixed planes), leaving ∫W² as the only full-array pass —
+  which is also why `Propagator` no longer keeps a full-shape `H` mesh, in 1D
+  either.
+  **`PanelGrid`'s two readings are `variants` and `phase`** — one plane across
+  every variant, or every plane of one variant. The second is called "**phase
+  portrait**" in the UI and never just "portrait", because that is already the
+  name of a LAYOUT orientation two controls away in the same header; the stored
+  `wignerf.panelMode` value migrates from the old `'portrait'` rather than
+  resetting the choice. **"link zoom" is hidden in the phase portrait**
+  (`canLink`): coupling one fractional window across panels only means something
+  when they share an axis pair, and there they show six different ones — (x,y)
+  against (px,py) against (x,py) — different quantities in different units, so
+  one window would map to six unrelated physical regions. The stored preference
+  is left alone, so it comes back on the way to `variants`.
 - **Streaming**: solver workers append records to an in-RAM byte-capped
   `FrameHistory`; the WS streamer (`routers/stream.py`) sends the newest
   lockstep-complete record (live, coalescing — slow clients skip frames) or
@@ -112,7 +173,10 @@ source) is what keeps startup fast. See `README.md`.
   ρ/φ marginals it already computed (host-side, O(Nx+Np), no extra device
   sync) and `session.report_edge` posts a `boundary` WS event on state
   change (band = max(4, N/32) cells/side, trigger 1e-6 in float64 and 1e-4
-  in float32 via `EDGE_THRESHOLD_BY_PRECISION` — expansion
+  in float32 via `EDGE_THRESHOLD_BY_PRECISION`; **gated on a MEASURED noise
+  floor and confirmed over `EDGE_CONFIRM`=4 records** — see the
+  edge-noise-floor gotcha, which is what stops a coarse 2D grid strobing the
+  warning — expansion
   prevents wrap, it cannot repair it, so it must fire while edge mass is
   negligible). The `auto_expand` toggle (SessionCreate field AND
   live-appliable via ParamChange) governs only the RESPONSE: an exact
@@ -346,12 +410,30 @@ source) is what keeps startup fast. See `README.md`.
   `style.css` in the process, `.wf-num` (was inside `ICEditor.vue`, styles every
   input in three components) and `.wf-plot .u-*` (was inside `MarginalsPlot.vue`,
   styled all three charts).
-- **Parameter policy**: U(x), c, mass, hbar_eff, tol, dt_sign, auto_expand
-  apply live at the frontier; grid/IC/variant-set and the whole COMPUTE group
-  (precision, device, history_mb — the Setup panel's third section) require a
-  session restart, because each of them is fixed at worker construction (FFT
-  plan dtype, `ArrayBackend` device, `FrameHistory` cap) (auto-expand moves the LIVE grid; the Setup panel shows it and
-  offers "adopt" to copy it into the form).
+- **Parameter policy**: U, c, mass, hbar_eff, tol, dt_sign, auto_expand
+  apply live at the frontier; **ndim**/grid/IC/variant-set and the whole COMPUTE
+  group (precision, device, history_mb — the Setup panel's third section)
+  require a session restart, because each of them is fixed at worker
+  construction (FFT plan dtype, `ArrayBackend` device, `FrameHistory` cap)
+  (auto-expand moves the LIVE grid; the Setup panel shows it and
+  offers "adopt" to copy it into the form). ndim is the most restart-only of
+  them all — it decides the array rank — and switching it in the form rebuilds
+  the grid and the IC (`config.setNdim`, which mirrors each component's second
+  dimension on its first, i.e. the separable product of what was there) and
+  replaces U **only if it was still the default**, since `x^2/2` cannot silently
+  become a two-variable expression and a hand-written potential must never be
+  discarded. **The BOX follows the same "only if untouched" rule, and for a
+  sharper reason**: a still-default box is replaced by the TARGET ndim's default,
+  because carrying [-6,6] into 2D reproduces exactly what `DEFAULT_AXES[2]` was
+  widened to [-8,8] to avoid — the edge band is max(4, N/32) CELLS, so at N=64
+  the 4-cell floor makes it 0.750 a.u. wide, only 4.60σ from the default packet
+  at x0=2, and a FRESH 2D default tripped its own boundary warning on the first
+  Restart (measured 3.78e-06 band mass against the 1e-6 trigger; analytic tail
+  2.15e-06 — real mass and a CORRECT warning, not detector noise; at [-8,8] the
+  same band sits at 7.07σ and reads 2.12e-12). A box the user CHOSE still carries
+  over untouched: silently widening someone's domain is worse than a warning. N
+  is always their own choice capped at the target default (a 1D 256 would be
+  4.3e9 cells at ndim=2). Pinned in `config.test.ts`.
   **Every restart-only field goes amber when it disagrees with the session**,
   COMPUTE included — a form reading `cuda:0` over a session on `cuda:1` is the
   same trap as one reading float64 over a float32 run. `precision` gets it via
@@ -501,13 +583,58 @@ source) is what keeps startup fast. See `README.md`.
   mark the session restart-dirty.
 - **Potentials** (`core/potential.py`): tokenize-screen (security boundary)
   → sympy parse → per-family validity. The Bopp arguments are REAL
-  (x ∓ ħθ/2, complex dtype only): quantum needs U real+finite on the
-  extended range [x1 − πħ/(2dp), x2 + πħ/(2dp)] (Abs is quantum-valid);
-  classical needs DiracDelta-free dU/dx (Heaviside steps are quantum-only).
-- **ICs** (`core/initial.py`): Gaussian mixtures (independent σx, σp) and
-  cat states (analytic pairwise cross-Wigner; σp derived = ħ/(2σx)).
+  (q_i ∓ ħθ_i/2, complex dtype only): quantum needs U real+finite on the
+  extended BOX (per spatial axis, [q1 − πħ/(2dk), q2 + πħ/(2dk)] with the
+  CONJUGATE axis's spacing; Abs is quantum-valid); classical needs EVERY
+  partial ∂U/∂q_i DiracDelta-free (Heaviside steps are quantum-only). At
+  ndim=2 the symbols are (x, y) and `grad_exprs` is the gradient tuple; `y` is
+  in the tokenizer's namespace at every ndim on purpose, so a 1D session that
+  types `x*y` gets the free-symbol message naming what IS allowed rather than a
+  tokenizer refusal that reads like a typo. **The numeric probe lattice uses an
+  ODD count per axis and forces an exact 0.0 onto any axis straddling the
+  origin**: the poles that matter in 2D sit on the axes and at the origin
+  (`1/sqrt(x^2+y^2)`, `1/x`, `log(x)`) and an even lattice steps straight over
+  them — and sympy's `singularities` is one-dimensional, so past ndim=1 the
+  lattice is most of the guard (the symbolic scan pins the other variables at a
+  few sample values, best effort).
+  **The preview endpoint's PLOT window and its VALIDITY boxes are two different
+  things and must not be conflated.** `POST /api/preview/potential` takes
+  `x1/x2` (and `y1/y2`) as what to SAMPLE — the editor zooms them, and zooming
+  out past the domain is how the interesting part of U is found — while both
+  validity boxes come from `req.grid`: `spatial_ranges()` for the classical
+  gradient probe and `spatial_extended()` for the quantum one. That is the same
+  pair `routers/sessions.compile_for` uses at create time, which is the point:
+  tie the classical probe to the zoom instead and the panel stops predicting the
+  API. Measured symptom — `1/x` on a grid of [-6, 6], zoomed to [1, 6]: the
+  badge reads `classical ✓`, the Solve gate opens, and `POST /sessions` 422s on
+  the potential the editor had just approved. Pinned by
+  `test_the_validity_probe_follows_the_GRID_not_the_zoom`.
+  **At ndim=2 the editor draws the two axis cuts on TWO charts, not two traces**
+  (`PotentialEditor.vue`): uPlot's `AlignedData` has ONE shared abscissa and
+  these cuts do not share one — U(x, 0) is indexed by x over the zoom window,
+  U(0, y) by y over the grid's own y extent. Overlaid, the y cut was drawn at the
+  x sample positions, i.e. rescaled by (x2−x1)/(y2−y1) — invisible on the
+  isotropic default box, which is exactly why it looked right. Each chart's title
+  also names the coordinate its cut was actually TAKEN at (`nearestZero` picks
+  the sample closest to the origin, and a window zoomed away from it has none),
+  so `U(x, 0.4)` rather than a false `U(x, 0)`. 1D is untouched: one chart, one
+  trace.
+- **ICs** (`core/initial.py`): Gaussian mixtures (independent σ per axis) and
+  cat states (analytic pairwise cross-Wigner; σ_k derived = ħ/(2σ_q) per
+  dimension). **BOTH FACTORISE OVER DIMENSIONS, which is why 2D needed no new
+  closed form**: the packets are separable products, the Wigner transform of a
+  tensor product is the product of the transforms, so a 2D pair's cross-Wigner
+  is the OUTER PRODUCT of the two one-dimensional cores (each carrying its own
+  1/(2πħ), giving (2πħ)^−ndim automatically) and ⟨ψ_k|ψ_j⟩ is the product of the
+  per-dimension overlaps. The 1D closed forms are reused verbatim, per
+  dimension — and because those cores are 2D arrays, only their product is ever
+  full size, which is why the 2D IC preview measures LESS per cell than the 1D
+  one (56 B/cell for a cat, 32 for a mixture, against 88 in 1D).
 
-- **Purity** γ = 2πℏ_eff∬W²dxdp (= Tr ρ²) is computed per record and
+- **Purity** γ = (2πℏ_eff)^ndim ∫W² over the whole phase space (= Tr ρ²; so
+  2πℏ∬W²dxdp in 1D and (2πℏ)²⨌W²dxdydpxdpy in 2D — the power per dimension is
+  easy to drop and makes a pure state read as γ ≈ 6.28 instead of 1) is
+  computed per record and
   streamed/plotted. Both the Moyal flow (unitarity) and the classical
   Liouville flow (incompressibility) conserve it for closed systems, so
   until the Lindblad term exists it is a solver-fidelity diagnostic (a
@@ -534,7 +661,39 @@ RTX 3090: ~2400 steps/s at 512², ~550 at 1024², ~134 at 2048²; 2080 Ti:
 ~390 at 1024²; CPU (pyfftw): ~75 at 512². Measured 4-worker lockstep at
 1024²: 135 steps/s all-on-3090 vs 191 split 2+2 across the pair (+41%,
 and 2+2 beats 3+1's 181 — the even chunk is right); 2 workers: 270 vs
-376 (+39%). **The IC preview runs on a GPU too, and hands the VRAM straight
+376 (+39%).
+**WHETHER A 2D SESSION STARTS IS DECIDED BY ASKING THE DRIVER, not by a cell
+count** (`routers/sessions._fit_error`). `WIGNERF_MAX_CELLS_2D` is only a rail
+(see its table row); the operative check runs `assign_devices` to learn which
+devices this session's workers land on, counts the workers per device, and
+compares `n·cells·BYTES_PER_CELL_2D + CONTEXT_BYTES` (300 MiB of CUDA context +
+cuFFT plan cache, per process per device) against `xp.device_free_bytes(dev)` ×
+`FIT_MARGIN` (0.9 — free memory is a moving target and, unlike the IC preview, a
+session has no CPU fallback to drop to). Free memory comes from the driver
+(`mem_info`), or from `MemAvailable` for `cpu`, so whatever else is on the card
+— another session, another process — is already counted. Two properties are
+load-bearing: **the SMALLER card binds**, which no per-session cell count can
+express (4 variants at 2+2 is refused by the 11 GiB half of the pair, not by the
+24 GiB half); and **unknown free memory does NOT refuse** — there the rail is the
+only guard and guessing would be worse. Skipped at ndim=1, where `WIGNERF_MAX_GRID`
+already bounds a 2D array to 4096² ≈ 2.7 GiB/worker. Pinned by
+`test_the_device_fit_check_is_the_operative_2d_guard`.
+**The IC preview is BOUNDED the same two ways** — by `protocol.grid_limit_error`
+(the shared rail: a grid a session would refuse is one the preview must not
+allocate either) and, before the CPU fallback, by `preview._cpu_fit_error`, which
+asks `xp.device_free_bytes("cpu")` the question `_fit_error` asks of a card. Both
+are needed, because the preview builds the FULL state at the requested grid and
+fires on every form change, long before anyone presses Restart — while
+`_fit_error` runs only at session creation and so never sees it. It had no bound
+at all until 2026-07-26, when a form grid of 256⁴ (4.3e9 cells — ONE dims switch
+away from the 1D default, before any Restart) found no GPU with room, fell
+through to the CPU path below and allocated 34 GiB arrays until the kernel
+OOM-killed the server on a 125 GiB host. The GPU path was never the hazard:
+`_pick_device` simply declines. The CPU fallback is the one that needed the
+check, which is why the rail has to be at the door AND the fallback has to
+measure — the rail alone was enough only while it was tight enough to double as
+a memory bound, and it is deliberately not that any more.
+**The IC preview runs on a GPU too, and hands the VRAM straight
 back** (`routers/preview.py`). It used to be CPU-only "to keep the GPU free
 for sessions", which was the right instinct and the wrong trade: the preview
 is built at the SESSION's grid, so at 8192² it is the same 67M-cell array the
@@ -584,15 +743,17 @@ pins the frame past the release.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and an enforced POLICY**: `SessionCreate.device` (Setup → Compute, restart-only) may narrow it per session but never widen it — a spec outside `xp.devices_allowed(WIGNERF_DEVICE)` (the pool **plus cpu**) is a 422 naming the pool, as is a malformed or absent one. It used to check only that the spec parsed and the card existed, so a host pinned to `cuda:1` (or to `cpu`, to keep its cards free) could be overridden by any client. `GET /api/device` returns BOTH `devices` (the pool) and `choices` — and `choices` IS `devices_allowed`, the same list the validator uses, so the Setup select can never offer a device the API refuses. CPU is always a legal target but never appears in an `auto` pool on a CUDA host, which is why it is appended. `resolve_devices` returns CANONICAL specs (a bare `cuda` → `cuda:0`), without which that membership test would reject a device the host does offer. |
+| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and an enforced POLICY**: `SessionCreate.device` (Setup → Compute, restart-only) may narrow it per session but never widen it — a spec outside `xp.devices_allowed(WIGNERF_DEVICE)` (the pool **plus cpu**) is a 422 naming the pool, as is a malformed or absent one. It used to check only that the spec parsed and the card existed, so a host pinned to `cuda:1` (or to `cpu`, to keep its cards free) could be overridden by any client. `GET /api/device` returns BOTH `devices` (the pool) and `choices` — and `choices` IS `devices_allowed`, the same list the validator uses, so the Setup select can never offer a device the API refuses. That endpoint is where every HOST fact the form needs before it can create anything lives: the device lists, `WIGNERF_PRECISION`, and the per-ndim grid ceilings (`max_grid`, `max_cells`, `bytes_per_cell_2d` — see the `WIGNERF_MAX_GRID_2D` row for why those cannot come off `status`). Those three sit OUTSIDE `_probe_backend`'s `lru_cache`, so they follow a monkeypatched `config` and ride the probe's error path too. CPU is always a legal target but never appears in an `auto` pool on a CUDA host, which is why it is appended. `resolve_devices` returns CANONICAL specs (a bare `cuda` → `cuda:0`), without which that membership test would reject a device the host does offer. |
 | `WIGNERF_PORT` | `8010` | Backend port (8000 belongs to urantia-library). Used by start.sh; `uvicorn --port` otherwise. |
-| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster and ~58% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`'s `default_factory` — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the precision control — or an IMPORT supplies one — the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. Two exceptions, both deliberate. An **imported** setup document or mp4 marks the precision CHOSEN (`importConfig` → `markPrecisionChosen`): it is the run someone exported, and reproducing it is what the document is for — without it the import silently ran at the host default and left the form showing a float32 that never happened, behind a "restart to apply" no restart could clear (`status.precision` never CHANGES, so the sync watcher never fires). And a form with **auto-expand on** sends `float64` explicitly rather than deferring, because auto-expand is float64-only, so asking for it IS asking for float64 — deferring it on a float32 host asks for a pair the schema refuses and 422s every create. |
+| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster and ~58% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`, which is `Optional` and **resolved in `_check`, not by a `default_factory`** — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing, and a factory made it collide with a gate: 2D defers float32 (M1), so a resolved host default of float32 refused EVERY 2D session over a value the client never sent (the SPA, `curl` and `scripts/ws_smoke.py --ndim 2` alike, and `tests/test_api2d.py` with them). **An omitted precision therefore resolves to the host default at ndim=1 and to `float64` at ndim=2**, and `MSG_F32_2D` fires only for an EXPLICIT float32 — a gate must refuse what was asked for. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the precision control — or an IMPORT supplies one — the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. Two exceptions, both deliberate. An **imported** setup document or mp4 marks the precision CHOSEN (`importConfig` → `markPrecisionChosen`): it is the run someone exported, and reproducing it is what the document is for — without it the import silently ran at the host default and left the form showing a float32 that never happened, behind a "restart to apply" no restart could clear (`status.precision` never CHANGES, so the sync watcher never fires). And a form with **auto-expand on**, or at **ndim=2**, sends `float64` explicitly rather than deferring, because both are float64-only, so asking for either IS asking for float64 — deferring on a float32 host asks for a pair the schema refuses and 422s every create. (Belt and braces with the backend resolution above: the backend keeps a non-SPA client working, the SPA keeps the payload saying what the form shows, and the exported setup document then records the precision the run actually had.) |
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` (Setup → Compute) may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long 1440p exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
 | `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` encoder if a runtime probe succeeds (dedicated encoder block, ~3× faster at 4K, frees CPU for the render pool), else `libx264 -preset veryfast`. `cpu` forces libx264, `nvenc` forces the GPU. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to our rawvideo input). The host default; `ExportSpec.encoder` (the Export panel's encoder select) overrides it per JOB, which is the right granularity — the best choice depends on what else is competing for cores at that moment. |
 | `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering a frame (matplotlib/Agg) dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` (spawn, not fork: the backend has CUDA up) while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`) uses all of these; a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
-| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it (status carries `max_grid`). Lower it on VRAM-constrained hosts. Measured peak per variant worker: 160 MiB at 1024², 672 MiB at 2048², 2.7 GiB at 4096², 10.0 GiB at 8192² (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~5.4 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~20 GiB/card, which fits the 3090 and does NOT fit the 2080 Ti — cap by variant count, not just by grid. In a **float32** session those peaks fall to ~58% (measured arena: 448 MiB at 2048², 1.79 GiB at 4096², 7.0 GiB at 8192²), so 4 variants at 8192² is ~12 GiB/card at 2+2 — comfortable on the 3090, still too much for the 2080 Ti. float32 moves that line; it does not remove it. At the cap the session warns and keeps computing (moves still allowed). |
+| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisSizeOptions` clamps its own 256 floor to the cap, so a host at 128 still gets a usable select). Measured peak per variant worker: 160 MiB at 1024², 672 MiB at 2048², 2.7 GiB at 4096², 10.0 GiB at 8192² (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~5.4 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~20 GiB/card, which fits the 3090 and does NOT fit the 2080 Ti — cap by variant count, not just by grid. In a **float32** session those peaks fall to ~58% (measured arena: 448 MiB at 2048², 1.79 GiB at 4096², 7.0 GiB at 8192²), so 4 variants at 8192² is ~12 GiB/card at 2+2 — comfortable on the 3090, still too much for the 2080 Ti. float32 moves that line; it does not remove it. At the cap the session warns and keeps computing (moves still allowed). |
+| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all (128⁴ = 268M cells is ~52 GiB per worker while every axis sits inside a 128 rail). What actually binds is the per-device fit check, `routers/sessions._fit_error` — see the GPU section. **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree for as long as a switch waits for its restart. Reading them off `status` broke the panel in both directions (measured 2026-07-27): over a live 1D session a 2D form offered N up to 4096 against this 128 ceiling AND rendered no footprint line at all (`bytes_per_cell` is null at ndim=1 — the number that says whether a 2D session can start, missing exactly before the first 2D restart), and over a live 2D session a 1D form's N select collapsed to one option (cap 128, 1D list starting at 256, loop body never entered). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted for that reason: both bugs were reachable only through the DOM. **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis (the edge band would cover a quarter of the axis), so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API and through an imported config, which the select keeps listed. |
+| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values (256⁴ = 4.3e9 cells is one dims switch away from the 1D default), and the only guard on a host where free memory cannot be read. It is deliberately NOT the operative limit: at the default it permits 26.0 GiB per worker, far past any card here. A fixed cell count cannot do that job — it is wrong in both directions, refusing 128×128×64×64 (13.0 GiB, one worker) on a 24 GiB card while permitting 6.5 GiB × 2 workers on an 11 GiB one — so the real check asks the driver (`_fit_error`, GPU section). Measured on an RTX 3090, 2026-07-26, on a real worker footprint (both exponent slots, an `adjust_step` pass, a frame build): **208 B/cell in float64, flat across sizes** — 0.20 GiB at 32⁴, 1.03 at 48⁴, 3.25 at 64⁴, and ~6.5 GiB/card for 4 variants at 64⁴ split 2+2, which fits both the 3090 and the 2080 Ti. **The STATE is only 4% of that** — W is real, so float64 = 8 B/cell, 0.12 GiB at 64⁴; the rest is the step's machinery at full shape, the two exponent slots (64 B/cell) largest among it. `config.BYTES_PER_CELL_2D` carries the measured stage-by-stage breakdown, and it is what M7 and M1 attack. Throughput on the same card: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run** (~0.23 s per record at 8 substeps). Both the rail's refusal and the fit check's quote the estimate, and `/api/device`'s `bytes_per_cell_2d` feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — from `/device` and not from `status`, or the line is absent on the one path that reaches 2D (see the `WIGNERF_MAX_GRID_2D` row). |
 
 ## Commands
 
@@ -600,14 +761,18 @@ pins the frame past the release.
 # backend tests (GPU tests auto-skip without cupy/CUDA)
 cd backend && .venv/bin/pytest
 
-# live-server streaming smoke test (no browser)
+# live-server streaming smoke test (no browser); --ndim 2 exercises the 2D
+# record path against a real uvicorn rather than a TestClient
 .venv/bin/uvicorn main:app --port 8010 --ws-per-message-deflate false &
 .venv/bin/python scripts/ws_smoke.py
+.venv/bin/python scripts/ws_smoke.py --ndim 2
 
 # throughput benchmark (add --precision both to reproduce the float32 speedup,
-# -N to sweep other grids)
+# -N to sweep other grids). --ndim 2 also reports the measured per-worker VRAM,
+# which is what decides whether a 2D session starts at all
 .venv/bin/python scripts/bench.py [cpu] [cuda:1]
 .venv/bin/python scripts/bench.py --precision both -N 1024,2048,4096 cuda:1
+.venv/bin/python scripts/bench.py --ndim 2 -N 32,48,64,80 cuda:1
 
 # frontend: decoder golden test + typecheck + build
 cd frontend && npm run test && npm run build
@@ -620,7 +785,10 @@ ffmpeg -version
 ```
 
 After changing the binary protocol: bump `VERSION` in BOTH protocol files,
-regenerate the fixture (`scripts/gen_fixture.py`), and update the vitest.
+regenerate the fixtures (`scripts/gen_fixture.py` writes TWO — `frame.bin`
+(ndim=1) and `frame2d.bin` (ndim=2), both with deliberately anisotropic axis
+counts so a transposed index cannot pass), and update the vitest, which runs
+`describe.each` over both. A 1D-only golden would let a 2D decode bug ship.
 
 UI debugging without touching the real display: drive the BUILT SPA with
 headless Chrome via `puppeteer-core` (frontend devDep; system Chrome at
@@ -632,7 +800,13 @@ the "flat purity line camouflaged on a gridline" bug was found.
 counters: received/painted rates, MiB/s, queue drops, per-stage avg ms
 (decode/upload/draw/plots/fanout), the GL renderer string (SwiftShader
 here = software rendering, the classic cause of few-fps playback at large
-grids) and the measured refresh interval.
+grids) and the measured refresh interval. **Two things worth asserting from a
+script rather than eyeballing**: the plot TITLES (they are the fastest check
+that the frontend and the backend agree about ndim — `ρ(x) = ∫W dy dpx dpy`
+against `ρ(x) = ∫W dp`), and the Setup column's real width — screenshot the
+`<aside>` and assert nothing's rect exceeds it AND that
+`scrollWidth === clientWidth`, which is what caught nothing at 320px after the
+Grid section became a four-axis table.
 
 ## Roadmap (v2, agreed 2026-07-19)
 
@@ -649,7 +823,31 @@ grids) and the measured refresh interval.
 4. ~~mp4 export~~ — DONE 2026-07-21: backend-rendered export of any
    computed range (see the mp4 export bullet above). Later: Lindblad
    dissipation (the propagator's exponent construction is deliberately
-   modular for it), multi-D.
+   modular for it).
+5. ~~**2D space / 4D phase space**~~ — FIRST CUT DONE 2026-07-26: `ndim ∈
+   {1,2}` through one generic core, 2D streaming the six pairwise 2D
+   projections instead of the 4D array (see the two Architecture bullets at
+   the top). Its deferred follow-ups are the milestone list below, and they
+   are committed work, not optional extras.
+
+## 2D follow-up milestones (deferred from the first 2D cut, 2026-07-26)
+
+**These are not optional extras — they are all wanted, and each is out of the
+first 2D cut only so the physics core lands verified.** Revisit as soon as 2D
+is stable, tested and committed. M1–M4 are enforced meanwhile by explicit,
+message-bearing refusals so a half-feature can never be mistaken for a
+working one; do NOT quietly relax a gate without doing the verification it
+stands in for. M1 is the one to do first — memory is *the* 2D constraint.
+
+| # | Milestone | v1 gate | What it needs |
+|---|---|---|---|
+| M1 | **float32 in 2D** | `SessionCreate` 422 on `ndim == 2` and an EXPLICIT `precision == "float32"` (an omitted one resolves to float64 there — see the `WIGNERF_PRECISION` row); the Setup panel disables the select and marks it `(1D)` | Highest value of the four: ~3.4× faster and ~58% of the working set, i.e. 2.4 → 1.4 GiB/worker at 64⁴. Needs the mixed-precision construction rules (float64 meshes, single stepping) re-verified for the CORRELATED 2D Bopp shift, and `adjust_step`'s float32 residual floor re-measured at 4D sizes (`TOL_MIN_F32` was measured at 256², and the note in `boundary.py` says the floor grows with grid size). |
+| M2 | **Relativistic 2D** (`qr`, `cr`) | `SessionCreate` 422 on `ndim == 2` with any relativistic variant | T = c√(px²+py²+m²c²) falls out of the generic code for free, but the mc² cancellation inside the 4D kinetic DIFFERENCE is unverified (in 1D it is a difference of ~1.9e4-magnitude terms — see the float32 gotcha), and the massless limit is harder than 1D: `dTdp = c·sign(p)` becomes `c·p_d/\|p\|`, singular at the origin rather than at a point. Restores the relativistic shear diagnostic in 2D. |
+| M3 | **Auto-expand in 2D** | `SessionCreate` 422 and live `ParamChange` refusal on `ndim == 2 and auto_expand` | Boundary DETECTION already ships and warns on all four axes. The exact regrid is deferred because in 4D each axis doubling doubles a multi-GiB footprint (against 1D, where the whole grid is a rounding error next to VRAM). `GridState`, `plan_axis`, `support_cells` and `embed_window` are written generically, so what is left is `session._schedule_regrid` orchestration over 4 axes plus a memory guard that refuses a doubling it cannot afford. |
+| M4 | **mp4 export of 2D runs** | `POST /sessions/{id}/export` 422 on `ndim == 2`; the Export panel states the gate | `render_mpl.FrameFigure` needs a plane-set-driven panel grid, four marginals, ⟨Lz⟩, and the (2πℏ)² purity title. Axis subscripts there must NOT use mathtext — see the plain-text gotcha below; the SPA gets real subscripts from HTML `<sub>` (`lib/axes.ts labelHtml`) but matplotlib has no cheap equivalent, so plain `px`/`py` is the default and a second smaller text artist is the only alternative worth trying. NB the SETUP-DOCUMENT half of the Export panel (`GET /sessions/{id}/setup`, and import of .json or .mp4) does work for 2D from the first cut — only the video render is gated. |
+| M5 | **Cuts / slices** | the wire reserves a per-plane `mode` byte; only `mode=0` (projection) is defined | Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime. A cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
+| M6 | **FFT fusion** | — | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, which changes numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass in both 1D and 2D. |
+| M7 | **One exponent slot instead of two** | — | `worker._exponents` pins the full step and keeps a second slot for the substep clamped onto τ_k: 4 complex meshes = 64 B/cell, the largest single item in the 4D working set. Choosing `dt' = rem/ceil(rem/dt)` makes every substep within a record identical, so the straggler and its slot both disappear: −32 B/cell, −22% of the 4D footprint, and 1D benefits too. Changes 1D numerics (uniform substeps instead of n equal plus one short), hence not bundled with the 2D work. |
 
 ## Conventions / gotchas
 
@@ -677,7 +875,44 @@ grids) and the measured refresh interval.
 - Physics invariants in `tests/test_propagator.py` are the correctness
   anchor — harmonic quantum ≡ classical (Moyal terms vanish for quadratic
   H) is the strongest single check; run them after touching propagator,
-  grid or fftshift bookkeeping.
+  grid or fftshift bookkeeping. **`tests/test_propagator2d.py` is the 2D
+  anchor** and its strongest check is different: see the next entry.
+- **The multi-D Bopp shift is ONE simultaneous shift of every spatial
+  argument, and quantum ≡ classical CANNOT detect getting it wrong.**
+  `qd(f, xs, dxs)` evaluates `U(x − ħθx/2, y − ħθy/2)` — both arguments moved
+  together, same sign, index-matched — which is what the 2D Moyal product
+  gives. The plausible wrong version, a SUM of two independent 1D differences,
+  agrees with it for **every quadratic U**, cross terms included, so
+  `test_quantum_equals_classical_with_a_cross_term` passes under it; the two
+  first differ at third order in mixed derivatives (for U = x²y by exactly
+  −2a²b with a = ħθx/2, b = ħθy/2). What discriminates them is
+  `test_matches_an_independent_schroedinger_run`: evolve ψ(x,y) with an
+  ordinary split-operator TDSE — a different method sharing nothing but
+  numpy's FFT — under a COUPLED potential (Hénon–Heiles), and compare the
+  streamed (x,y) plane against |ψ|² cell by cell. Measured 2026-07-26, relative
+  error at t = 1: correct shift **1.45e-4 at dt = 0.02 and 3.43e-5 at 0.01
+  (ratio 4.22, i.e. O(dt²))**; independent shift **7.83e-3 and 7.81e-3 (ratio
+  1.003, FLAT)**. 228× worse and dt-independent, because a wrong shift is a
+  different evolution OPERATOR, not a smaller time step away from the right
+  one. So the assertion that matters is the dt RATIO, not a tolerance — do not
+  "simplify" it to a single run. And do not extend the sweep to dt = 0.005:
+  the ratio falls to 1.9 there because the residual has reached a
+  dt-independent ~1.5e-5 floor set by the GRID (the Bopp shift samples U
+  outside the box on the discrete θ lattice, which `exp(-iU dt)` never does),
+  so the convergence check only means something where splitting error
+  dominates.
+- **The other 2D anchors, and what each is for.** Separability: for
+  U = Ux(x) + Uy(y) and a product IC, W_2D(t) must equal the outer product of
+  two 1D runs — a separable U makes dU a SUM, so the exponent factorises
+  exactly, which validates the whole 4D pipeline against code the 1D suite
+  already trusts (measured 5.9e-11 of the peak after 150 steps, pure
+  `exp(a+b)` vs `exp(a)exp(b)` roundoff). ⟨Lz⟩: conserved by a central U to
+  5.65e-6 over 300 steps and off by 3.05 (150%) for an anisotropic one — a
+  5e5 separation, and the drift is IDENTICAL for the quantum and classical
+  variants, which is the tell that it is the square lattice breaking
+  rotational symmetry rather than physics. And a reductions-vs-naive test
+  over all six planes and four marginals, which is what catches 4-axis
+  fftshift bookkeeping — the likeliest porting error after the shift pairing.
 - **Always run uvicorn with `--ws-per-message-deflate false`** (start.sh
   does). uvicorn's default permessage-deflate zlib-compresses every
   multi-MiB frame bundle on the asyncio event loop and caps the stream at
@@ -757,8 +992,15 @@ grids) and the measured refresh interval.
     pattern, and a standing paragraph is not part of it** — two permanent notes
     beside controls you are not allowed to change were crowding the actual
     controls out of a narrow column. Instead: a compact permanent marker in the
-    label that costs no line ("auto-expand domain — float64 only", "tol ≥1e-5");
-    the full reason in the control's `title`; and the reason ONCE in amber
+    label that costs no line ("auto-expand (f64)", "tol ≥1e-5", and "precision
+    (1D)" for the 2D gate below); the full reason in the control's `title`;
+    **`:disabled` on the control itself** wherever the value is not merely
+    discouraged but overridden — the precision select was left enabled at ndim=2
+    and `applyNdimInvariants` put its value back in `payload()`, so picking
+    float32 lit an amber "restart to apply" against a value no restart could
+    send, and on a fresh session made `syncFreshSessionToForm` build TWO of them
+    (its loop re-reads the form after `restart()`, which had moved it back); and
+    the reason ONCE in amber
     (`f32Applied`, recorded at the moment of the switch so it names only what
     actually changed — a form already at tol = 0.01 had nothing raised) while
     `runDiffers('precision')` holds, so "Restart session" clears it and the
@@ -773,11 +1015,15 @@ grids) and the measured refresh interval.
     to raise THREE amber paragraphs and now raises one, the COMPUTE line naming
     what is running.
     Clearing `auto_expand` in the form is NOT enough on its own, because it
-    applies LIVE — `SimulatorView` watches `cfg.precision` and sends
-    `auto_expand: false` to a running session, since the status→form watcher
+    applies LIVE — `SimulatorView` watches `[cfg.precision, cfg.grid.ndim]` and
+    sends `auto_expand: false` to a running session, since the status→form watcher
     cannot (`status.auto_expand` does not CHANGE, so it never fires) and the
     checkbox is by then disabled, which left a session quietly expanding behind
-    an unchecked, unreachable box.
+    an unchecked, unreachable box. **ndim is in that key for the same reason
+    precision is**: 2D refuses auto-expand too (M3), `applyNdimInvariants` clears
+    the form, and `dims` is restart-only — so the old 1D session can go on
+    regridding for as long as the switch waits for its restart, which is longer
+    than the float32 case ever lasts.
     **And the invariants must be applied SYNCHRONOUSLY at the point of change,
     never from a watcher.** `SetupPanel`'s precision select calls
     `onPrecisionChange` directly, because a watcher is too late: a child's setup
@@ -961,6 +1207,109 @@ grids) and the measured refresh interval.
   support. Use a `weakref` + explicit `gc.collect()` to decide whether
   something leaked, and thread stacks (`sys._current_frames()`) to find who
   is still running.
+- **The boundary warning is ONE SHORT LINE, and the cells it names are
+  drawable.** It can clear again within a couple of records as a state drifts
+  back out of the band, so the old sentence — which also explained periodicity
+  and offered a remedy — was regularly gone before it had been read. What
+  survives is only what cannot be got elsewhere: `⚠ W(x,y,px,py,t) has reached
+  the px edge — 1.3e-4 of its integral is in the outer 4 cells.` ("integral",
+  not "probability": the quantity is ∫W over the band, and W is signed.) The
+  reasoning and the remedy moved into the span's `title` (`boundaryTitle`), which
+  a hover holds still. The cell COUNT comes from the server (`band` in the
+  boundary payload, per axis) rather than being re-derived, because it must be
+  the width the mass was actually measured with. **`lib/cells.ts` mirrors
+  `boundary.edge_band` separately, for DRAWING only** — a second "cells" toggle
+  (`wignerf.cells`, its own key, so "Reset setup to defaults" leaves it alone)
+  paints the computed lattice faintly on the W panels and the IC preview with the
+  edge-band cells brighter, so the number in that warning points at something
+  visible. The mirror exists because the overlay follows the PAINTED frame, which
+  during a scrub across an auto-expand boundary is not the live window the
+  server's `band` describes. Ticks and cells are INDEPENDENT layers
+  (`showTicks`/`showCells`), and the lattice is dropped when more than ~200 of
+  its lines would land in the visible window — a COUNT not a pixel test, so
+  zooming in brings it back, which is what makes it usable at 1D's 4096
+  (measured: N=64 draws 110 lattice + 20 band lines; N=1024 draws 0 + 132).
+  **The three toggles share ONE row** (`flex`, natural widths, labels
+  "auto-expand", "grid", "cells"), which is what pays for the third control in a
+  320px column: verified at the real width, one line and `scrollWidth ===
+  clientWidth` at ndim=1, ndim=1/float32 and ndim=2. That budget is also why the
+  auto-expand gate marker is `(1D)` / `(f64)` rather than a spelled-out clause —
+  it stays permanent and visible, which is the load-bearing half, and the full
+  reason is in the tooltip. Cell lines are deliberately NOT in `ExportSpec`: the
+  mp4 is a finished artefact, and this is a diagnostic you reach for.
+  **And the edge finding is stated ONCE.** The IC-preview check and the runtime
+  watch describe the same thing — record 0 IS the IC — so an IC sitting at the
+  edge produced two amber messages, a header line and a paragraph under the IC
+  plot, with the same number in both. `preview_warnings` now takes an
+  `edge_axes` out-list: given one it puts `(axis, band_mass)` pairs there and
+  keeps the sentence OUT of `warnings` (given none it still returns the full
+  prose, so no other caller changes), `from_spec` returns it, and
+  `routers/preview._respond` sends it as **`X-Wignerf-Edge: axis:mass,…`** — its
+  own header precisely so the client is not pattern-matching a sentence.
+  `ICEditor.edgeNotice` then renders the SET DIFFERENCE against the session's
+  tripped axes. Differencing rather than simply deleting the IC-side
+  message is the point: it keeps the one case the header cannot cover — an IC you
+  have EDITED but not yet restarted into, whose new axes the running session
+  knows nothing about. Verified: form == session shows exactly one line; editing
+  the IC out to the py edge leaves the header on x and adds "this IC reaches the
+  py edge" alone.
+  **What it differences against must SURVIVE A DISMISSAL**, hence
+  `session.boundary?.axes ?? status.boundary?.axes`: the first is the transient
+  event, and the header's own `×` sets it to null — so differencing against it
+  alone meant dismissing the header made this line appear instead, i.e. the one
+  fact stated twice after all, just sequentially. `status.boundary` is the
+  session's standing `boundary_state`, always present and untouched by the ×; the
+  event stays first only because it is fresher than the 1 s status cadence.
+- **The header's TRANSIENT notices are an absolute overlay, not flow content —
+  the W panels must never move because a message arrived.** `restartNeeded`,
+  `boundaryText`, `paramFlash` and `regridFlash` come and go while you are
+  watching the heatmaps, and the header is `flex-wrap` above a `flex-1` main: as
+  inline children, each arrival wrapped the header to a second line and moved
+  the panels down 32 px at 1280 px wide, then back up when it cleared (measured
+  `HEADER HEIGHTS SEEN: 38,70` / `PANEL TOPS SEEN: 46,78`). They now live in a
+  `absolute left-0 right-0 top-full z-30` strip anchored to the `relative`
+  header, so they are out of the vertical flow in BOTH layouts — verified with a
+  warning toggling 43× in 24 s: `hdr`, `panTop`, `panH` and `plotsTop` each take
+  exactly one value, landscape and portrait. The trade is deliberate: the strip
+  OVERLAYS the top ~24 px of the columns, i.e. it briefly hides the panel's label
+  chip and the first plot's title — chrome, never data — which is much cheaper
+  than relaying out the thing being watched, and it is dismissible. Full width so
+  no message has to be truncated to fit a header row. **The float32 badge stays
+  inline on purpose** (a permanent property of the session, set before there is
+  anything to watch), and so does `createError` (a hard failure with no session
+  running, so there are no panels to disturb). Do not "tidy" these back into the
+  header row.
+- **A marginal's NEGATIVE part measures the noise floor its edge-band mass is
+  read against, and on a coarse grid that floor is ABOVE the trigger.** ρ(x) is
+  a probability density, so any negative value in it is pure numerical error —
+  which makes `(|ρ|−ρ)/2` summed over the axis a free, self-calibrating error
+  bar (elementwise only, so it costs one reduction on numpy and cupy alike; no
+  boolean indexing, no extra device sync). It has to be used, because the floor
+  is the Nyquist truncation of the state's own Fourier tail,
+  `exp(−(πσ_q/dx)²/2)` — measured 2026-07-26 on a coherent state parked at
+  |q| = 2, nowhere near an edge: **N=32 predicted 5.17e-5 / measured 5.35e-5;
+  N=48 2.27e-10 / 1.66e-10; N=64 7.15e-18 / 2.29e-13** (below ~1e-13 other
+  error sources take over). At 32⁴ — a size this project *recommends* for
+  exploration — that is 50× the 1e-6 trigger, so the band mass IS noise:
+  negative in 96 of 204 readings, sign flipping every record or two. Ungated
+  that produced **79 boundary state changes in 201 records, and 243 WS events
+  in 25 s in a browser**, each rewriting the header warning — which wraps the
+  `flex-wrap` header and so moved the W panels 32 px at 1280 px wide, on and
+  off, for the whole run. That is what "the heatmaps jump while computing" was,
+  in both interactive and batch mode (compute-linked, hence absent in
+  playback), and it was neither the scrollbar nor the time cursor. Fix:
+  `EdgeState` carries `noise` and an axis trips only above
+  `max(threshold, EDGE_NOISE_MARGIN·noise)`, plus `session._confirm_edge`
+  requires `EDGE_CONFIRM` consecutive records in BOTH directions. 8×/4 measured
+  zero false announcements against a real approach still announced at record 3;
+  see boundary.py for the full sweep. Three properties are load-bearing: the
+  gate is **inert wherever the detector already worked** (1D N=256..4096 and 2D
+  from N=48 have floors three orders under the trigger, so 1e-6 alone still
+  decides — 1D behaviour is untouched); a **ratio-only** gate is not enough,
+  because a state genuinely over the edge rings in proportion (band/noise 11
+  there against 4.2 for the worst noise blip, which is why the margin is 8 and
+  not 12); and the **first reading per slot is exempt**, or an IC that starts at
+  the edge — a paused session with exactly one record — would never warn.
 - **Secular E drift + slow purity decay = boundary wrap, not a solver
   bug.** The spectral domain is a torus: when a state's orbit + ~5σ tails
   reach the x or p edge, mass wraps through the seam and the run faithfully

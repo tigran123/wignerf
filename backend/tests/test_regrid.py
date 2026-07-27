@@ -27,7 +27,7 @@ def test_regrid_exactness_move_and_double():
         / (2.*np.pi*0.8*0.9)
 
     # move by whole cells (+7 in x, -3 in p): lattice and values bitwise
-    mv = replace(gs, ox=gs.ox + 7, op=gs.op - 3)
+    mv = replace(gs, offset=(gs.offset[0] + 7, gs.offset[1] - 3))
     gm = mv.make_grid(b)
     assert gm.dx == gs.dx and gm.dp == gs.dp        # frozen lattice, bitwise
     assert np.array_equal(gm.xv[:-7], g.xv[7:])     # same global cell, same float
@@ -41,7 +41,8 @@ def test_regrid_exactness_move_and_double():
     assert abs((Wm*Wm).sum() - (W*W).sum())*dxdp < 1e-12   # purity survives
 
     # double both axes, old window centered: pure zero-padding
-    db = replace(gs, ox=gs.ox - 32, Nx=128, op=gs.op - 32, Np=128)
+    db = replace(gs, offset=(gs.offset[0] - 32, gs.offset[1] - 32),
+                 N=(128, 128))
     gd = db.make_grid(b)
     assert gd.dx == gs.dx and gd.dp == gs.dp
     assert np.array_equal(gd.xv[32:96], g.xv)

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * Analytic U(x) editor with instant feedback: debounced compile+sample via
+ * Analytic U(x) / U(x,y) editor with instant feedback: debounced compile+sample via
  * POST /api/preview/potential, a live plot of U over the grid range, and
  * per-variant-family validity badges (quantum needs U finite on the
  * extended Bopp range; classical needs a delta-free dU/dx).
@@ -29,15 +29,18 @@
  */
 import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
 import { createUplotZoom } from '../lib/uplotZoom'
 import { chartPalette, theme } from '../lib/theme'
 import type { VariantKey } from '../lib/variants'
+import { labels as axisLabels } from '../lib/axes'
+import { cutAlongX, cutAlongY, cutAt, cutLabel, isLattice } from '../lib/potentialCuts'
+import type { GridCfg } from '../lib/config'
 
 const props = defineProps<{
   modelValue: string
-  grid: { x1: number; x2: number; Nx: number; p1: number; p2: number; Np: number }
+  grid: GridCfg
   hbarEff: number
   live: boolean          // a session exists and the socket is attached
   // ...and it is producing NEW records right now. NOT status.running, which
@@ -46,7 +49,9 @@ const props = defineProps<{
   // not stop_at_frontier; see core/session.py).
   computing: boolean
   variants: VariantKey[] // active selection: decides which families must be valid
-  liveExpr?: string | null   // the session's CURRENT U(x), for the no-op gate
+  liveExpr?: string | null   // the session's CURRENT U, for the no-op gate
+  /** ndim of the RUNNING session, or null when none — see ndimDiffers */
+  liveNdim?: number | null
 }>()
 
 const emit = defineEmits<{
@@ -59,10 +64,39 @@ const emit = defineEmits<{
 interface PreviewResult {
   ok: boolean
   error?: string
+  ndim?: number
   validity?: { quantum: boolean; classical: boolean }
   reasons?: string[]
   warnings?: string[]
-  samples?: { x: number[]; U: (number | null)[] }
+  /** 1D: U along x. 2D: an n x n lattice, from which the axis cuts are read. */
+  samples?: { x: number[]; y?: number[]; U: (number | null)[] | (number | null)[][] }
+}
+
+const ndim = computed(() => props.grid.ndim)
+const axisNames = computed(() => axisLabels(ndim.value))
+/**
+ * In 2D the editor plots the two AXIS CUTS, U(x, 0) and U(0, y), rather than a
+ * heatmap: the cuts are what you read numbers off — the depth of a well, where
+ * a barrier sits — and they carry the pole and asymmetry information that
+ * matters for validity. The server sends the whole n x n lattice, so both cuts
+ * come out of one response with no extra request.
+ *
+ * TWO charts, not two traces on one. uPlot's AlignedData has a single shared
+ * abscissa, and these two cuts do not share one: x follows the editor's zoom
+ * window and y follows the grid's own extent. Overlaying them drew U(0, y) —
+ * indexed by y — at the x sample positions, which is right only when the two
+ * windows happen to coincide (they do for the isotropic default box, which is
+ * exactly why it looked correct) and silently rescales the y cut by
+ * (x2-x1)/(y2-y1) otherwise. 1D is unchanged: one chart, one trace.
+ */
+
+/** "U(x)" / "U(x,y)" — the function's own name, which is a fact about the
+ *  grid's dimensionality and must not be hard-coded anywhere it is shown. */
+const uName = computed(() => `U(${axisNames.value.slice(0, ndim.value).join(',')})`)
+
+const PLACEHOLDERS: Record<number, string> = {
+  1: 'e.g. x^2/2, -1/sqrt(x^2+2), x^4/4 - x^2/2',
+  2: 'e.g. (x^2+y^2)/2, x^2*y - y^3/3, -1/sqrt(x^2+y^2+1)',
 }
 
 const draft = ref(props.modelValue)
@@ -72,7 +106,10 @@ const draft = ref(props.modelValue)
 watch(() => props.modelValue, (v) => { draft.value = v })
 const result = ref<PreviewResult | null>(null)
 const plotEl = ref<HTMLDivElement | null>(null)
+// the y-cut's own chart, mounted only at ndim > 1 (see the note above)
+const plotElY = ref<HTMLDivElement | null>(null)
 let chart: uPlot | null = null
+let chartY: uPlot | null = null
 let timer: ReturnType<typeof setTimeout> | null = null
 
 // zoomed x window of the plot, DELIBERATELY independent of the grid's
@@ -94,17 +131,16 @@ async function compile() {
   // commit it below
   const expr = draft.value
   try {
+    const ax = props.grid.axes
     const { data } = await api.post<PreviewResult>('/preview/potential', {
       expr,
-      x1: viewX.value?.x1 ?? props.grid.x1,
-      x2: viewX.value?.x2 ?? props.grid.x2,
+      x1: viewX.value?.x1 ?? ax[0]!.lo,
+      x2: viewX.value?.x2 ?? ax[0]!.hi,
       grid: props.grid,
       hbar_eff: props.hbarEff,
     })
     result.value = data
-    if (data.ok && data.samples && chart) {
-      zoom.setData(chart, [data.samples.x, data.samples.U])
-    }
+    if (data.ok && data.samples && matchesNdim(data.samples)) draw(data.samples)
     // the form adopts the draft the moment the server says it is usable —
     // this is what replaces the old "Use at restart" button
     if (expr === draft.value && draftValid.value && expr !== props.modelValue)
@@ -123,13 +159,44 @@ watch([draft, () => props.grid, () => props.hbarEff, viewX], () => {
   timer = setTimeout(compile, 300)
 }, { deep: true })
 
-/** Copy the zoomed-in "interesting domain" into the grid's x₁/x₂
+/**
+ * Does this response's shape match the layout that currently exists? A 1D
+ * response carries a flat U trace and a 2D one an n x n lattice, and a 2D
+ * layout has a second chart to fill from that lattice's rows. Feed one to the
+ * other and uPlot reads a data array that is not there — it throws, and the
+ * half-built chart collapses to min-content width, which on screen is the
+ * title typeset one word per line. Shape-based rather than ndim-based so any
+ * stale response is inert, not just an ndim switch.
+ */
+function matchesNdim(sm: NonNullable<PreviewResult['samples']>): boolean {
+  return isLattice(sm) === (ndim.value > 1)
+}
+
+/** Which coordinate each cut was actually TAKEN at (null in 1D), so the titles
+ *  name it instead of claiming 0 — see lib/potentialCuts.ts. */
+const cutFrom = ref<{ x: number; y: number } | null>(null)
+
+function draw(sm: NonNullable<PreviewResult['samples']>) {
+  if (chart) zoom.setData(chart, cutAlongX(sm) as unknown as uPlot.AlignedData)
+  if (chartY && isLattice(sm))
+    chartY.setData(cutAlongY(sm) as unknown as uPlot.AlignedData)
+  cutFrom.value = cutAt(sm)
+}
+
+const titleX = computed(() => {
+  if (ndim.value < 2) return 'U(x)'
+  return `U(x, ${cutLabel(cutFrom.value?.y, result.value?.samples?.y)})`
+})
+const titleY = computed(() =>
+  `U(${cutLabel(cutFrom.value?.x, result.value?.samples?.x)}, y)`)
+
+/** Copy the zoomed-in "interesting domain" into the FIRST spatial axis
  *  (applies at restart, like any grid edit). */
 function setGridFromView() {
   const v = viewX.value
   if (!v) return
-  props.grid.x1 = parseFloat(v.x1.toPrecision(6))
-  props.grid.x2 = parseFloat(v.x2.toPrecision(6))
+  props.grid.axes[0]!.lo = parseFloat(v.x1.toPrecision(6))
+  props.grid.axes[0]!.hi = parseFloat(v.x2.toPrecision(6))
   emit('gridDirty')
 }
 
@@ -148,8 +215,20 @@ watch(draftValid, (v) => emit('validity', v), { immediate: true })
 /** The running session is evolving a DIFFERENT U(x) than the draft: edited
  *  but not applied, marked in amber on the input exactly as the Physics
  *  fields mark theirs. */
+/**
+ * The form's dimensionality differs from the RUNNING session's. Then U is
+ * restart-only like the grid and the IC: a 2D expression cannot be pushed into
+ * a 1D session at all (the backend would reject `y` as a free symbol), so
+ * marking it "edited, Apply live pushes it" would promise something nothing
+ * can keep. The dims marker in the Grid section already says "restart" — one
+ * amber per fact.
+ */
+const ndimDiffers = computed(() =>
+  props.liveNdim != null && props.liveNdim !== ndim.value)
+
 const isPending = computed(() =>
-  props.live && props.liveExpr != null && draft.value !== props.liveExpr)
+  props.live && !ndimDiffers.value
+  && props.liveExpr != null && draft.value !== props.liveExpr)
 
 /**
  * Something to push, somewhere to push it, and a reason to push it NOW.
@@ -174,7 +253,7 @@ function makeChart(): uPlot {
     {
       width: plotEl.value!.clientWidth || 300,
       height: 110,
-      title: 'U(x)',
+      title: titleX.value,
       legend: { show: false },
       plugins: [zoom.plugin], // owns the cursor config (drag/wheel/dblclick)
       scales: { x: { time: false } },
@@ -189,44 +268,98 @@ function makeChart(): uPlot {
   )
 }
 
+/** The y cut, on its own abscissa. No zoom plugin: its window follows the
+ *  grid's y extent, and the request's y1/y2 fields are where a y zoom would
+ *  go if one is ever wanted. Shorter than the x chart — this is the secondary
+ *  reading, in the column the W panels are competing with. */
+function makeChartY(): uPlot {
+  const pal = chartPalette()
+  return new uPlot(
+    {
+      width: plotElY.value!.clientWidth || 300,
+      height: 90,
+      title: titleY.value,
+      legend: { show: false },
+      cursor: { show: false },
+      scales: { x: { time: false } },
+      axes: [
+        { stroke: pal.axis, grid: { stroke: pal.gridSoft } },
+        { stroke: pal.axis, grid: { stroke: pal.gridSoft } },
+      ],
+      series: [{},
+        { stroke: pal.text, width: 1.5, dash: [5, 4], points: { show: false } }],
+    },
+    [[], []],
+    plotElY.value!,
+  )
+}
+
+/** Rebuild whichever charts should exist right now, keeping the data. uPlot
+ *  takes titles, series and axis colours at construction, so a theme change, a
+ *  dimensionality change and a moved cut coordinate all land here. */
+function rebuild() {
+  chart?.destroy()
+  chart = makeChart()
+  chartY?.destroy()
+  chartY = ndim.value > 1 && plotElY.value ? makeChartY() : null
+  const sm = result.value?.samples
+  if (sm && matchesNdim(sm)) {
+    draw(sm)
+  } else {
+    // The samples belong to the OTHER dimensionality: not merely mis-shaped
+    // but the wrong function. Drop them and let the recompile the grid
+    // watcher already scheduled refill — which also re-runs validity, so
+    // Solve stays gated until U has been checked against the new grid.
+    result.value = null
+  }
+}
+
 onMounted(() => {
   chart = makeChart()
+  // mounting straight into 2D (a stored 2D setup, a reload): plotElY is
+  // rendered by the initial pass, so its chart is built here rather than
+  // waiting for the first theme/ndim change
+  if (ndim.value > 1 && plotElY.value) chartY = makeChartY()
   const ro = new ResizeObserver(() => {
     if (chart && plotEl.value)
       chart.setSize({ width: plotEl.value.clientWidth, height: 110 })
+    if (chartY && plotElY.value)
+      chartY.setSize({ width: plotElY.value.clientWidth, height: 90 })
   })
   ro.observe(plotEl.value!)
   // theme change: rebuild in place, keeping the data — exactly as the other
   // two charts do. The last response's samples ARE that data, so re-fetching
   // them would blank the trace for a whole round-trip (and spend a
   // /preview/potential call) to redraw a curve we already have.
-  watch(theme, () => {
-    chart?.destroy()
-    chart = makeChart()
-    const s = result.value?.samples
-    if (s) zoom.setData(chart, [s.x, s.U])
+  // ndim rides along because it decides whether the y chart exists at all, and
+  // the titles because a zoomed-away window changes which cut was taken. The
+  // ndim branch waits a tick: plotElY is v-if'd on it and is not in the DOM
+  // until Vue has flushed the render.
+  watch([theme, ndim, titleX, titleY], async () => {
+    await nextTick()
+    if (plotEl.value) rebuild()
   })
   onBeforeUnmount(() => ro.disconnect())
   void compile()
 })
 
-onBeforeUnmount(() => chart?.destroy())
+onBeforeUnmount(() => { chart?.destroy(); chartY?.destroy() })
 </script>
 
 <template>
   <section class="space-y-1.5">
     <!-- the header's `uppercase` styling must not mangle math notation:
          U(x) keeps its case -->
-    <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Potential <span class="normal-case">U(x)</span></h3>
+    <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Potential <span class="normal-case">{{ uName }}</span></h3>
     <input
       v-model="draft"
       spellcheck="false"
       class="w-full bg-input border border-line rounded px-2 py-1 font-mono text-sm"
       :class="isPending && 'wf-pending'"
       :title="isPending
-        ? 'the session is still evolving a different U(x) — Apply live pushes this one at the frontier'
+        ? `the session is still evolving a different ${uName} — Apply live pushes this one at the frontier`
         : ''"
-      placeholder="e.g. x^2/2, -1/sqrt(x^2+2), x^4/4 - x^2/2"
+      :placeholder="PLACEHOLDERS[ndim] ?? PLACEHOLDERS[1]"
     />
     <div class="flex items-center gap-2 text-xs">
       <template v-if="result">
@@ -250,6 +383,10 @@ onBeforeUnmount(() => chart?.destroy())
       <div v-for="(r, i) in result.reasons" :key="i">{{ r }}</div>
     </div>
     <div ref="plotEl" class="wf-plot"></div>
+    <!-- 2D: the y cut on its OWN abscissa. It cannot share the x chart's —
+         x follows the zoom window, y the grid's extent — see the note by
+         seriesY(). -->
+    <div v-if="ndim > 1" ref="plotElY" class="wf-plot"></div>
     <div v-if="viewX" class="flex justify-end">
       <button
         class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
@@ -268,7 +405,8 @@ onBeforeUnmount(() => chart?.destroy())
       :disabled="!canApplyLive"
       :title="!live ? 'no session — Solve computes from this U(x)'
         : !draftValid ? 'invalid for the active variants — see the reasons above'
-        : !isPending ? 'this is already the U(x) the session is evolving'
+        : ndimDiffers ? `the session is ${liveNdim}D and this ${uName} is ${ndim}D — press Restart session`
+        : !isPending ? `this is already the ${uName} the session is evolving`
         : !computing ? 'nothing is computing, so there is no live run to apply'
           + ' into — press Solve and it will compute with this U(x)'
         : 'push this U(x) into the computation already in progress, applied'

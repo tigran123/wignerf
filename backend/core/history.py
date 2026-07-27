@@ -30,7 +30,8 @@ class FrameHistory:
 
     @staticmethod
     def _frame_bytes(vf):
-        return vf.wq.nbytes + vf.rho.nbytes + vf.phi.nbytes + 96
+        return (sum(p.wq.nbytes for p in vf.planes)
+                + sum(m.nbytes for m in vf.marg) + 96)
 
     def put(self, n, t, slot, vframe, geom):
         with self._lock:

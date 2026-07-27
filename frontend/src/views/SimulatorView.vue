@@ -19,8 +19,10 @@ import PlotsColumn from '../components/PlotsColumn.vue'
 import SetupPanel from '../components/SetupPanel.vue'
 import Timeline from '../components/Timeline.vue'
 import { useSession } from '../composables/useSession'
-import { applyPrecisionInvariants, loadConfig, precisionForPayload,
-         precisionIsUserChosen, saveConfig, setHostPrecision } from '../lib/config'
+import { applyNdimInvariants, applyPrecisionInvariants, geomOf,
+         loadConfig, precisionForPayload, precisionIsUserChosen, saveConfig,
+         setHostPrecision, type GeomCfg } from '../lib/config'
+import { labels as axisLabels } from '../lib/axes'
 import { apiErrorText } from '../lib/apierror'
 import { displayInterval } from '../lib/perf'
 import { transportAction } from '../lib/transport'
@@ -52,13 +54,23 @@ watch(layout, (v) => localStorage.setItem('wignerf.layout', v))
 
 const showGrid = ref(localStorage.getItem('wignerf.grid') !== '0')
 watch(showGrid, (v) => localStorage.setItem('wignerf.grid', v ? '1' : '0'))
+// The computed lattice + the boundary watch's edge band, on the phase-space
+// canvases only (a cell line means nothing on a uPlot series). Off by default:
+// it is a diagnostic you reach for, and at 1D's larger N it is a lot of ink.
+// Its own key, a sibling of wignerf.grid, so "Reset setup to defaults" leaves
+// it alone like the other display prefs.
+const showCells = ref(localStorage.getItem('wignerf.cells') === '1')
+watch(showCells, (v) => localStorage.setItem('wignerf.cells', v ? '1' : '0'))
 
 // setup persists across reloads: a hard refresh must not silently reset
 // mode/t2/grid/IC to defaults
 const cfg = reactive(loadConfig())
 watch(cfg, () => saveConfig(cfg), { deep: true })
 const activeVariants = ref<VariantKey[]>([...cfg.variants])
-const activeGrid = ref({ ...cfg.grid })
+// The LIVE geometry, per painted frame (auto-expand moves it). Distinct from
+// cfg.grid, which is the form: seeded from it so the panels have axes before
+// the first frame lands.
+const activeGeom = ref<GeomCfg>(geomOf(cfg.grid))
 const sessionId = computed(() => session.info.value?.session_id ?? null)
 // batch mode while it computes new records: no frames stream, so the heatmap
 // and marginals are dimmed and a progress report stands in for the display
@@ -93,6 +105,9 @@ function payload() {
   // payload built from a half-fixed config asked for float32 + auto-expand and
   // came back a 422 naming a pair the user never chose. Idempotent, so this
   // costs nothing when the fix-up has already run.
+  // Both invariant sets, and ndim FIRST because it forces float64: the form
+  // must be self-consistent before it is serialized, whichever watcher ran.
+  applyNdimInvariants(cfg)
   applyPrecisionInvariants(cfg)
   const p: Record<string, unknown> = JSON.parse(JSON.stringify(cfg))
   if (cfg.mode === 'interactive') delete p.t2
@@ -120,7 +135,7 @@ async function restart() {
     unsub?.()
     await session.create(payload())
     activeVariants.value = [...cfg.variants]
-    activeGrid.value = { ...cfg.grid }
+    activeGeom.value = geomOf(cfg.grid)
     currentRecord.value = 0
     restartNeeded.value = false
     restartCount.value++
@@ -129,11 +144,11 @@ async function restart() {
       // geometry is a per-record fact (auto-expand regrids): follow the
       // PAINTED frame so panels, axis overlays and marginal axes stay in
       // sync while scrubbing across a regrid boundary in either direction
-      const g = activeGrid.value
-      if (f.Nx !== g.Nx || f.Np !== g.Np || f.x1 !== g.x1 || f.x2 !== g.x2
-          || f.p1 !== g.p1 || f.p2 !== g.p2)
-        activeGrid.value = { x1: f.x1, x2: f.x2, Nx: f.Nx,
-                             p1: f.p1, p2: f.p2, Np: f.Np }
+      const g = activeGeom.value
+      if (f.ndim !== g.ndim || f.N.some((n, i) => n !== g.N[i])
+          || f.lo.some((v, i) => v !== g.lo[i])
+          || f.hi.some((v, i) => v !== g.hi[i]))
+        activeGeom.value = { ndim: f.ndim, lo: [...f.lo], hi: [...f.hi], N: [...f.N] }
     })
   } catch (e: unknown) {
     createError.value = apiErrorText(e)
@@ -292,17 +307,82 @@ watch(() => [cfg.mode, cfg.t2, cfg.record_dt, cfg.precision],
 // Boundary watch surfacing: a dismissible amber warning while W sits in
 // the edge band (the server posts an all-clear that removes it), and a
 // transient notice for each auto-expand regrid.
+
+/**
+ * The dimensionality of what is RUNNING, not of the form. `dims` is
+ * restart-only, so it can sit at 2D over a live 1D session — and everything
+ * below describes that session: the boundary warning would otherwise name
+ * W(x,y,px,py,t) while reporting a 1D session's x edge, and offer the 2D
+ * remedy for a domain that can auto-expand. Falls back to the form only before
+ * the first status arrives.
+ */
+const sessionNdim = computed(() =>
+  session.status.value?.ndim ?? cfg.grid.ndim)
+const wOf = computed(() => `W(${axisLabels(sessionNdim.value).join(',')},t)`)
+
+/**
+ * The largest edge-band reading among the tripped axes. Naming the NUMBER
+ * matters: "approaching the edge" alone says nothing about how close, and the
+ * quantity is a probability — the fraction of ∫W lying in the outer cells of
+ * that axis's marginal — not anything to do with the particle mass `m` in the
+ * Physics panel. See core/boundary.py.
+ */
+const boundaryWorst = computed(() => {
+  const b = session.boundary.value
+  if (!b?.mass) return null
+  const vals = b.axes.map((a) => b.mass[a] ?? 0)
+  return vals.length ? Math.max(...vals) : null
+})
+
 const boundaryText = computed(() => {
   const b = session.boundary.value
   if (!b) return ''
   const axes = b.axes.join(', ')
+  const w = boundaryWorst.value
+  const amount = w == null ? '' : `${w.toExponential(1)} of its integral `
   if (b.action === 'capped')
-    return `W(x,p,t) reached the ${axes} edge but the domain is at the ` +
-           `${b.max_grid ?? ''}-cell cap (WIGNERF_MAX_GRID) — mass is wrapping`
+    return `${wOf.value} reached the ${axes} edge but the domain is at the ` +
+           `${b.max_grid ?? ''}-cell cap (WIGNERF_MAX_GRID) — ${amount}` +
+           're-entering from the opposite side'
   if (b.action === 'invalid_potential')
-    return b.message ?? 'cannot expand: U(x) is invalid on the larger domain'
-  return `W(x,p,t) is approaching the ${axes} edge — mass will wrap around` +
-         (cfg.auto_expand ? '' : '; enable auto-expand or restart with a larger domain')
+    return b.message ?? 'cannot expand: U is invalid on the larger domain'
+  // ONE LINE, and short enough to finish reading. This warning can clear again
+  // within a couple of records as a state drifts back out of the band, so a
+  // sentence that explains periodicity and offers a remedy was regularly gone
+  // before it had been read. What survives is the two facts that cannot be got
+  // anywhere else — WHICH axis, and HOW MUCH is in HOW MANY cells; the
+  // reasoning and the remedy move to the title, which a hover can hold still.
+  return `${wOf.value} has reached the ${axes} edge — ${amount}is in the ` +
+         `outer ${boundaryBand.value} cells.`
+})
+
+/** Band width in cells per side, from the server (never re-derived here). */
+const boundaryBand = computed(() => {
+  const b = session.boundary.value
+  const w = b?.band
+  if (!w) return '?'
+  const each = [...new Set(b.axes.map((a) => w[a]).filter((n) => n != null))]
+  // one number when the tripped axes agree (they do unless their N differ)
+  return each.length === 1 ? String(each[0]) : each.sort((x, y) => x - y).join('/')
+})
+
+/** The explanation the message no longer carries, on hover. */
+const boundaryTitle = computed(() => {
+  const b = session.boundary.value
+  if (!b || b.action !== 'warn') return ''
+  const advice = sessionNdim.value > 1
+    // auto-expand is deferred in 2D (milestone M3), so offering it would be a
+    // dead end: the only remedy there is a bigger domain at restart
+    ? 'Restart with a larger domain.'
+    // the SESSION's toggle, not the form's: this describes the run that raised
+    // the warning, and the two can differ for a moment before a status echo
+    : ((session.status.value?.auto_expand ?? cfg.auto_expand)
+        ? 'Auto-expand is on, so the domain will be regridded.'
+        : 'Enable auto-expand, or restart with a larger domain.')
+  return 'The spectral domain is periodic, so whatever reaches an edge ' +
+         're-enters from the opposite side and the run then evolves the wrong ' +
+         '(torus) problem — the tells are a secular energy drift and a slow ' +
+         `purity decay. ${advice}`
 })
 // the server's status is the authority on the live toggle (delay-dial
 // pattern): a reattach to a surviving session must not show a stale box
@@ -322,27 +402,37 @@ watch(() => session.status.value?.precision, (v) => {
     applyPrecisionInvariants(cfg)
   }
 })
-// float32 forbids auto-expand, and applyPrecisionInvariants has already cleared
-// the FORM. Make the LIVE session agree, because nothing else can: the watcher
-// above cannot (status.auto_expand does not CHANGE, so it never fires), the
-// checkbox is disabled in float32, and auto_expand is not in LivePhysics so
-// there is no amber marker either — a session left quietly expanding behind an
-// unchecked, unreachable box. Keyed on PRECISION, not on cfg.auto_expand, so it
-// never duplicates the checkbox's own apply-live; that path leaves precision
-// alone. Covers the select, an import and probeHost's adoption in one place.
-// send() no-ops on a closed socket, so this is safe before a session exists.
-watch(() => cfg.precision, () => {
-  if (cfg.precision === 'float32' && session.status.value?.auto_expand
-      && session.connected.value)
+// TWO settings forbid auto-expand — float32 (single-precision noise passes its
+// own detector) and ndim=2 (no memory guard on a 4-axis doubling, milestone M3) —
+// and applyPrecisionInvariants / applyNdimInvariants have already cleared the
+// FORM for both. Make the LIVE session agree, because nothing else can: the
+// watcher above cannot (status.auto_expand does not CHANGE, so it never fires),
+// the checkbox is disabled in both states, and auto_expand is not in LivePhysics
+// so there is no amber marker either — a session left quietly expanding behind an
+// unchecked, unreachable box. dims is restart-only, so a switch can sit here for
+// a long time with the old session still running and still regridding.
+// Keyed on precision and ndim, not on cfg.auto_expand, so it never duplicates the
+// checkbox's own apply-live; that path leaves both of these alone. Covers the two
+// selects, an import and probeHost's adoption in one place. send() no-ops on a
+// closed socket, so this is safe before a session exists.
+watch([() => cfg.precision, () => cfg.grid.ndim], () => {
+  if ((cfg.precision === 'float32' || cfg.grid.ndim > 1)
+      && session.status.value?.auto_expand && session.connected.value)
     applyLive({ auto_expand: false })
 })
 // Live parameter changes: the Physics fields apply on change (blur/Enter)
 // with no other confirmation anywhere, which reads as "nothing happened" —
-// so echo what the server actually took. Labels mirror describe.FIELD_LABEL.
+// so echo what the server actually took. Labels mirror describe.FIELD_LABEL,
+// U included: describe.param_lines writes U(x,y) at ndim=2 and this flash has
+// to say the same words about the same change.
 const PARAM_LABEL: Record<string, string> = {
-  U: 'U(x)', mass: 'm', c: 'c', hbar_eff: 'ℏ', tol: 'tol',
+  mass: 'm', c: 'c', hbar_eff: 'ℏ', tol: 'tol',
   dt_sign: 't dir', auto_expand: 'auto-expand',
 }
+const uLabel = computed(() => {
+  const nd = sessionNdim.value
+  return `U(${axisLabels(nd).slice(0, nd).join(',')})`
+})
 const paramFlash = ref('')
 let paramTimer = 0
 watch(session.paramsApplied, (p) => {
@@ -352,7 +442,7 @@ watch(session.paramsApplied, (p) => {
     : k === 'dt_sign' ? (Number(v) < 0 ? 'backward' : 'forward')
     : String(v)
   const parts = Object.entries(p.applied).map(([k, v]) => {
-    const label = PARAM_LABEL[k] ?? k
+    const label = k === 'U' ? uLabel.value : (PARAM_LABEL[k] ?? k)
     return k in p.before ? `${label} ${fmt(k, p.before[k])} → ${fmt(k, v)}`
                          : `${label} = ${fmt(k, v)}`
   })
@@ -367,8 +457,11 @@ watch(session.regrid, (r) => {
   if (!r) return
   const g = r.grid
   const verb = Object.values(r.kind).includes('double') ? 'expanded' : 'moved'
-  regridFlash.value = `domain ${verb} to [${+g.x1.toFixed(4)}, ${+g.x2.toFixed(4)}] × ` +
-    `[${+g.p1.toFixed(4)}, ${+g.p2.toFixed(4)}], ${g.Nx}×${g.Np}, at record ${r.at_record}`
+  const box = g.lo
+    .map((lo, i) => `[${+lo.toFixed(4)}, ${+g.hi[i]!.toFixed(4)}]`)
+    .join(' × ')
+  regridFlash.value = `domain ${verb} to ${box}, ${g.N.join('×')}, ` +
+    `at record ${r.at_record}`
   clearTimeout(regridTimer)
   regridTimer = window.setTimeout(() => { regridFlash.value = '' }, 6000)
 })
@@ -499,6 +592,28 @@ const deviceOptions = ref<{ spec: string; device: string }[] | null>(null)
 // whether a form device of '' still matches the RUNNING session's devices — a
 // restart-only field with no live counterpart to compare against otherwise.
 const hostPool = ref<string[] | null>(null)
+/**
+ * The host's ceilings PER NDIM, from /api/device.
+ *
+ * Deliberately not from `status`: those are resolved once, for the ndim of the
+ * session that is RUNNING, while the form has to describe the ndim it is
+ * SHOWING — and `dims` is restart-only, so the two disagree for exactly as long
+ * as a switch waits for its restart. Taking them off `status` meant a form
+ * switched to 2D over a live 1D session offered N up to 4096 against an API
+ * ceiling of 128 AND hid the 2D footprint estimate entirely (`bytes_per_cell` is
+ * null at ndim=1) — the one number that says whether a 2D session can start, and
+ * it was missing precisely before the first 2D restart. In the other direction a
+ * form back at 1D over a live 2D session collapsed its N select to one option.
+ *
+ * The literals mirror config.py's defaults and are FALLBACKS only, in the spirit
+ * of the precision handling below: a probe that fails costs a ceiling the API
+ * still enforces with a message, never a wrong result.
+ */
+const hostLimits = ref({
+  maxGrid: { 1: 4096, 2: 128 } as Record<number, number>,
+  maxCells: { 1: null, 2: 2 ** 27 } as Record<number, number | null>,
+  bytesPerCell2d: 208,
+})
 const historyCapMb = computed(() => {
   const b = session.status.value?.history_cap_bytes
   return b == null ? null : Math.round(b/(1024*1024))
@@ -507,7 +622,8 @@ const historyCapMb = computed(() => {
 /**
  * Host facts the form needs before it can create anything: the device
  * `choices` (the pool PLUS cpu, which is always a legal target but never
- * appears in an "auto" pool on a CUDA host) and WIGNERF_PRECISION.
+ * appears in an "auto" pool on a CUDA host), WIGNERF_PRECISION, and the per-ndim
+ * grid ceilings (see `hostLimits` for why those cannot come off `status`).
  *
  * Awaited before the FIRST restart so the form shows the right default at once
  * and no session is created only to be recreated. The cost is a cached
@@ -528,10 +644,25 @@ async function probeHost() {
   try {
     const { data } = await api.get<{ choices: { spec: string; device: string }[]
                                      devices?: { spec: string }[]
-                                     precision?: string }>(
+                                     precision?: string
+                                     max_grid?: Record<string, number>
+                                     max_cells?: Record<string, number | null>
+                                     bytes_per_cell_2d?: number }>(
       '/device', { timeout: 5000 })
     deviceOptions.value = data.choices ?? []
     hostPool.value = data.devices?.map((d) => d.spec) ?? null
+    // Normalized key by key rather than assigned wholesale: the JSON keys are
+    // strings, and an older backend (or the probe's own error path) carries
+    // neither field — a missing one must keep its literal fallback, not become
+    // undefined and index to NaN in the Setup panel.
+    for (const nd of [1, 2]) {
+      const g = data.max_grid?.[String(nd)]
+      if (typeof g === 'number') hostLimits.value.maxGrid[nd] = g
+      const c = data.max_cells?.[String(nd)]
+      if (c === null || typeof c === 'number') hostLimits.value.maxCells[nd] = c
+    }
+    if (typeof data.bytes_per_cell_2d === 'number')
+      hostLimits.value.bytesPerCell2d = data.bytes_per_cell_2d
     // Install the host's default so "Reset setup to defaults" agrees with the
     // server, and adopt it if this browser has never chosen a precision.
     setHostPrecision(data.precision)
@@ -563,7 +694,10 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="h-screen flex flex-col overflow-hidden bg-app text-fg">
-    <header class="px-3 py-2 text-sm border-b border-line-soft flex items-center gap-4 flex-wrap">
+    <!-- `relative` anchors the transient-notices overlay at the bottom of this
+         bar; see the comment on it for why it must not sit in the flow. -->
+    <header class="relative px-3 py-2 text-sm border-b border-line-soft
+                   flex items-center gap-4 flex-wrap">
       <button class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
               @click="showSetup = !showSetup">
         {{ showSetup ? '◀ hide setup' : '▶ setup' }}
@@ -643,21 +777,40 @@ onBeforeUnmount(() => {
             title="This session's spectral working precision is float32 — a fast PREVIEW mode. Purity and energy drift by ~1e-4 with the same secular signature as boundary wrap, and ΔX·ΔP noise is ~150× the relativistic shear. Restart in float64 before reading any of these curves as physics.">
         float32 · preview — single precision mode
       </span>
-      <span v-if="restartNeeded" class="text-warn text-xs">
-        setup changed —
-        <button class="underline" @click="requestRestart">restart</button> to apply
-      </span>
-      <span v-if="boundaryText" class="text-warn text-xs">
-        ⚠ {{ boundaryText }}
-        <button class="underline" title="dismiss (reappears if the boundary state changes)"
-                @click="session.boundary.value = null">×</button>
-      </span>
-      <span v-if="paramFlash" class="text-ok text-xs">✓ {{ paramFlash }}</span>
-      <span v-if="regridFlash" class="text-info text-xs">⤢ {{ regridFlash }}</span>
       <span v-if="reconnecting" class="ml-auto text-warn">
         backend disconnected — reconnecting…
       </span>
       <span v-else-if="!session.connected.value" class="ml-auto text-warn">connecting…</span>
+
+      <!-- TRANSIENT NOTICES OVERLAY, and why it is absolutely positioned.
+           These four come and go WHILE you are watching the heatmaps, and the
+           header is `flex-wrap` above a `flex-1` main: inline, each arrival
+           wrapped the header to a second line and moved the W panels down 32 px
+           at 1280 px wide (measured), then back up when it cleared. The
+           boundary warning made that pathological — it can legitimately toggle
+           as a state drifts across the edge — but a single jump of the thing you
+           are watching is wrong on its own. `top-full` takes them out of the
+           vertical flow, so the panels NEVER move; they overlay the top ~24 px
+           of the columns instead, which is where they always appeared anyway.
+           Full width, so no message has to be truncated to fit a header row.
+           The float32 badge stays inline on purpose: it is a permanent property
+           of the session, set before there is anything to watch. -->
+      <div v-if="restartNeeded || boundaryText || paramFlash || regridFlash"
+           class="absolute left-0 right-0 top-full z-30 flex items-center
+                  gap-4 flex-wrap px-3 py-1 text-xs
+                  bg-panel/95 border-b border-line-soft shadow-sm">
+        <span v-if="restartNeeded" class="text-warn">
+          setup changed —
+          <button class="underline" @click="requestRestart">restart</button> to apply
+        </span>
+        <span v-if="boundaryText" class="text-warn" :title="boundaryTitle">
+          ⚠ {{ boundaryText }}
+          <button class="underline" title="dismiss (reappears if the boundary state changes)"
+                  @click="session.boundary.value = null">×</button>
+        </span>
+        <span v-if="paramFlash" class="text-ok">✓ {{ paramFlash }}</span>
+        <span v-if="regridFlash" class="text-info">⤢ {{ regridFlash }}</span>
+      </div>
     </header>
 
     <div v-if="createError" class="px-3 py-2 text-error text-sm">{{ createError }}</div>
@@ -671,29 +824,36 @@ onBeforeUnmount(() => {
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
-                    :max-grid="session.status.value?.max_grid ?? 4096"
+                    :max-grid="hostLimits.maxGrid[cfg.grid.ndim]"
+                    :max-cells="hostLimits.maxCells[cfg.grid.ndim] ?? null"
+                    :bytes-per-cell="cfg.grid.ndim > 1 ? hostLimits.bytesPerCell2d : null"
                     :live-devices="session.status.value?.devices ?? null"
                     :device-options="deviceOptions" :host-pool="hostPool"
                     :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
                     v-model:show-grid="showGrid"
+                    v-model:show-cells="showCells"
                     @dirty="restartNeeded = true" @restart="requestRestart"
                     @apply-live="applyLive"
                     @potential-validity="(v: boolean) => potentialValid = v" />
         <ICEditor :ic="cfg.ic" :grid="cfg.grid" :hbar-eff="cfg.hbar_eff"
-                  :show-grid="showGrid" @changed="restartNeeded = true"
+                    :quiet="!!createError"
+                  :show-grid="showGrid" :show-cells="showCells"
+                  :live-edge-axes="session.boundary.value?.axes
+                                   ?? session.status.value?.boundary?.axes ?? null"
+                  @changed="restartNeeded = true"
                   @validity="(v: boolean) => icValid = v" />
       </aside>
 
       <div class="flex-1 min-w-0 min-h-0">
         <PanelGrid :key="plotsKey" :frame-source="session.onFrame"
-                   :variants="activeVariants" :domain="activeGrid"
+                   :variants="activeVariants" :geom="activeGeom"
                    :batch-overlay="batchOverlay" :progress="session.progress.value"
-                   :show-grid="showGrid" />
+                   :show-grid="showGrid" :show-cells="showCells" />
       </div>
 
       <aside class="w-[380px] shrink-0 overflow-y-auto">
         <PlotsColumn :frame-source="session.onFrame" :session-id="sessionId"
-                     :variants="activeVariants" :grid="activeGrid"
+                     :variants="activeVariants" :geom="activeGeom"
                      :last-frame="session.lastFrame.value"
                      :batch-computing="batchComputing"
                      :show-grid="showGrid" :plots-key="plotsKey" />
@@ -710,23 +870,30 @@ onBeforeUnmount(() => {
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
-                    :max-grid="session.status.value?.max_grid ?? 4096"
+                    :max-grid="hostLimits.maxGrid[cfg.grid.ndim]"
+                    :max-cells="hostLimits.maxCells[cfg.grid.ndim] ?? null"
+                    :bytes-per-cell="cfg.grid.ndim > 1 ? hostLimits.bytesPerCell2d : null"
                     :live-devices="session.status.value?.devices ?? null"
                     :device-options="deviceOptions" :host-pool="hostPool"
                     :history-cap-mb="historyCapMb" :history-mb-max="session.status.value?.history_mb_max ?? null"
                     v-model:show-grid="showGrid"
+                    v-model:show-cells="showCells"
                       @dirty="restartNeeded = true" @restart="requestRestart"
                       @apply-live="applyLive"
                       @potential-validity="(v: boolean) => potentialValid = v" />
         </div>
         <div class="overflow-y-auto min-h-0 pr-1">
           <ICEditor :ic="cfg.ic" :grid="cfg.grid" :hbar-eff="cfg.hbar_eff"
-                    :show-grid="showGrid" @changed="restartNeeded = true"
+                    :quiet="!!createError"
+                    :show-grid="showGrid" :show-cells="showCells"
+                  :live-edge-axes="session.boundary.value?.axes
+                                   ?? session.status.value?.boundary?.axes ?? null"
+                  @changed="restartNeeded = true"
                     @validity="(v: boolean) => icValid = v" />
         </div>
         <div class="overflow-y-auto min-h-0 pr-1">
           <PlotsColumn :frame-source="session.onFrame" :session-id="sessionId"
-                       :variants="activeVariants" :grid="activeGrid"
+                       :variants="activeVariants" :geom="activeGeom"
                        :last-frame="session.lastFrame.value"
                        :batch-computing="batchComputing"
                        :show-grid="showGrid" :plots-key="plotsKey" />
@@ -735,9 +902,9 @@ onBeforeUnmount(() => {
 
       <div class="flex-1 min-w-0 min-h-0">
         <PanelGrid :key="plotsKey" :frame-source="session.onFrame"
-                   :variants="activeVariants" :domain="activeGrid"
+                   :variants="activeVariants" :geom="activeGeom"
                    :batch-overlay="batchOverlay" :progress="session.progress.value"
-                   :show-grid="showGrid" />
+                   :show-grid="showGrid" :show-cells="showCells" />
       </div>
     </main>
 

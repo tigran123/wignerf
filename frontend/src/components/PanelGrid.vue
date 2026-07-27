@@ -1,18 +1,21 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { Frame } from '../lib/protocol'
-import type { GridCfg } from '../lib/config'
+import type { GeomCfg } from '../lib/config'
 import type { ProgressEvent } from '../composables/useSession'
 import { VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
-import { createViewWindow, remapView } from '../lib/viewWindow'
+import { createViewWindow, remapView, type Domain } from '../lib/viewWindow'
+import { planeLabel, planeLabelHtml, planes as planesOf } from '../lib/axes'
 import { AU_TIME_FS } from '../lib/units'
 import WignerPanel from './WignerPanel.vue'
 
 const props = defineProps<{
   frameSource: (h: (f: Frame) => void) => () => void
   variants: VariantKey[]   // in bundle order (= session config order)
-  domain: GridCfg
+  /** live geometry of the PAINTED frame — per-record, so a regrid follows */
+  geom: GeomCfg
   showGrid: boolean
+  showCells?: boolean
   // batch mode streams no frames: 'computing' dims the heatmaps and shows a
   // live progress card; 'review' shows a "press Play" hint over the (blank)
   // panels of a finished run; null = normal live/playback display.
@@ -24,42 +27,134 @@ const throughput = computed(() =>
   (props.progress?.per_variant ?? [])
     .map((v) => `${v.variant} ${v.steps_per_sec}/s`).join('   '))
 
+/**
+ * WHAT THE PANELS SHOW. At ndim=1 there is one plane and the grid is the
+ * familiar one panel per variant. At ndim=2 there are six planes per variant,
+ * i.e. up to 24 combinations, so the user picks one of two readings:
+ *
+ *  'variants' — one selected plane across every variant. The quantum-vs-
+ *               classical comparison this whole UI was built for.
+ *  'phase'    — every plane of one selected variant: that state's full phase
+ *               portrait. Called "phase portrait" in the UI, never just
+ *               "portrait", which is already the name of a LAYOUT orientation
+ *               two controls away in the same header.
+ *
+ * Both come out of one cell list, so PanelGrid keeps a single code path and
+ * WignerPanel never learns which mode it is in.
+ */
+type ViewMode = 'variants' | 'phase'
+const MODE_KEY = 'wignerf.panelMode'
+const PLANE_KEY = 'wignerf.panelPlane'
+// 'portrait' was the stored value before the rename; migrate rather than
+// silently resetting someone's choice
+const storedMode = localStorage.getItem(MODE_KEY)
+const mode = ref<ViewMode>(
+  storedMode === 'phase' || storedMode === 'portrait' ? 'phase' : 'variants')
+const planeIdx = ref(Math.max(0, Number(localStorage.getItem(PLANE_KEY)) || 0))
+const variantIdx = ref(0)
+watch(mode, (v) => localStorage.setItem(MODE_KEY, v))
+watch(planeIdx, (v) => localStorage.setItem(PLANE_KEY, String(v)))
+
+const ndim = computed(() => props.geom.ndim)
+const allPlanes = computed(() => planesOf(ndim.value))
+// a stored index can outlive a switch back to 1D, where only plane 0 exists
+const plane = computed(() =>
+  allPlanes.value[Math.min(planeIdx.value, allPlanes.value.length - 1)]!)
+
+interface Cell {
+  key: string
+  variant: VariantKey
+  variantIndex: number
+  plane: readonly [number, number]
+  label: string
+}
+
+const cells = computed<Cell[]>(() => {
+  if (ndim.value === 1 || mode.value === 'variants') {
+    const pl = plane.value
+    return props.variants.map((v, i) => ({
+      key: `${v}:${pl[0]},${pl[1]}`,
+      variant: v, variantIndex: i, plane: pl,
+      label: VARIANT_META[v].label,
+    }))
+  }
+  const i = Math.min(variantIdx.value, props.variants.length - 1)
+  const v = props.variants[i]!
+  return allPlanes.value.map((pl) => ({
+    key: `${v}:${pl[0]},${pl[1]}`,
+    variant: v, variantIndex: i, plane: pl,
+    // the PLANE only: every panel here is the same variant, which the selector
+    // names once. Repeating "Quantum, non-relativistic" six times is noise, and
+    // the long form ran under the control cluster in the top-right panel.
+    label: planeLabelHtml(ndim.value, pl),
+  }))
+})
+
 // Zoom/pan coupling: decoupled by default (each panel its own window);
-// the "link zoom" toggle drives all panels from one shared window.
+// the "link zoom" toggle drives all panels from one shared window. One window
+// per CELL, keyed by cell identity so a mode switch does not shuffle them.
 const LINK_KEY = 'wignerf.linkZoom'
 const linked = ref(localStorage.getItem(LINK_KEY) === '1')
 watch(linked, (v) => localStorage.setItem(LINK_KEY, v ? '1' : '0'))
 
-const views = [createViewWindow(), createViewWindow(),
-               createViewWindow(), createViewWindow()]
+/**
+ * Linking only MEANS anything when every panel shows the same axis pair. In the
+ * phase portrait they show six DIFFERENT pairs — (x,y) against (px,py) against
+ * (x,py) — spanning different quantities in different units, so one shared
+ * fractional window would map to six unrelated physical regions. The toggle is
+ * hidden there and the panels use their own windows; the stored preference is
+ * untouched, so it comes back on the way to 'variants'.
+ */
+const canLink = computed(() => ndim.value === 1 || mode.value === 'variants')
+const linkedNow = computed(() => linked.value && canLink.value)
+
+const views = new Map<string, ReturnType<typeof createViewWindow>>()
 const shared = createViewWindow()
 // coupling adopts the window of the panel the user last zoomed/panned
-let lastTouched = 0
-views.forEach((v, i) => watch(v, () => { lastTouched = i }))
+let lastTouched = ''
+function viewFor(key: string) {
+  let v = views.get(key)
+  if (!v) {
+    v = createViewWindow()
+    views.set(key, v)
+    watch(v, () => { lastTouched = key })
+  }
+  return v
+}
 
-// auto-expand regrid (the domain object is replaced per painted frame when
-// its geometry changed): keep every zoom window on the same PHYSICAL region
-watch(() => props.domain, (nd, od) => {
-  if (!od || !nd || od === nd) return
-  for (const v of views) remapView(v, od, nd)
-  remapView(shared, od, nd)
+/** This cell's plane extents, for the regrid remap. */
+function domainOf(g: GeomCfg, pl: readonly [number, number]): Domain {
+  return { a1: g.lo[pl[0]]!, a2: g.hi[pl[0]]!, b1: g.lo[pl[1]]!, b2: g.hi[pl[1]]! }
+}
+
+// auto-expand regrid (the geom object is replaced per painted frame when its
+// geometry changed): keep every zoom window on the same PHYSICAL region. Each
+// window is remapped through ITS OWN axis pair.
+watch(() => props.geom, (ng, og) => {
+  if (!og || !ng || og === ng || og.ndim !== ng.ndim) return
+  for (const c of cells.value) {
+    const v = views.get(c.key)
+    if (v) remapView(v, domainOf(og, c.plane), domainOf(ng, c.plane))
+  }
+  remapView(shared, domainOf(og, plane.value), domainOf(ng, plane.value))
 })
 
 function toggleLink() {
   if (!linked.value) {
-    Object.assign(shared, views[lastTouched])
+    Object.assign(shared, viewFor(lastTouched || cells.value[0]!.key))
   } else {
     // decouple in place: every panel keeps the current shared window
-    for (const v of views) Object.assign(v, shared)
+    for (const c of cells.value) Object.assign(viewFor(c.key), shared)
   }
   linked.value = !linked.value
 }
 
 const gridClass = computed(() => {
-  const n = props.variants.length
+  const n = cells.value.length
   if (n <= 1) return 'grid-cols-1 grid-rows-1'
   if (n === 2) return 'grid-cols-2 grid-rows-1'
-  return 'grid-cols-2 grid-rows-2'
+  if (n <= 4) return 'grid-cols-2 grid-rows-2'
+  return 'grid-cols-3 grid-rows-2'
 })
 </script>
 
@@ -67,22 +162,47 @@ const gridClass = computed(() => {
   <div class="relative w-full h-full min-h-0">
     <div class="grid gap-1 w-full h-full min-h-0" :class="[gridClass,
            batchOverlay === 'computing' ? 'opacity-20 grayscale pointer-events-none' : '']">
-      <div v-for="(v, i) in variants" :key="v"
+      <div v-for="c in cells" :key="c.key"
            class="min-h-0 border rounded overflow-hidden"
-           :style="{ borderColor: variantColor(v) + '66' }">
-        <WignerPanel :frame-source="frameSource" :variant-index="i"
-                     :label="VARIANT_META[v].label"
-                     :domain="domain" :show-grid="showGrid"
-                     :view="linked ? shared : views[i]" />
+           :style="{ borderColor: variantColor(c.variant) + '66' }">
+        <WignerPanel :frame-source="frameSource" :variant-index="c.variantIndex"
+                     :plane="c.plane" :label="c.label" :show-grid="showGrid"
+                     :show-cells="showCells"
+                     :view="linkedNow ? shared : viewFor(c.key)" />
       </div>
     </div>
-    <label v-if="variants.length > 1"
-           class="absolute top-1 right-2 z-10 flex items-center gap-1 text-xs
-                  text-white bg-black/75 px-1.5 py-0.5 rounded cursor-pointer select-none"
-           title="couple zoom/pan across all panels (coupling adopts the last-zoomed panel's view)">
-      <input type="checkbox" :checked="linked" @change="toggleLink" />
-      <span>link zoom</span>
-    </label>
+    <div class="absolute top-1 right-2 z-10 flex items-center gap-2 text-xs
+                text-white bg-black/75 px-1.5 py-0.5 rounded select-none">
+      <!-- 2D only: 24 variant x plane combinations do not fit on screen, so
+           pick a reading. Hidden at ndim=1, where there is nothing to pick. -->
+      <template v-if="ndim > 1">
+        <select v-model="mode" class="bg-transparent outline-none cursor-pointer"
+                title="compare variants on one plane, or see every plane of one variant">
+          <option value="variants" class="text-black">compare variants</option>
+          <option value="phase" class="text-black">phase portrait</option>
+        </select>
+        <select v-if="mode === 'variants'" v-model.number="planeIdx"
+                class="bg-transparent outline-none cursor-pointer"
+                title="which 2D reduction every panel shows">
+          <option v-for="(pl, i) in allPlanes" :key="i" :value="i" class="text-black">
+            {{ planeLabel(ndim, pl) }}
+          </option>
+        </select>
+        <select v-else v-model.number="variantIdx"
+                class="bg-transparent outline-none cursor-pointer"
+                title="whose phase-space portrait to show">
+          <option v-for="(v, i) in variants" :key="v" :value="i" class="text-black">
+            {{ VARIANT_META[v].label }}
+          </option>
+        </select>
+      </template>
+      <label v-if="canLink && cells.length > 1"
+             class="flex items-center gap-1 cursor-pointer"
+             title="couple zoom/pan across all panels (coupling adopts the last-zoomed panel's view)">
+        <input type="checkbox" :checked="linked" @change="toggleLink" />
+        <span>link zoom</span>
+      </label>
+    </div>
 
     <!-- batch mode: no frames are streamed while computing, so stand a
          progress card in for the dimmed heatmaps (the observable series keep

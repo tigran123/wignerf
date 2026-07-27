@@ -23,10 +23,27 @@ WIGNERF_HISTORY_MB   in-RAM frame history cap per session (default 32 GiB:
                      ask for less, never for more.
 WIGNERF_FFT_THREADS  threads per FFT; 0 = auto (ncores // (2*n_variants),
                      capped at 4; decided at session start)
-WIGNERF_MAX_GRID     per-axis Nx/Np ceiling for auto-expand doublings
-                     (default 4096 — the schema maximum; lower it on
-                     VRAM-constrained hosts: a 4096x4096 complex working
-                     set is ~1.3 GiB per variant worker)
+WIGNERF_MAX_GRID     per-axis ceiling for 1D (ndim=1) sessions and for
+                     auto-expand doublings (default 4096 — the schema
+                     maximum; lower it on VRAM-constrained hosts: a
+                     4096x4096 complex working set is ~1.3 GiB per variant
+                     worker)
+WIGNERF_MAX_GRID_2D  per-axis ceiling for 2D (ndim=2) sessions (default 128).
+                     A rail only — see below for the operative one.
+WIGNERF_MAX_CELLS_2D total-cell RAIL for 2D sessions (default 2**27 = 134M,
+                     i.e. 26 GiB/worker — past any single card here). A rail,
+                     NOT the operative guard: the real check is per-device,
+                     asking the driver how much is actually free and comparing
+                     it against the workers assigned to that device
+                     (routers/sessions._fit_error). A fixed cell count cannot
+                     do that job — it is wrong in both directions, refusing
+                     128x128x64x64 (13.0 GiB, one worker) on a 24 GiB card
+                     while permitting 6.5 GiB x 2 workers on an 11 GiB one.
+                     This rail exists to stop absurd values (256^4 = 4.3e9
+                     cells) cheaply and deterministically, and to be the only
+                     guard on a host where free memory cannot be read. See
+                     BYTES_PER_CELL_2D below for where the bytes go (the state
+                     is 4% of them).
 WIGNERF_EXPORT_DIR   where mp4 exports are written before being downloaded
                      (default <tempdir>/wignerf-exports; files are deleted
                      after the download TTL, on session close and at exit)
@@ -82,6 +99,49 @@ PRECISION = _precision()
 HISTORY_MB = int(os.environ.get("WIGNERF_HISTORY_MB", "32768"))
 FFT_THREADS = int(os.environ.get("WIGNERF_FFT_THREADS", "0"))
 MAX_GRID = int(os.environ.get("WIGNERF_MAX_GRID", "4096"))
+MAX_GRID_2D = int(os.environ.get("WIGNERF_MAX_GRID_2D", "128"))
+MAX_CELLS_2D = int(os.environ.get("WIGNERF_MAX_CELLS_2D", str(2**27)))
+
+# Device bytes ONE variant worker holds per grid cell, float64. Measured on an
+# RTX 3090, 2026-07-26, on a real worker footprint: 208.0 B/cell at 32^4, 48^4
+# and 64^4 alike — 0.20, 1.03 and 3.25 GiB.
+#
+# THE STATE IS 4% OF IT, which is the thing everyone gets wrong: W is REAL
+# (solve_spectral returns B.real), so it is float64 = 8 B/cell — 0.12 GiB at
+# 64^4 — and the other 200 B/cell is the machinery of the step, all at full
+# shape. Pool high-water by stage, measured:
+#
+#   Propagator rebuild (dU_im + dT_im at 16, plus the two Bopp
+#     evaluations U(q -+ i*hbar*theta/2) at complex argument)      +80
+#   W, the state                                                  + 0  (pooled)
+#   _exp_main = (expU, expT), 2x complex128                       + 0  (pooled)
+#   _exp_odd, the slot for the substep clamped onto tau_k          +32
+#   one Strang step: complex working arrays + cuFFT work area      +16
+#   adjust_step: W1 and W2, plus a 2nd exponent pair for the halves +80
+#   frame.build: 6 plane reductions + the int W^2 pass            + 0  (pooled)
+#
+# So the two exponent slots (64 B/cell) are the largest single item — which is
+# what milestone M7 removes half of — and the complex arrays are what M1
+# (float32) halves. Neither is free; see CLAUDE.md.
+#
+# Not a display detail: at 4 variants split 2+2 over a card pair this is what
+# decides whether a session starts, so the create-time refusal quotes it and
+# status() reports it for the Setup panel's footprint line.
+BYTES_PER_CELL_2D = 208
+
+
+def max_grid(ndim):
+    """Per-axis ceiling for this dimensionality."""
+    return MAX_GRID if ndim == 1 else MAX_GRID_2D
+
+
+def max_cells(ndim):
+    """Total-cell ceiling. Unbounded at ndim=1 (MAX_GRID already bounds a 2D
+    array to 4096^2 = 16.8M cells); the operative limit past that, because
+    N^4 outruns any per-axis rail."""
+    return None if ndim == 1 else MAX_CELLS_2D
+
+
 EXPORT_DIR = os.environ.get(
     "WIGNERF_EXPORT_DIR",
     os.path.join(tempfile.gettempdir(), "wignerf-exports"))

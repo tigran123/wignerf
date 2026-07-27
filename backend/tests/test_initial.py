@@ -13,7 +13,7 @@ from core.initial import (GaussianComponent, cat_wigner, minimal_sigma_p,
 
 @pytest.fixture(scope="module")
 def grid():
-    return Grid(-8.0, 8.0, 128, -8.0, 8.0, 128, ArrayBackend(device="cpu"))
+    return Grid.from_1d(-8.0, 8.0, 128, -8.0, 8.0, 128, ArrayBackend(device="cpu"))
 
 
 def _comp(x0, p0, sx, weight=1.0, phase=0.0):
@@ -87,7 +87,7 @@ def test_preview_warnings(grid):
     assert any("edge" in s for s in w)
     # under-resolved fringes: huge separation
     c = [_comp(-7.0, 0.0, 0.3), _comp(7.0, 0.0, 0.3)]
-    g2 = Grid(-8.0, 8.0, 64, -8.0, 8.0, 16, ArrayBackend(device="cpu"))
+    g2 = Grid.from_1d(-8.0, 8.0, 64, -8.0, 8.0, 16, ArrayBackend(device="cpu"))
     assert any("under-resolved" in s for s in preview_warnings(g2, c, "cat"))
 
 

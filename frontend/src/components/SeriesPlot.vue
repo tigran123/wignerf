@@ -10,39 +10,70 @@
  */
 import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../api'
-import { loadHidden, saveHidden } from '../lib/plotPrefs'
-import { createUplotZoom } from '../lib/uplotZoom'
+import { lzTitle, purityTitle, uncertaintyTitle } from '../lib/axes'
+import { loadHidden, saveHidden, type PlotId } from '../lib/plotPrefs'
+import { createUplotZoom, setPlotTitleHtml } from '../lib/uplotZoom'
 import { chartPalette, theme } from '../lib/theme'
 import { VARIANT_META, keyOfVid, variantColor, type VariantKey } from '../lib/variants'
 
 const props = defineProps<{
   sessionId: string | null
   variants: VariantKey[]
-  which: 'E' | 'uncertainty' | 'purity'
+  /**
+   * Which quantity. 'uncertainty' is per spatial DIMENSION (`dim`), so a 2D run
+   * gets one plot for ΔX·ΔPx and one for ΔY·ΔPy; 'lz' is the 2D-only angular
+   * momentum, which no 1D run has.
+   */
+  which: 'E' | 'uncertainty' | 'purity' | 'lz'
+  /** spatial dimension for which === 'uncertainty' */
+  dim?: number
+  ndim: number
   showGrid?: boolean
   /** physical time of the PAINTED frame — the time cursor rides on it
    *  (null before the first frame) */
   cursorT?: number | null
 }>()
 
+interface SeriesVariant {
+  vid: number
+  E: number
+  purity: number
+  /** per phase-space axis, so std[i]*std[ndim+i] is dimension i's product */
+  std: number[]
+  lz: number
+}
+
 interface SeriesRec {
   n: number
   t: number
-  variants: { vid: number; E: number; x_std: number; p_std: number; purity: number }[]
+  variants: SeriesVariant[]
 }
 
-const TITLES = {
-  E: 'E(t)',
-  uncertainty: 'ΔX·ΔP(t)',
-  purity: 'purity γ(t) = 2πℏ∬W²dxdp',
+/** localStorage/plot key: unique per dimension for the uncertainty plots. */
+const prefId = computed<PlotId>(() =>
+  props.which === 'uncertainty'
+    ? (`uncertainty${props.dim ?? 0}` as PlotId)
+    : props.which)
+
+/** `html` gives real subscripts; uPlot takes the plain one at construction and
+ *  setPlotTitleHtml rewrites it (see lib/uplotZoom.ts). */
+function titleOf(html: boolean): string {
+  if (props.which === 'E') return 'E(t)'
+  if (props.which === 'purity') return purityTitle(props.ndim, html)
+  if (props.which === 'lz') return lzTitle(html)
+  return uncertaintyTitle(props.ndim, props.dim ?? 0, html)
 }
+const title = computed(() => titleOf(false))
 
 const el = ref<HTMLDivElement | null>(null)
 // per-plot display-only visibility (persisted); the session keeps
 // computing and accumulating every variant regardless
-const hidden = ref(loadHidden(props.which))
+const hidden = ref(loadHidden(
+  props.which === 'uncertainty'
+    ? (`uncertainty${props.dim ?? 0}` as PlotId)
+    : props.which))
 // created in setup so the zoom window survives the grid-lines rebuild
 const zoom = createUplotZoom()
 let chart: uPlot | null = null
@@ -54,10 +85,13 @@ let generation = 0    // bumped by reset(): stale responses are discarded
 const ts: number[] = []   // x-values: physical time t of each record (a.u.)
 const cols: Map<VariantKey, (number | null)[]> = new Map()
 
-function value(v: { E: number; x_std: number; p_std: number; purity: number }): number {
+function value(v: SeriesVariant): number {
   if (props.which === 'E') return v.E
   if (props.which === 'purity') return v.purity
-  return v.x_std * v.p_std
+  if (props.which === 'lz') return v.lz
+  const i = props.dim ?? 0
+  const nd = v.std.length / 2
+  return v.std[i]! * v.std[nd + i]!
 }
 
 function pushNulls() {
@@ -122,7 +156,7 @@ function toggle(v: VariantKey) {
   const h = hidden.value
   if (h.has(v)) h.delete(v)
   else h.add(v)
-  saveHidden(props.which, h)
+  saveHidden(prefId.value, h)
   // setSeries auto-rescales y over the remaining visible curves...
   chart?.setSeries(props.variants.indexOf(v) + 1, { show: !h.has(v) })
   // ...which would silently drop a pinned y-zoom — re-assert it
@@ -180,7 +214,7 @@ function makeChart(width: number): uPlot {
     {
       width,
       height: 130,
-      title: TITLES[props.which],
+      title: title.value,
       legend: { show: false },
       // zoom owns the cursor config (drag/wheel/dblclick); the second
       // plugin re-places the time cursor whenever the chart re-lays out
@@ -250,6 +284,7 @@ function setChartData() {
 
 onMounted(() => {
   chart = makeChart(el.value!.clientWidth || 360)
+  setPlotTitleHtml(chart, titleOf(true))
   addCursorEl(chart)
   const ro = new ResizeObserver(() => {
     if (chart && el.value) chart.setSize({ width: el.value.clientWidth, height: 130 })
@@ -261,9 +296,10 @@ onMounted(() => {
   watch(() => props.cursorT, placeCursor)
   // grid-lines toggle and theme change: rebuild in place, keeping the
   // accumulated data (both only reach uPlot at construction)
-  watch([() => props.showGrid, theme], () => {
+  watch([() => props.showGrid, theme, title], () => {
     chart?.destroy()
     chart = makeChart(el.value?.clientWidth || 360)
+    setPlotTitleHtml(chart, titleOf(true))
     addCursorEl(chart)          // the old element died with the old chart
     setChartData()
   })
@@ -271,7 +307,7 @@ onMounted(() => {
   // debug surface: window.__wfSeries.<which>() -> poller state
   const dbg = ((window as unknown as Record<string, unknown>).__wfSeries ??= {}) as
     Record<string, () => unknown>
-  dbg[props.which] = () => ({
+  dbg[prefId.value] = () => ({
     points: ts.length, merged, lastT: ts.at(-1) ?? null, gone, inFlight, generation,
     sessionId: props.sessionId,
     lastVals: props.variants.map((k) => cols.get(k)?.at(-1) ?? null),

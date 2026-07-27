@@ -138,7 +138,10 @@ def _progress_msg(s, lc):
              "steps_total": w.steps_total}
         v = obs.get(protocol.variant_id(**w.flavor))
         if v is not None:
-            e.update(E=v.E, x_std=v.x_std, p_std=v.p_std, purity=v.purity)
+            e.update(E=v.E, purity=v.purity, std=list(v.std),
+                     mean=list(v.mean), lz=v.lz)
+            if v.ndim == 1:
+                e.update(x_std=v.x_std, p_std=v.p_std)
         out.append(e)
     return {"type": "progress", "record": lc, "t": t, "t1": c.t1, "t2": c.t2,
             "percent": pct, "per_variant": out}
