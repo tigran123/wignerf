@@ -14,3 +14,10 @@ docs/
 
 # Results of our simulations go here
 out/
+
+# Claude Code's data for this project (session transcripts, subagent logs,
+# project memory), kept beside the repo rather than under ~/.claude:
+# ~/.claude/projects/-home-tigran-python-wignerf is a SYMLINK to this path.
+# Not committed — it holds whole conversations. Only this subdirectory is
+# ignored, so a project-scoped .claude/settings.json could still be tracked.
+.claude/projects/
