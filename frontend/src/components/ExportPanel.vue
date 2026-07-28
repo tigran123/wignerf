@@ -22,8 +22,13 @@ import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import type { ExportEvent, SessionStatus } from '../composables/useSession'
 import { apiErrorText } from '../lib/apierror'
+import { planeLabel, planes as planesOf, planeTitle } from '../lib/axes'
 import { importConfig, type SimConfig } from '../lib/config'
+import { defaultDiagnostics, diagnosticLabel, diagnosticTitle,
+         diagnosticsAvailable, panelGridOf, panelPixels, PANEL_PX_MIN,
+         type DiagId } from '../lib/exportLayout'
 import { extractWignerfDoc } from '../lib/mp4meta'
+import { panelMode, panelPlaneIdx, panelVariantIdx } from '../lib/panelView'
 import { fmtTime } from '../lib/units'
 import { theme, type ThemeName } from '../lib/theme'
 import { VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
@@ -62,6 +67,14 @@ interface ExportForm {
   // changes over time and a stale index would silently pick another size
   width: number
   variants: VariantKey[]
+  // WHAT THE FRAME SHOWS. `planes` are indices into axes.planes(ndim) — the
+  // same index the panel grid stores — and the panels are the cartesian
+  // product of these and `variants`, so the SPA's two readings are the two
+  // edges of one control rather than modes of their own. `diagnostics` are
+  // plot ids shared with lib/plotPrefs.ts; an EMPTY list is legal and gives a
+  // panels-only video.
+  planes: number[]
+  diagnostics: DiagId[]
   // '' = the host's WIGNERF_EXPORT_ENCODER. Per JOB, not per session: the
   // right choice depends on what else is running, since nvenc's real benefit
   // is freeing CPU cores for the parallel frame RENDER (the bottleneck).
@@ -83,9 +96,26 @@ const jobTheme = ref<ThemeName>(theme.value)
 
 const STORAGE_KEY = 'wignerf.export'
 
+/**
+ * The diagnostics choice is remembered PER NDIM, not as one list. The two are
+ * genuinely different sets — 1D has five plots, 2D has nine, and only three
+ * ids appear in both — so carrying one over gives the worst of each: a 1D
+ * choice reused at 2D silently drops ⟨Lz⟩ and ΔY·ΔPy, the two plots a 2D user
+ * is most likely to be here for.
+ */
+const diagByNdim: Record<string, DiagId[]> = {}
+
+// Declared HERE and not beside is2d below, because the persistence watcher a
+// few lines down reads it and Vue evaluates a watch source IMMEDIATELY to seed
+// its old value — a later `const` is still in its temporal dead zone at that
+// moment, which threw "Cannot access 'ndim' before initialization" on every
+// page load and left the panel's watcher dead.
+const ndim = computed(() => props.status?.ndim ?? 1)
+
 function loadForm(): ExportForm {
   const d: ExportForm = { k0: 0, k1: 0, stride: 1, fps: 30, width: 1920,
-                          variants: [...props.variants], encoder: '' }
+                          variants: [...props.variants], planes: [0],
+                          diagnostics: defaultDiagnostics(1), encoder: '' }
   try {
     const s = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
     if (s && typeof s === 'object') {
@@ -93,6 +123,9 @@ function loadForm(): ExportForm {
         if (typeof s[k] === 'number') d[k] = s[k]
       if (RESOLUTIONS.some((r) => r.width === s.width)) d.width = s.width
       if (ENCODERS.some((e) => e.value === s.encoder)) d.encoder = s.encoder
+      if (s.diagnostics && typeof s.diagnostics === 'object')
+        for (const [nd, ids] of Object.entries(s.diagnostics))
+          if (Array.isArray(ids)) diagByNdim[nd] = ids as DiagId[]
     }
   } catch { /* corrupted storage -> defaults */ }
   return d
@@ -101,13 +134,30 @@ function loadForm(): ExportForm {
 const form = reactive(loadForm())
 const resolution = computed(() =>
   RESOLUTIONS.find((r) => r.width === form.width) ?? RESOLUTIONS[0])
-// the RANGE is never persisted (it belongs to this session's history), only
-// the encoding preferences
-watch(() => [form.stride, form.fps, form.width, form.encoder], () => {
+// the RANGE is never persisted (it belongs to this session's history), and
+// neither is the PLANE choice — that is seeded from the panel grid every time
+// this opens (below), and a remembered value would fight the seeding exactly
+// as a remembered theme would stop tracking the app's
+function saveForm() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(
     { stride: form.stride, fps: form.fps, width: form.width,
-      encoder: form.encoder }))
-})
+      encoder: form.encoder, diagnostics: diagByNdim }))
+}
+
+watch(() => [form.stride, form.fps, form.width, form.encoder], saveForm)
+
+// The diagnostics set is recorded by the TOGGLE, never by a watcher on the
+// form. A watcher cannot tell a choice from a re-seed: `status.ndim` arrives
+// after the first render, so the form still holds the 1D default at the moment
+// it flips to 2, and a watcher keyed on (ndim, diagnostics) faithfully stored
+// that 1D set as the user's 2D preference — which then won over
+// defaultDiagnostics(2) the first time the panel was opened, so a fresh 2D
+// export offered rho(x)/rho(y) and no <Lz>. Measured in a browser before this
+// was written this way.
+function rememberDiagnostics() {
+  diagByNdim[String(ndim.value)] = [...form.diagnostics]
+  saveForm()
+}
 
 const open = ref(false)
 const busy = ref(false)
@@ -151,21 +201,74 @@ const running = computed(() => props.status?.running ?? false)
 // records), but a DISABLED button whose only explanation is a tooltip is
 // how this feature first looked broken. Opening the panel explains the
 // gate, and Render pauses the run first.
-// mp4 export of a 2D run is deferred (milestone M4 in CLAUDE.md): the export
-// figure needs a plane-set panel grid, four marginals, <Lz> and the (2 pi h)^2
-// purity scale. The SETUP half of this panel works for 2D from the first cut —
-// which is why the button stays live and the gate is stated in the panel rather
-// than the whole thing being disabled: downloading and importing a setup is
-// exactly what a 2D user is here for.
-const is2d = computed(() => (props.status?.ndim ?? 1) > 1)
+const is2d = computed(() => ndim.value > 1)     // ndim is declared above
 const disabled = computed(() => !hasHistory.value || !props.sessionId)
 const disabledWhy = computed(() =>
   !hasHistory.value ? 'nothing computed yet'
-    : is2d.value
-      ? "save/load this simulation's setup (mp4 export of 2D runs is not "
-        + 'available yet — milestone M4)'
-      : 'render the computed range to an mp4 video, or save/load this '
-        + "simulation's setup")
+    : 'render the computed range to an mp4 video, or save/load this '
+      + "simulation's setup")
+
+// -- what the frame shows ---------------------------------------------------
+
+/**
+ * A 2D record carries six planes per variant (up to 24 panels) and nine
+ * diagnostics against 1D's five, which is more than a frame can hold — the SPA
+ * answers that by scrolling its column and offering two panel readings,
+ * neither of which a video frame can do. So the job selects.
+ *
+ * Panels are the CARTESIAN PRODUCT of the chosen planes and variants, which
+ * makes PanelGrid's two readings the two edges of one control: the presets
+ * below just set the checkboxes.
+ */
+const allPlanes = computed(() => planesOf(ndim.value))
+const allDiagnostics = computed(() => diagnosticsAvailable(ndim.value))
+
+function togglePlane(i: number) {
+  const at = form.planes.indexOf(i)
+  if (at >= 0) {
+    if (form.planes.length === 1) return       // the API needs >= 1
+    form.planes.splice(at, 1)
+  } else {
+    form.planes.push(i)
+    form.planes.sort((a, b) => a - b)
+  }
+}
+
+function toggleDiagnostic(id: DiagId) {
+  const at = form.diagnostics.indexOf(id)
+  // an empty set is legal — a panels-only video is a real thing to want
+  if (at >= 0) form.diagnostics.splice(at, 1)
+  else {
+    form.diagnostics.push(id)
+    const order = allDiagnostics.value
+    form.diagnostics.sort((a, b) => order.indexOf(a) - order.indexOf(b))
+  }
+  rememberDiagnostics()
+}
+
+/** The two readings PanelGrid offers, as one-click presets. */
+function presetCompareVariants() {
+  form.planes = [Math.min(panelPlaneIdx.value, allPlanes.value.length - 1)]
+  form.variants = [...props.variants]
+}
+
+function presetPhasePortrait() {
+  form.planes = allPlanes.value.map((_p, i) => i)
+  const v = props.variants[Math.min(panelVariantIdx.value,
+                                    props.variants.length - 1)]
+  if (v) form.variants = [v]
+}
+
+const grid = computed(() =>
+  panelGridOf(form.planes.length, form.variants.length))
+const panelPx = computed(() =>
+  panelPixels(grid.value.rows, grid.value.cols, form.diagnostics.length,
+              resolution.value.width, resolution.value.height))
+/** Tiny panels are the one way this dialog can produce a useless video, so it
+ *  says so BEFORE the render rather than after — the same job the Setup
+ *  panel's 2D footprint line does. */
+const panelsCramped = computed(() =>
+  Math.min(panelPx.value.w, panelPx.value.h) < PANEL_PX_MIN)
 
 /** t of a record index, from the timeline's own linear mapping. */
 function tOf(k: number): string {
@@ -208,6 +311,17 @@ watch(open, async (v) => {
   jobTheme.value = theme.value   // follow the app unless overridden below
   form.variants = form.variants.filter((k) => props.variants.includes(k))
   if (!form.variants.length) form.variants = [...props.variants]
+  // ...and seed the CONTENT from the panel grid, so Render films what is on
+  // screen. Same path the theme takes, and re-seeded on every open for the
+  // same reason: a remembered value would silently stop tracking.
+  if (panelMode.value === 'phase' && is2d.value) presetPhasePortrait()
+  else presetCompareVariants()
+  // remembered per ndim; an empty list is a legal CHOICE (a panels-only
+  // video), so only an absent entry falls back to the default
+  const stored = diagByNdim[String(ndim.value)]
+  form.diagnostics = stored
+    ? stored.filter((d) => allDiagnostics.value.includes(d))
+    : defaultDiagnostics(ndim.value)
   // a FINISHED job is kept: rendering continues while the popover is
   // closed, and reopening it is how you collect the file (clearing here
   // threw away the only link to a file that still exists on the server)
@@ -265,6 +379,7 @@ async function start() {
       `/sessions/${props.sessionId}/export`,
       { k0: form.k0, k1: form.k1, stride: form.stride, fps: form.fps,
         width: r.width, height: r.height, variants: form.variants,
+        planes: form.planes, diagnostics: form.diagnostics,
         show_grid: props.showGrid, theme: jobTheme.value,
         ...(form.encoder ? { encoder: form.encoder } : {}) })
     job.value = data
@@ -422,18 +537,10 @@ onBeforeUnmount(() => clearInterval(poll))
       <h4 class="font-semibold text-fg-2">Export</h4>
 
       <h5 class="text-muted uppercase tracking-wider text-[11px] pt-1">
-        Video (mp4) — the computed range<template v-if="is2d"> — 1D only for
-        now</template>
+        Video (mp4) — the computed range
       </h5>
 
-      <p v-if="is2d" class="text-warn">
-        mp4 export of 2D runs is not available yet (milestone M4): the export
-        figure needs a plane-set panel grid, four marginals, ⟨Lz⟩ and the
-        (2πℏ)² purity scale. The run's SETUP below does work — download it and
-        re-import it to reproduce this run exactly.
-      </p>
-
-      <div v-if="!is2d" class="grid grid-cols-[3.5rem_1fr] gap-x-2 gap-y-1.5 items-center">
+      <div class="grid grid-cols-[3.5rem_1fr] gap-x-2 gap-y-1.5 items-center">
         <span class="text-muted">records</span>
         <div class="flex items-center gap-1">
           <input v-model.number="form.k0" type="number" class="wf-num w-20"
@@ -498,7 +605,7 @@ onBeforeUnmount(() => clearInterval(poll))
           <option value="dark">dark</option>
         </select>
 
-        <span class="text-muted">panels</span>
+        <span class="text-muted">variants</span>
         <div class="flex items-center gap-2">
           <label v-for="v in props.variants" :key="v"
                  class="flex items-center gap-1 cursor-pointer select-none"
@@ -508,16 +615,64 @@ onBeforeUnmount(() => clearInterval(poll))
             <span :style="{ color: variantColor(v) }">{{ v.toUpperCase() }}</span>
           </label>
         </div>
+
+        <!-- 2D only: one plane per panel, and there are six of them. At
+             ndim=1 there is nothing to choose. -->
+        <template v-if="is2d">
+          <span class="text-muted">planes</span>
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <label v-for="(pl, i) in allPlanes" :key="i"
+                   class="flex items-center gap-1 cursor-pointer select-none"
+                   :title="planeTitle(ndim, pl)">
+              <input type="checkbox" :checked="form.planes.includes(i)"
+                     @change="togglePlane(i)" />
+              <span>{{ planeLabel(ndim, pl) }}</span>
+            </label>
+          </div>
+
+          <span></span>
+          <div class="flex items-center gap-1">
+            <button class="px-1.5 py-0.5 rounded bg-raised hover:bg-raised-hover
+                           whitespace-nowrap"
+                    title="one plane across every variant — the reading the
+                           panel grid calls 'compare variants'"
+                    @click="presetCompareVariants">compare variants</button>
+            <button class="px-1.5 py-0.5 rounded bg-raised hover:bg-raised-hover
+                           whitespace-nowrap"
+                    title="every plane of one variant — the reading the panel
+                           grid calls 'phase portrait'"
+                    @click="presetPhasePortrait">phase portrait</button>
+          </div>
+        </template>
+
+        <span class="text-muted">plots</span>
+        <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <label v-for="d in allDiagnostics" :key="d"
+                 class="flex items-center gap-1 cursor-pointer select-none"
+                 :title="diagnosticTitle(ndim, d)">
+            <input type="checkbox" :checked="form.diagnostics.includes(d)"
+                   @change="toggleDiagnostic(d)" />
+            <span>{{ diagnosticLabel(ndim, d) }}</span>
+          </label>
+        </div>
       </div>
 
-      <p v-if="!is2d" class="text-fg-3">
-        {{ frames }} frames → {{ duration.toFixed(1) }} s of video, {{ jobTheme }}
-        theme, grid lines {{ showGrid ? 'on' : 'off' }} (follows the setup panel).
-        Each frame carries the panels, the marginals, the E/ΔX·ΔP/γ series
-        and the parameters + IC needed to reproduce the run.
+      <p class="text-fg-3">
+        {{ frames }} frames → {{ duration.toFixed(1) }} s of video,
+        {{ grid.cells }} panel<template v-if="grid.cells !== 1">s</template>
+        (<span class="tabular-nums">{{ grid.cols }}×{{ grid.rows }}</span>,
+        ~<span class="tabular-nums">{{ panelPx.w }}×{{ panelPx.h }}</span> px
+        each), {{ jobTheme }} theme, grid lines
+        {{ showGrid ? 'on' : 'off' }} (follows the setup panel). Each frame
+        also carries the parameters + IC needed to reproduce the run.
       </p>
 
-      <p v-if="running && !is2d" class="text-warn">
+      <p v-if="panelsCramped" class="text-warn">
+        Those panels are thumbnails at this size. Render at a larger size, or
+        drop planes or variants — {{ grid.cells }} panels share the frame.
+      </p>
+
+      <p v-if="running" class="text-warn">
         The session is still computing. Rendering needs a paused session —
         Render will pause it first (computation resumes with Solve).
       </p>
@@ -538,7 +693,7 @@ onBeforeUnmount(() => clearInterval(poll))
         </p>
       </div>
 
-      <div v-if="!is2d" class="flex items-center gap-2 pt-1">
+      <div class="flex items-center gap-2 pt-1">
         <button class="wf-solid px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 font-medium"
                 :disabled="busy || frames < 1
                            || job?.state === 'running' || job?.state === 'queued'"

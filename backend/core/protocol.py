@@ -374,13 +374,12 @@ MSG_EXPAND_F32 = (
     "precision float64 to auto-expand, or size the domain by hand.")
 
 
-# 2D still ships without auto-expand and mp4 export — milestones M3 and M4 in
-# CLAUDE.md, both wanted and both out only until the work each names is done.
-# Each is refused explicitly here rather than half-working: a gate that says what
-# it stands in for cannot be mistaken for settled scope, and cannot be relaxed by
-# accident.
+# 2D still ships without auto-expand — milestone M3 in CLAUDE.md, wanted and out
+# only until the work it names is done. It is refused explicitly here rather than
+# half-working: a gate that says what it stands in for cannot be mistaken for
+# settled scope, and cannot be relaxed by accident.
 #
-# TWO gates that were here are gone, and both left their verification behind
+# THREE gates that were here are gone, and each left its verification behind
 # rather than being waved through. M2 (relativistic qr/cr, 2026-07-27): the mc^2
 # cancellation inside the 4D kinetic difference and the massless gradient at the
 # lattice origin, measured and pinned in tests/test_propagator2d.py. M1 (float32,
@@ -389,16 +388,16 @@ MSG_EXPAND_F32 = (
 # re-measured at 4D sizes (it saturates at ~2.5e-6, so TOL_MIN_F32 = 1e-5 keeps
 # 4x margin and did not move), and the footprint measured at 112 B/cell against
 # float64's 208 — see tests/test_precision.py and config.BYTES_PER_CELL_2D.
+# M4 (mp4 export, 2026-07-28): the figure generalized over a plane x variant
+# panel grid and a selectable diagnostics column (ExportSpec.planes /
+# .diagnostics below), and the constant the gate had been hiding — RangeStats'
+# one-colour-scale-per-variant shape, which would have mis-scaled five of every
+# six 2D panels in silence. See tests/test_export2d.py.
 MSG_EXPAND_2D = (
     "auto-expand is not available for 2D runs yet (milestone M3): in 4D every "
     "axis doubling doubles a multi-GiB working set, so the planner needs a "
     "memory guard it does not have. Boundary DETECTION still runs on all four "
     "axes and will warn you; size the domain by hand.")
-MSG_EXPORT_2D = (
-    "mp4 export is not available for 2D runs yet (milestone M4): the export "
-    "figure needs a plane-set panel grid, four marginals, ⟨Lz⟩ and the (2πℏ)² "
-    "purity scale. The run's SETUP document (GET /sessions/{id}/setup) does "
-    "work, and re-importing it reproduces the run.")
 
 
 class SessionCreate(BaseModel):
@@ -492,6 +491,27 @@ class ExportSpec(BaseModel):
     height: int = Field(default=1080, ge=240, le=2160)
     variants: Optional[list[Literal["qn", "qr", "cn", "cr"]]] = \
         Field(default=None, min_length=1, max_length=4)
+    # WHAT THE FRAME SHOWS. A 2D record carries six planes per variant (up to
+    # 24 panels) and nine diagnostics against 1D's five, which is more than a
+    # video frame can hold — the SPA answers that by scrolling its column and
+    # offering two panel readings, neither of which a frame can do. So the job
+    # selects, and render_mpl lays out what it was given.
+    #
+    # `planes` are indices into axes.PLANES[ndim] — the same index the SPA's
+    # panel selector stores in localStorage.wignerf.panelPlane. Panels are the
+    # CARTESIAN PRODUCT of these and `variants`, which makes PanelGrid.vue's
+    # two readings the two edges of one control rather than modes of their own.
+    # None = every plane of this ndim.
+    planes: Optional[list[int]] = Field(default=None, min_length=1,
+                                        max_length=6)
+    # Diagnostics plot ids, shared verbatim with frontend/src/lib/plotPrefs.ts:
+    # marg0..marg3, E, uncertainty0/1, purity, lz. An EMPTY list is legal and
+    # means a panels-only video. None = render_mpl.diagnostics_default(ndim),
+    # which is all five at 1D and the five SERIES at 2D (there the x,y and
+    # px,py panels already ARE the spatial and momentum densities).
+    # Validated against the session's ndim in routers/export.py, which is
+    # where ndim is known — as with `variants`.
+    diagnostics: Optional[list[str]] = Field(default=None, max_length=16)
     # mirrors the SPA's "grid lines on plots" toggle (localStorage
     # wignerf.grid, default on) — one setting for every plot in the frame,
     # W heatmaps included
@@ -517,6 +537,14 @@ class ExportSpec(BaseModel):
         if self.variants is not None and \
            len(set(self.variants)) != len(self.variants):
             raise ValueError("duplicate variants")
+        if self.planes is not None:
+            if len(set(self.planes)) != len(self.planes):
+                raise ValueError("duplicate planes")
+            if any(i < 0 for i in self.planes):
+                raise ValueError("plane indices must be >= 0")
+        if self.diagnostics is not None and \
+           len(set(self.diagnostics)) != len(self.diagnostics):
+            raise ValueError("duplicate diagnostics")
         return self
 
 

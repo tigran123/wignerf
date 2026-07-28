@@ -13,9 +13,11 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 import config
+from core import axes as ax
+from core import render_mpl
 from core import session as sessions
 from core import videoexport
-from core.protocol import MSG_EXPORT_2D, ExportSpec
+from core.protocol import ExportSpec
 
 router = APIRouter()
 
@@ -25,10 +27,37 @@ def create_export(sid: str, spec: ExportSpec):
     s = sessions.get_session(sid)
     if s is None:
         raise HTTPException(404, "no such session")
-    # checked before ffmpeg, so a 2D user learns what is deferred rather than
-    # that their server lacks a codec
-    if s.ndim > 1:
-        raise HTTPException(422, MSG_EXPORT_2D)
+    # WHAT was asked for is checked first, before anything about the server or
+    # the session's state: a spec naming a plane this run does not have is
+    # wrong however much history exists and whether or not ffmpeg is
+    # installed, and "no computed records to export" would send you looking in
+    # the wrong place. Same reasoning the removed ndim gate carried.
+    #
+    # These live here rather than in the schema because what is available
+    # depends on the session's ndim, which the request body does not carry.
+    # Both refusals name what IS available, not just what was wrong — a 1D
+    # session has one plane and no <Lz>, and neither is guessable from the
+    # index that failed.
+    unknown = set(spec.variants or ()) - set(s.cfg.variants)
+    if unknown:
+        raise HTTPException(422, "variants not in this session: %s"
+                            % ", ".join(sorted(unknown)))
+    planes = ax.planes(s.ndim)
+    bad = [i for i in (spec.planes or ()) if i >= len(planes)]
+    if bad:
+        raise HTTPException(422, "no such plane%s for a %dD run: %s — this "
+                            "session has %d (%s)"
+                            % ("s" if len(bad) > 1 else "", s.ndim,
+                               ", ".join(str(i) for i in bad), len(planes),
+                               ", ".join(ax.plane_label(s.ndim, p)
+                                         for p in planes)))
+    available = render_mpl.diagnostics_available(s.ndim)
+    bad = [d for d in (spec.diagnostics or ()) if d not in available]
+    if bad:
+        raise HTTPException(422, "unknown diagnostics plot%s for a %dD run: "
+                            "%s — available: %s"
+                            % ("s" if len(bad) > 1 else "", s.ndim,
+                               ", ".join(bad), ", ".join(available)))
     if videoexport.ffmpeg_path() is None:
         raise HTTPException(503, "ffmpeg is not installed on the server")
     if s.clock.running:
@@ -44,10 +73,6 @@ def create_export(sid: str, spec: ExportSpec):
     if k1 < k0:
         raise HTTPException(422, "empty record range after clamping to the "
                                  "retained history [%d, %d]" % (first, last))
-    unknown = set(spec.variants or ()) - set(s.cfg.variants)
-    if unknown:
-        raise HTTPException(422, "variants not in this session: %s"
-                            % ", ".join(sorted(unknown)))
     job = videoexport.start(s, spec, k0, k1, config.EXPORT_DIR)
     return job.status()
 

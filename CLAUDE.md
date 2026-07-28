@@ -68,15 +68,16 @@ source) is what keeps startup fast. See `README.md`.
   compatibility property that **RAISES at ndim > 1** rather than returning axis
   0/1, so a call site nobody generalized fails loudly instead of computing a
   wrong number. That is what made the migration tractable; do not soften it.
-  **What is DEFERRED in 2D and why**: auto-expand and mp4 export are milestones
-  M3 and M4 (see the milestone table below), each refused with a message naming
-  its milestone at create time and, for auto-expand, on the live `ParamChange`
-  path too. `applyNdimInvariants` (`lib/config.ts`) mirrors auto-expand in the
-  FORM for the same reason `applyPrecisionInvariants` exists: the panel can be
-  unmounted and an import can reach the combination from outside it.
-  **M2 (relativistic `qr`/`cr`) and M1 (float32) both landed 2026-07-27** and
-  their gates are gone from both sides — see the relativistic-2D and
-  float32-in-2D gotchas below for what was measured to retire each.
+  **What is DEFERRED in 2D and why**: auto-expand is milestone M3 (see the
+  milestone table below), refused with a message naming its milestone at create
+  time and on the live `ParamChange` path too. `applyNdimInvariants`
+  (`lib/config.ts`) mirrors it in the FORM for the same reason
+  `applyPrecisionInvariants` exists: the panel can be unmounted and an import
+  can reach the combination from outside it.
+  **M2 (relativistic `qr`/`cr`) and M1 (float32) landed 2026-07-27, M4 (mp4
+  export) on 2026-07-28** and their gates are gone from both sides — see the
+  relativistic-2D, float32-in-2D and 2D-mp4 gotchas below for what was measured
+  to retire each.
 - **2D streams PLANE REDUCTIONS, never the state.** W(x,y,px,py) can be neither
   drawn nor sent, so each worker reduces it on the device to the six pairwise
   2D projections (`axes.PLANES`) plus one 1D marginal per axis, and the 4D array
@@ -267,7 +268,38 @@ source) is what keeps startup fast. See `README.md`.
 - **mp4 export** (`core/videoexport.py` + `core/render_mpl.py` +
   `routers/export.py`): renders an ALREADY-COMPUTED record range on the
   BACKEND — matplotlib/Agg frames piped as raw RGBA into ffmpeg (system
-  ffmpeg, absence ⇒ 503). PAUSED-only (409
+  ffmpeg, absence ⇒ 503).
+  **WHAT GOES IN THE FRAME IS A CHOICE** (`ExportSpec.planes` /
+  `.diagnostics`, M4, 2026-07-28), because a 2D record carries far more than a
+  frame can hold: six planes × four variants is 24 panels, and the diagnostics
+  column has NINE plots against 1D's five. The SPA answers that by scrolling
+  its column and offering two panel readings; a video frame can do neither.
+  So **panels are the CARTESIAN PRODUCT of the selected planes and variants**,
+  which makes `PanelGrid`'s two readings the two EDGES of one control rather
+  than modes the renderer has to know about — "compare variants" is one plane ×
+  every variant, "phase portrait" is every plane × one variant, and the Export
+  panel offers both as one-click presets that just set the checkboxes.
+  `render_mpl.panel_grid` REFLOWS by count when one dimension is 1 (so 1D and
+  "compare variants" keep the 1×1/1×2/2×2 tiling the figure always had, and six
+  planes give the 3×2 the phase portrait shows on screen) and otherwise lays out
+  the matrix itself, rows = planes. Diagnostics are plot ids shared VERBATIM
+  with `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`, `uncertainty0/1`,
+  `purity`, `lz`) — one vocabulary for the hidden-series preferences, the export
+  wire and the metadata block — and an EMPTY list is legal (a panels-only
+  video). **The 2D default drops the four marginals, and that is a physical
+  argument, not a space-saving one**: at ndim=2 the (x,y) and (px,py) PANELS
+  already ARE the spatial and momentum densities, so ρ(x) is a further reduction
+  of something a panel is showing, and dropping them keeps the frame's shape
+  (one 5-row column, panels at `[0.045, 0.60]`) identical to 1D's. Past
+  `DIAG_ROWS_MAX` = 7 plots the column splits in two and the panels pay for it
+  in width (`diag_layout`); the Export panel states the resulting panel count
+  and approximate pixel size and warns when they become thumbnails. Both
+  refusals live in `routers/export.py` and not in the schema, for the reason the
+  `variants` check does: what is available depends on the session's ndim, which
+  the request body does not carry — and both name what IS available, since a 1D
+  session has one plane and no ⟨Lz⟩ and neither is guessable from the index that
+  failed. `RangeStats` is keyed to match: `scale[(variant, plane)]` and
+  `uncert[(variant, dim)]`, `marg_max` per axis, `lo`/`hi` per axis. PAUSED-only (409
   while running): a running session evicts old records, and the feature is
   for filming a range you already played back. **The frame RENDER, not the
   encode, is the bottleneck** (measured 4-var 1024²: ~410 ms/frame render at
@@ -317,10 +349,13 @@ source) is what keeps startup fast. See `README.md`.
   moved by one transform write per frame — a canvas artist would cost a full
   `u.redraw()` (re-pathing every series) at display rate, and `over` clips
   it when a zoom scrolls it out of view.
-  The video must READ like the screen: plot titles are copied
-  verbatim from `SeriesPlot.vue`/`MarginalsPlot.vue` (γ keeps the UI's
-  "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²), field labels
-  match the Setup panel (ℏ, "batch"), and the series y-window +
+  The video must READ like the screen: every plot title comes from
+  `core/axes.py`, the same source `lib/axes.ts` mirrors for
+  `SeriesPlot.vue`/`MarginalsPlot.vue` (γ keeps the UI's
+  "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²; ⟨Lz⟩ got the
+  `axes.lz_title` the backend had been missing, restoring the three-way
+  mirror), field labels match the Setup panel (ℏ, "batch"), and the series
+  y-window +
   tick decimals reproduce that component's `scales.y.range` rule
   (`render_mpl.series_ylim`); the "grid lines on plots" toggle rides along
   in `ExportSpec.show_grid` and governs EVERY plot in the frame — charts
@@ -896,36 +931,45 @@ without the release and 0 with it.
 ## 2D follow-up milestones (deferred from the first 2D cut, 2026-07-26)
 
 **These are not optional extras — they are all wanted, and each is out of the
-first 2D cut only so the physics core lands verified.** M3 and M4 are enforced
-meanwhile by explicit, message-bearing refusals so a half-feature can never be
-mistaken for a working one; do NOT quietly relax a gate without doing the
-verification it stands in for. **M4 is the one to do next** — M3's exact regrid
-is the hardest of the pair and mp4 export of a 2D run is the thing most visibly
-missing.
+first 2D cut only so the physics core lands verified.** M3 is enforced meanwhile
+by an explicit, message-bearing refusal so a half-feature can never be mistaken
+for a working one; do NOT quietly relax a gate without doing the verification it
+stands in for. **M3 is the one to do next** — its exact regrid is the hardest of
+the set, and it is now the only thing 2D still refuses.
 
-**M1 and M2 are both DONE (2026-07-27)** and their rows are kept below, struck
-through, because between them they are the worked example of retiring one of
-these gates. Two lessons neither row can hold on its own:
+**M1, M2 and M4 are DONE (2026-07-27, -27 and -28)** and their rows are kept
+below, struck through, because between them they are the worked example of
+retiring one of these gates. Three lessons no row holds on its own:
 
-- **The verification is the work; the gate removal is a few lines.** In both
-  cases the physics core was already generic and nothing in it had to change.
-  What took the time was measuring what the gate stood in for — and in M1's case
-  the measurement contradicted the prediction twice, once in each direction (54%
-  of the memory rather than 58%, but only 1.5–2.6× the speed rather than ~3.4×).
-  A gate retired by argument would have shipped the wrong number in the docs.
+- **The verification is the work; the gate removal is a few lines.** In all
+  three cases the physics core was already generic and nothing in it had to
+  change. What took the time was measuring what the gate stood in for — and in
+  M1's case the measurement contradicted the prediction twice, once in each
+  direction (54% of the memory rather than 58%, but only 1.5–2.6× the speed
+  rather than ~3.4×). A gate retired by argument would have shipped the wrong
+  number in the docs.
 - **Look for the accounting the gate was hiding.** M1's milestone row listed two
   risks and both were fine; the thing that actually needed code was
   `BYTES_PER_CELL_2D`, a scalar nobody had listed, which feeds the operative
   `_fit_error` guard and would have gone on refusing precisely the grids float32
-  makes affordable. When retiring M3 or M4, ask what constant assumes the gated
-  thing can never happen.
+  makes affordable. M4 repeated it exactly: its row named four visible things to
+  build, all easy, while the thing that would have shipped BROKEN was
+  `RangeStats.scale`, one colour scale per variant — correct at ndim=1 and
+  silently wrong at 2, where it renders five of every six panels blank without
+  erroring. When retiring M3, ask what constant assumes the gated thing can
+  never happen.
+- **A gate can carry a stale REASON, and retiring it is when that surfaces.**
+  M4's row said axis subscripts "must NOT use mathtext", citing a measurement in
+  `describe.py` that mathtext is too slow. Re-measured, it was wrong for this
+  figure by a factor that made the advice backwards. Re-measure the claim a gate
+  rests on, not only the risk it names.
 
 | # | Milestone | v1 gate | What it needs |
 |---|---|---|---|
 | ~~M1~~ | ~~**float32 in 2D**~~ | **DONE 2026-07-27** — gate removed from `SessionCreate`, from `applyNdimInvariants`, from `precisionForPayload` and from the Setup panel's select | Every named risk measured, and the memory accounting made precision-aware, which was the half nobody had listed: `BYTES_PER_CELL_2D` is a scalar feeding `_fit_error`, so leaving it at 208 would have refused exactly the grids float32 exists to allow. **112 B/cell measured against float64's 208** (54%, flat across 32⁴–80⁴, same for relativistic). Speed is the disappointment: **1.5–2.6× in 2D, not the ~3.4× predicted from 1D** — see the float32-in-2D gotcha. `TOL_MIN_F32` did NOT move: the residual floor saturates rather than growing with cells. |
 | ~~M2~~ | ~~**Relativistic 2D** (`qr`, `cr`)~~ | **DONE 2026-07-27** — gate removed from `SessionCreate` and from `applyNdimInvariants` | Both named risks were measured, not argued away: the mc² cancellation is FLAT between 1D and 2D (abs error 3.6e-12 vs 4.2e-12, set by m²c²·eps and indifferent to how many momentum components enter the sum), and the massless gradient is defined as 0 at the lattice origin, which is bitwise what 1D's `sign(0) == 0` already gave. The relativistic shear diagnostic works in 2D. See the gotcha below. |
 | M3 | **Auto-expand in 2D** | `SessionCreate` 422 and live `ParamChange` refusal on `ndim == 2 and auto_expand` | Boundary DETECTION already ships and warns on all four axes. The exact regrid is deferred because in 4D each axis doubling doubles a multi-GiB footprint (against 1D, where the whole grid is a rounding error next to VRAM). `GridState`, `plan_axis`, `support_cells` and `embed_window` are written generically, so what is left is `session._schedule_regrid` orchestration over 4 axes plus a memory guard that refuses a doubling it cannot afford. |
-| M4 | **mp4 export of 2D runs** | `POST /sessions/{id}/export` 422 on `ndim == 2`; the Export panel states the gate | `render_mpl.FrameFigure` needs a plane-set-driven panel grid, four marginals, ⟨Lz⟩, and the (2πℏ)² purity title. Axis subscripts there must NOT use mathtext — see the plain-text gotcha below; the SPA gets real subscripts from HTML `<sub>` (`lib/axes.ts labelHtml`) but matplotlib has no cheap equivalent, so plain `px`/`py` is the default and a second smaller text artist is the only alternative worth trying. NB the SETUP-DOCUMENT half of the Export panel (`GET /sessions/{id}/setup`, and import of .json or .mp4) does work for 2D from the first cut — only the video render is gated. |
+| ~~M4~~ | ~~**mp4 export of 2D runs**~~ | **DONE 2026-07-28** — gate removed from `routers/export.py`, `MSG_EXPORT_2D` deleted, and the Export panel's video half ungated at every ndim | The figure generalized over a **plane × variant** panel grid and a **selectable diagnostics column** (`ExportSpec.planes` / `.diagnostics`), because a 2D record carries more than a frame can hold — 24 panels and 9 diagnostics against 1D's 4 and 5. The constant the gate was hiding was none of the four it named: `RangeStats` kept ONE colour scale per variant, which is right at ndim=1 and would have rendered five of every six 2D panels blank in silence. And the row's own advice about mathtext was WRONG — see the 2D-mp4 gotcha, where real subscripts measured free. |
 | M5 | **Cuts / slices** | the wire reserves a per-plane `mode` byte; only `mode=0` (projection) is defined | Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime. A cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
 | M6 | **FFT fusion** | — | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, which changes numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass in both 1D and 2D. |
 | M7 | **One exponent slot instead of two** | — | `worker._exponents` pins the full step and keeps a second slot for the substep clamped onto τ_k: 4 complex meshes = 64 B/cell, the largest single item in the 4D working set. Choosing `dt' = rem/ceil(rem/dt)` makes every substep within a record identical, so the straggler and its slot both disappear: −32 B/cell, −22% of the 4D footprint, and 1D benefits too. Changes 1D numerics (uniform substeps instead of n equal plus one short), hence not bundled with the 2D work. |
@@ -1044,6 +1088,106 @@ these gates. Two lessons neither row can hold on its own:
   steps/s at 64⁴, against the 35.1 in the config table). A √ over meshes that
   already exist costs nothing; the FFTs are still the whole cost. Massless is the
   same again — 176.0 B/cell.
+- **2D mp4 EXPORT (M4, landed 2026-07-28): the frame is a SELECTION, real
+  subscripts turned out to be free, and the blit decides where static art may
+  live.** Four things worth keeping:
+  **MATHTEXT IS FREE HERE, and the note saying otherwise was backwards.**
+  `describe.py` used to state flatly that mathtext "was measured to slow the
+  export's plots down enormously", and the M4 milestone row repeated it as
+  "axis subscripts must NOT use mathtext" — which is why exported frames spelled
+  the momentum axes `px`/`py` while the SPA showed real subscripts via HTML
+  `<sub>`. Re-measured on the shipping figure: **plain 2.21 ms per text artist,
+  mathtext 4.05 ms (1.83×), usetex 26.6 ms (12×)** — but the figure BLITS, so
+  every title and axis label is a STATIC artist baked into the background once.
+  In situ that is **build ×0.91–1.34 and steady-state ×0.98–1.05 (noise) in
+  every configuration from 1D/4-panel to 2D/24-panel at FHD and 4K**. So
+  `axes.sub_math` typesets the two-letter axis names as `$p_x$` and everything
+  else — ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ — stays the same Unicode the screen uses, so the
+  two cannot drift and 1D (single-letter names) is untouched at the byte level.
+  Every title function takes a `math=` flag, the exact counterpart of its
+  frontend mirror's `html=`. **usetex is NOT used** and the reason is not only
+  the 12×: it needs a LaTeX install (the VPS has none), it cannot render our
+  Unicode without a THIRD spelling of every string, and `text.usetex` is global,
+  so the metadata block's user-supplied U(x) would go through LaTeX too.
+  **AND IT HAS TO BE THE WHOLE FRAME, not the plot titles only** — doing half
+  the job reads worse than doing none, because the same axis appears twice on
+  one screen in two spellings. So the header's per-record geometry readout
+  (`geom_line(math=True)`), the metadata block (`_extents`, the panel list,
+  `diagnostic_label`) and `describe.ic_expression` all take the same flag.
+  Three things that fell out of it:
+  **The metadata block is WRAPPED PLAIN and typeset afterwards** (`_emit`).
+  `$p_x$` is five characters that draw as two glyphs, so letting the typeset
+  form into `textwrap` makes every column width a guess; which characters land
+  on which line has to be decided by the plain text. A logical line that fit
+  unbroken is then swapped wholesale for its typeset twin, and one that had to
+  be broken keeps its fragments with only the per-token axis-name substitution
+  (valid on any fragment, unlike U's single `$…$` span).
+  **And it must not break a line MID-FACT.** `px ∈ [-7, 7]` is one fact and was
+  being split between the axis name and the ∈; so were
+  `(6 planes × 1 variant = 6)` and the units figure. Each such group is joined
+  with `_NB` (`\x00`) and `_emit` restores real spaces after wrapping — it has
+  to be a character `textwrap` cannot see as whitespace at all, and a Unicode
+  NBSP is `\s` so it does not work. A test asserting the groups survive must
+  check them **per line**: joining a column with " " is exactly what
+  reconstitutes a group that was split, so a whole-column search cannot see the
+  bug. Pinned by `test_the_metadata_block_never_breaks_a_line_mid_fact`.
+  **The header readout and the block deliberately DISAGREE.** The header's
+  geometry follows the PAINTED record (`geom_line` off the record handed to
+  `update`), exactly as the SPA follows the painted frame; the block's is
+  labelled "at record k0" and stays there, because it is part of "what this
+  video is" and a per-frame rewrite would make it a moving target — the union
+  is quoted on its own line instead. The two can only diverge across an
+  auto-expand regrid, which ndim=2 cannot do yet (M3), so it is pinned at
+  **1D** by `test_the_header_follows_the_painted_record_and_the_block_does_not`
+  rather than left to be discovered when M3 lands.
+  **U(x,y) is typeset by a LEXICAL rewrite of the user's own string**
+  (`describe.potential_math`), NOT by round-tripping through `sympy.latex`. That
+  was measured too: sympy renders every real potential without a mathtext parse
+  error, and is still wrong here twice over. It CANONICALISES — `x^2/2 + 0.3*x^4`
+  comes back as `0.3x^4 + x^2/2`, and `10*(1-exp(-0.5*(x-1)))^2` as
+  `10(1 − 1.64872127070013·e^{−0.5x})^2`, sympy having evaluated `exp(0.5)` at
+  parse time — which is the same function and a different picture, and this
+  block's job is "how to reproduce this run": the source string is what you
+  paste back into the U(x) box. And it emits `\frac`, which is TALL, where the
+  block advances by a fixed `META_LINESPACING`. The rewrite (brace multi-char
+  exponents, `\mathrm{}` the tokenizer's own function names, `*` → thin space)
+  preserves the source token for token and introduces nothing taller than a
+  superscript. The one 1D-visible change in all of this is `U(x) = $x^{2}/2$`.
+  **A typeset line built from USER input cannot be the only line of defence**:
+  a mathtext parse error raises at DRAW time and would take the export down, so
+  every candidate goes through `render_mpl.mathtext_ok` (matplotlib's own
+  parser, per `$…$` span, cached) and falls back to plain per line.
+  `describe.config_json` and the setup document stay plain either way — they are
+  machine-readable, and `param_lines`/`ic_expression` only typeset when asked.
+  **THE BLIT DECIDES WHERE STATIC ART MAY LIVE.** Past
+  `CBAR_MAX_CELLS` = 8 panels a colorbar is a ~9 px strip with 6.5 pt ticks, so
+  each panel's fixed scale is stated instead — and the first version put it in
+  the corner of the heatmap, where it rendered as NOTHING. `update()` restores
+  the static background and then `draw_artist`s the images on top, so anything
+  static drawn INSIDE the axes box is painted over every frame; that is exactly
+  why the panel grid lines are in `_dynamic` and ordered after the images. The
+  caption went into the panel's `loc="right"` TITLE instead (outside the axes
+  box, hence still static and free); making it dynamic would have cost 24 text
+  renders a frame for something that never changes. Pinned by
+  `test_a_dense_grid_states_its_scales_in_the_titles_not_over_the_heatmap`,
+  which also asserts no panel has an in-axes text at all.
+  **COST: 2D is CHEAPER per frame than 1D, not dearer.** Measured on a real
+  32⁴ 4-variant run at FHD with the parallel pool: **9.8 fps for 4 panels,
+  8.7 for the 6-panel phase portrait, 6.4 for the full 24-panel matrix, 10.1
+  for panels-only** — against CLAUDE.md's 1D figure of ~9–10 fps at 1080p. A 2D
+  plane is at most 128×128 (`WIGNERF_MAX_GRID_2D`) where a 1D W is up to 4096²,
+  so the `imshow` upsampling that dominates a 1D frame barely registers, and 24
+  panels cost only ~35% over 4 because the total image AREA is what matters.
+  The pool's per-task pickle payload shrinks too — ~50 KiB per variant per
+  record at 64⁴ against 32 MiB at 1D/4096² — so `POOL_MIN_FRAMES` and the w+2
+  window needed no change.
+  **The metadata block did NOT overflow, measured rather than assumed.** 2D
+  makes every line longer (four axes in the grid line and in the IC) and adds
+  two of its own ("panels: …" and "plots omitted: …"), so the 11-line budget was
+  the obvious thing to blow. Worst realistic case — 4-variant 2D cat, 4 live
+  changes, float32, all six planes — measures **10 lines against the 11 that fit
+  at 8 pt**: no shrink, no elision, one line of margin. `_meta_fontsize` /
+  `_meta_fit` still degrade gracefully past that and are pinned at 2D.
 - **FLOAT32 IN 2D (M1, landed 2026-07-27): choose it for MEMORY, not for speed,
   and know that it raises the boundary warning on a contained state at 32⁴.**
   Like M2, the physics core needed no change — the mixed scheme (float64 meshes

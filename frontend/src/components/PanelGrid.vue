@@ -6,6 +6,7 @@ import type { ProgressEvent } from '../composables/useSession'
 import { VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
 import { createViewWindow, remapView, type Domain } from '../lib/viewWindow'
 import { planeLabel, planeLabelHtml, planes as planesOf } from '../lib/axes'
+import { panelMode, panelPlaneIdx, panelVariantIdx } from '../lib/panelView'
 import { AU_TIME_FS } from '../lib/units'
 import WignerPanel from './WignerPanel.vue'
 
@@ -28,32 +29,15 @@ const throughput = computed(() =>
     .map((v) => `${v.variant} ${v.steps_per_sec}/s`).join('   '))
 
 /**
- * WHAT THE PANELS SHOW. At ndim=1 there is one plane and the grid is the
- * familiar one panel per variant. At ndim=2 there are six planes per variant,
- * i.e. up to 24 combinations, so the user picks one of two readings:
- *
- *  'variants' — one selected plane across every variant. The quantum-vs-
- *               classical comparison this whole UI was built for.
- *  'phase'    — every plane of one selected variant: that state's full phase
- *               portrait. Called "phase portrait" in the UI, never just
- *               "portrait", which is already the name of a LAYOUT orientation
- *               two controls away in the same header.
- *
- * Both come out of one cell list, so PanelGrid keeps a single code path and
- * WignerPanel never learns which mode it is in.
+ * WHAT THE PANELS SHOW — the two readings and their state live in
+ * lib/panelView.ts, because the Export panel seeds its own plane/variant
+ * choice from them (see that module's docstring). Both come out of one cell
+ * list here, so PanelGrid keeps a single code path and WignerPanel never
+ * learns which mode it is in.
  */
-type ViewMode = 'variants' | 'phase'
-const MODE_KEY = 'wignerf.panelMode'
-const PLANE_KEY = 'wignerf.panelPlane'
-// 'portrait' was the stored value before the rename; migrate rather than
-// silently resetting someone's choice
-const storedMode = localStorage.getItem(MODE_KEY)
-const mode = ref<ViewMode>(
-  storedMode === 'phase' || storedMode === 'portrait' ? 'phase' : 'variants')
-const planeIdx = ref(Math.max(0, Number(localStorage.getItem(PLANE_KEY)) || 0))
-const variantIdx = ref(0)
-watch(mode, (v) => localStorage.setItem(MODE_KEY, v))
-watch(planeIdx, (v) => localStorage.setItem(PLANE_KEY, String(v)))
+const mode = panelMode
+const planeIdx = panelPlaneIdx
+const variantIdx = panelVariantIdx
 
 const ndim = computed(() => props.geom.ndim)
 const allPlanes = computed(() => planesOf(ndim.value))

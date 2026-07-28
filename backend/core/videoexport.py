@@ -10,14 +10,20 @@ evicts its oldest records once the byte cap is reached, and an export
 reading behind the frontier would lose them mid-file.
 
 Two passes over the range:
-  1. scan  — collects the E/ΔX·ΔP/γ series, the per-variant fixed colour
-             scale, the fixed marginal amplitudes and the widest window any
-             record used (all cheap scalars already stored in the records),
-             and proves every record is still retained BEFORE ffmpeg is
-             spawned. Only VALUE scales are export-wide: the spatial axes
-             follow each record's own geometry (render_mpl._apply_geom), so
-             a frame from before an auto-expansion still fills its panel;
+  1. scan  — collects the E/ΔQ·ΔK/γ/⟨Lz⟩ series, the fixed colour scale per
+             (variant, plane), the fixed marginal amplitude per axis and the
+             widest window any record used (all cheap scalars already stored
+             in the records), and proves every record is still retained
+             BEFORE ffmpeg is spawned. Only VALUE scales are export-wide: the
+             spatial axes follow each record's own geometry
+             (render_mpl._apply_geom), so a frame from before an
+             auto-expansion still fills its panel;
   2. render — one figure update + one stdin write per frame.
+
+WHAT the frame shows is `spec.planes` x `spec.variants` panels plus
+`spec.diagnostics` plots — see render_mpl's docstring. A 2D record carries six
+planes and nine diagnostics, which is more than a frame can hold, so the job
+carries a selection and the metadata block records it.
 
 This module must not import core.session (the session imports it back for
 cleanup); the session object is duck-typed here.
@@ -38,6 +44,7 @@ from time import monotonic
 
 import config
 
+from . import axes as ax
 from . import describe, render_mpl
 
 log = logging.getLogger(__name__)
@@ -123,13 +130,15 @@ def export_workers():
 _WORKER = {}
 
 
-def _worker_init(variants, stats, meta, width, height, show_grid, theme):
+def _worker_init(variants, stats, meta, width, height, show_grid, theme,
+                 planes, diagnostics):
     """One persistent FrameFigure per worker process, reused across records
     (it re-applies the window itself on the rare auto-expand regrid). Building
     it here — once per worker, not once per frame — is what the pool is for."""
     _WORKER["fig"] = render_mpl.FrameFigure(
         variants, stats, meta, width=width, height=height,
-        show_grid=show_grid, theme=theme)
+        show_grid=show_grid, theme=theme, planes=planes,
+        diagnostics=diagnostics)
 
 
 def _worker_render(args):
@@ -150,14 +159,27 @@ class ExportJob(threading.Thread):
         self.k0, self.k1 = int(k0), int(k1)
         self.records = list(range(self.k0, self.k1 + 1, spec.stride))
         self.variants = list(spec.variants or session.cfg.variants)
+        # WHAT the frame shows. None = the whole record for panels, and
+        # render_mpl's per-ndim default for the diagnostics column (which at
+        # ndim=2 is the five series — see its docstring).
+        self.ndim = session.cfg.ndim
+        all_planes = ax.planes(self.ndim)
+        self.planes = ([all_planes[i] for i in spec.planes]
+                       if spec.planes is not None else list(all_planes))
+        self.diagnostics = (list(spec.diagnostics)
+                            if spec.diagnostics is not None
+                            else render_mpl.diagnostics_default(self.ndim))
         # On-disk name stays collision-proof (session + job id); the name the
         # BROWSER saves is the readable one below — two exports of the same
         # range in the same minute must not overwrite each other's file
-        # while one of them is being downloaded.
+        # while one of them is being downloaded. The plane marker is part of
+        # that: at ndim=2 the same range is routinely exported twice with
+        # different planes, and those are different videos.
         self.path = os.path.join(outdir, "wignerf-%s-%s.mp4"
                                  % (session.id, self.id))
-        self.download_name = "wignerf-%s-%drec%s-%dx%d-%s.mp4" % (
+        self.download_name = "wignerf-%s%s-%drec%s-%dx%d-%s.mp4" % (
             "-".join(v.upper() for v in self.variants),
+            self._plane_marker(),
             len(self.records),
             "" if spec.stride == 1 else "-every%d" % spec.stride,
             spec.width, spec.height,
@@ -168,6 +190,18 @@ class ExportJob(threading.Thread):
         self.error = None
         self.finished_at = None
         self.cancel_evt = threading.Event()
+
+    def _plane_marker(self):
+        """The plane part of the download name. Empty at ndim=1, where there
+        is only ever one plane and every existing name would otherwise grow a
+        redundant "-xp"; "-6pl" rather than all six spelled out, which is 24
+        characters of nothing."""
+        if self.ndim == 1:
+            return ""
+        if len(self.planes) == len(ax.planes(self.ndim)):
+            return "-%dpl" % len(self.planes)
+        return "-" + "+".join(ax.plane_label(self.ndim, p).replace(",", "")
+                              for p in self.planes)
 
     # -- status -------------------------------------------------------------
 
@@ -211,7 +245,8 @@ class ExportJob(threading.Thread):
             stats, geom0 = self._scan()
             meta = render_mpl.meta_columns(
                 self.session.cfg, geom0, stats, self.variants, self.k0,
-                self.k1, self.total, self.spec.fps, self.session.param_log)
+                self.k1, self.total, self.spec.fps, self.session.param_log,
+                planes=self.planes, diagnostics=self.diagnostics)
             proc = self._spawn_ffmpeg()
             self._last_post = 0.0
             # Rendering a frame (matplotlib/Agg) dominates export time, so it
@@ -232,7 +267,8 @@ class ExportJob(threading.Thread):
                     initializer=_worker_init,
                     initargs=(self.variants, stats, meta, self.spec.width,
                               self.spec.height, self.spec.show_grid,
-                              self.spec.theme))
+                              self.spec.theme, self.planes,
+                              self.diagnostics))
                 self._render_parallel(proc, executor, w)
             proc.stdin.close()
             rc = proc.wait(timeout=120)
@@ -289,7 +325,9 @@ class ExportJob(threading.Thread):
                                      width=self.spec.width,
                                      height=self.spec.height,
                                      show_grid=self.spec.show_grid,
-                                     theme=self.spec.theme)
+                                     theme=self.spec.theme,
+                                     planes=self.planes,
+                                     diagnostics=self.diagnostics)
         for k in self.records:
             if self.cancel_evt.is_set():
                 raise _Cancelled()
@@ -334,13 +372,24 @@ class ExportJob(threading.Thread):
 
     def _scan(self):
         """Pass 1: series + fixed colour scales + the widest window (quoted
-        in the metadata block; the plots follow each record)."""
-        st = render_mpl.RangeStats()
+        in the metadata block; the plots follow each record).
+
+        Collected for EVERY plane and every diagnostic the record carries,
+        not just the selected ones: it is all in the record already, it costs
+        a few floats, and it keeps RangeStats a statement about the RANGE
+        rather than about one job's selection."""
+        nd = self.ndim
+        naxes = ax.n_axes(nd)
+        st = render_mpl.RangeStats(ndim=nd)
+        st.marg_max = [0.0]*naxes
         for key in self.variants:
-            st.E[key], st.uncert[key], st.purity[key] = [], [], []
-            st.scale[key] = 0.0
-        x1 = p1 = float("inf")
-        x2 = p2 = float("-inf")
+            st.E[key], st.purity[key], st.lz[key] = [], [], []
+            for d in range(nd):
+                st.uncert[(key, d)] = []
+            for plane in ax.planes(nd):
+                st.scale[(key, plane)] = 0.0
+        lo = [float("inf")]*naxes
+        hi = [float("-inf")]*naxes
         geom0 = None
         for k in self.records:
             if self.cancel_evt.is_set():
@@ -353,21 +402,27 @@ class ExportJob(threading.Thread):
             if geom0 is None:
                 geom0 = geom
             st.t.append(t)
-            x1, x2 = min(x1, geom.x1), max(x2, geom.x2)
-            p1, p2 = min(p1, geom.p1), max(p2, geom.p2)
+            for a in range(naxes):
+                lo[a], hi[a] = min(lo[a], geom.lo[a]), max(hi[a], geom.hi[a])
             for key, vf in zip(self.variants, self._order(vframes)):
                 st.E[key].append(vf.E)
-                st.uncert[key].append(vf.x_std*vf.p_std)
                 st.purity[key].append(vf.purity)
-                st.scale[key] = max(st.scale[key], vf.wmax, -vf.wmin)
-                st.rho_max = max(st.rho_max, float(vf.rho.max()))
-                st.phi_max = max(st.phi_max, float(vf.phi.max()))
+                st.lz[key].append(vf.lz)
+                # index-matched: the dual of q_d is k_d on array axis ndim+d
+                # (axes.conjugate). Pairing these wrong is silent.
+                for d in range(nd):
+                    st.uncert[(key, d)].append(vf.std[d]*vf.std[nd + d])
+                for pf in vf.planes:
+                    kp = (key, (pf.a, pf.b))
+                    st.scale[kp] = max(st.scale[kp], pf.wmax, -pf.wmin)
+                for a in range(naxes):
+                    st.marg_max[a] = max(st.marg_max[a], float(vf.marg[a].max()))
         if geom0 is None:
             raise ValueError("no records in the requested range")
-        for key in self.variants:
-            if st.scale[key] <= 0.0:
-                st.scale[key] = 1e-30
-        st.x1, st.x2, st.p1, st.p2 = x1, x2, p1, p2
+        for kp, v in st.scale.items():
+            if v <= 0.0:
+                st.scale[kp] = 1e-30
+        st.lo, st.hi = tuple(lo), tuple(hi)
         return st, geom0
 
     def _spawn_ffmpeg(self):
@@ -377,14 +432,18 @@ class ExportJob(threading.Thread):
             cfg, self.session.param_log, at_record=self.k0,
             export={"records": [self.k0, self.k1], "stride": self.spec.stride,
                     "fps": self.spec.fps, "frames": self.total,
-                    "variants": self.variants, "encoder": enc[1]})
+                    "variants": self.variants, "encoder": enc[1],
+                    # what the frame SHOWS, so a re-imported mp4 records the
+                    # subset it was rendered from and not just the run
+                    "planes": [list(p) for p in self.planes],
+                    "diagnostics": self.diagnostics})
         cmd = [ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y",
                "-f", "rawvideo", "-pixel_format", "rgba",
                "-video_size", "%dx%d" % (self.spec.width, self.spec.height),
                "-framerate", str(self.spec.fps), "-i", "pipe:0", "-an"] + enc + [
                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-               "-metadata", "title=wignerf W(x,p,t) records %d-%d"
-               % (self.k0, self.k1),
+               "-metadata", "title=wignerf W(%s,t) records %d-%d"
+               % (",".join(ax.labels(self.ndim)), self.k0, self.k1),
                "-metadata", "comment=%s" % comment,
                self.path]
         log.info("export %s: %d frames @ %s -> %s",
@@ -481,11 +540,13 @@ def close_all():
 
 
 def probe_json(path):
-    """ffprobe helper (tests/diagnostics): stream info of an exported file."""
+    """ffprobe helper (tests/diagnostics): stream AND format info of an
+    exported file. The format half carries the `comment` tag, which is the
+    setup document lib/mp4meta.ts reads back on import."""
     exe = shutil.which("ffprobe")
     if exe is None:
         return None
     out = subprocess.run([exe, "-v", "error", "-print_format", "json",
-                          "-show_streams", path],
+                          "-show_streams", "-show_format", path],
                          capture_output=True, text=True, check=True)
     return json.loads(out.stdout)

@@ -105,12 +105,14 @@ def _vframe(seed, Nx=32, Np=32):
 
 
 def _stats(n=3):
-    st = RangeStats(t=[0.0, 0.05, 0.1][:n], rho_max=1.0, phi_max=1.0,
-                    x1=-6.0, x2=6.0, p1=-7.0, p2=7.0)
+    st = RangeStats(ndim=1, t=[0.0, 0.05, 0.1][:n])
+    st.marg_max = [1.0, 1.0]
+    st.lo, st.hi = (-6.0, -7.0), (6.0, 7.0)
     st.E["qn"] = [1.0, 1.1, 1.2][:n]
-    st.uncert["qn"] = [0.5]*n
+    st.uncert[("qn", 0)] = [0.5]*n
     st.purity["qn"] = [1.0]*n
-    st.scale["qn"] = 0.3
+    st.lz["qn"] = [0.0]*n
+    st.scale[("qn", (0, 1))] = 0.3
     return st
 
 
@@ -209,7 +211,7 @@ def test_theme_repaints_the_frame_but_not_the_heatmap():
         fig = FrameFigure(["qn"], stats, meta, width=320, height=240,
                           theme=th)
         try:
-            panel_ax, im = fig.images[0]
+            panel_ax, im, _cell = fig.images[0]
             chart_ax = [a for a in fig.fig.axes
                         if a.get_title(loc="right") == "E(t)"][0]
             frame = bytes(fig.update(0, 0.0, geom, [_vframe(1)], 0, 2))
@@ -221,9 +223,9 @@ def test_theme_repaints_the_frame_but_not_the_heatmap():
                 # the default centre one stays untouched (and black)
                 spine=chart_ax.spines["bottom"].get_edgecolor(),
                 tick=chart_ax.xaxis.get_ticklabels()[0].get_color(),
-                marg_title=fig.ax_rho.title.get_color(),
+                marg_title=fig.marg_axes[0].title.get_color(),
                 panel_title=panel_ax.title.get_color(),
-                rho=fig.rho_lines["qn"].get_color(),
+                rho=fig.marg_lines[(0, "qn")].get_color(),
                 cmap=im.get_cmap().name,
                 clim=im.get_clim(),
                 frame=frame,
@@ -264,26 +266,26 @@ def test_axes_follow_the_record_geometry():
     small = protocol.RecordGeom.from_1d(32, 32, -6.0, 6.0, -7.0, 7.0)
     big = protocol.RecordGeom.from_1d(64, 64, -12.0, 12.0, -14.0, 14.0)
     stats = _stats(2)
-    stats.x1, stats.x2, stats.p1, stats.p2 = -12.0, 12.0, -14.0, 14.0  # union
+    stats.lo, stats.hi = (-12.0, -14.0), (12.0, 14.0)          # union
     fig = FrameFigure(["qn"], stats,
                       meta_columns(cfg, small, stats, ["qn"], 0, 1, 2, 30),
                       width=640, height=360)
     try:
         panel = fig.images[0][0]
         clim = fig.images[0][1].get_clim()
-        rho_ylim = fig.ax_rho.get_ylim()
+        rho_ylim = fig.marg_axes[0].get_ylim()
         fig.update(0, 0.0, small, [_vframe(1)], 0, 1)
         assert panel.get_xlim() == (small.x1, small.x2)
         assert panel.get_ylim() == (small.p1, small.p2)
-        assert fig.ax_rho.get_xlim() == (small.x1, small.x2)
-        assert fig.ax_phi.get_xlim() == (small.p1, small.p2)
+        assert fig.marg_axes[0].get_xlim() == (small.x1, small.x2)
+        assert fig.marg_axes[1].get_xlim() == (small.p1, small.p2)
         fig.update(1, 0.05, big, [_vframe(2, 64, 64)], 0, 1)
         assert panel.get_xlim() == (big.x1, big.x2)
         assert panel.get_ylim() == (big.p1, big.p2)
-        assert fig.ax_rho.get_xlim() == (big.x1, big.x2)
+        assert fig.marg_axes[0].get_xlim() == (big.x1, big.x2)
         # value scales are export-wide: no brightness or height pumping
         assert fig.images[0][1].get_clim() == clim
-        assert fig.ax_rho.get_ylim() == rho_ylim
+        assert fig.marg_axes[0].get_ylim() == rho_ylim
     finally:
         fig.close()
     # the metadata quotes the first record's window AND the widest one

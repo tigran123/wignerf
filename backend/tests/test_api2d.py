@@ -1,18 +1,17 @@
 """
-2D sessions through the API: the record path end to end, and the two explicit
-refusals that stand in for deferred work (milestones M3 and M4 in CLAUDE.md).
+2D sessions through the API: the record path end to end, and the one explicit
+refusal that still stands in for deferred work (milestone M3 in CLAUDE.md).
 
-The refusal tests are not box-ticking. Each gate replaces a feature that would
+The refusal test is not box-ticking. The gate replaces a feature that would
 otherwise half-work — an auto-expanding 4D grid with no memory guard on the
-doubling, an mp4 export with no panel grid to render into — and a gate that
-silently stopped firing is exactly how a half-feature ships. They also pin that
-the messages NAME the milestone, so whoever hits one learns what is missing
-rather than that "2D is broken".
+doubling — and a gate that silently stopped firing is exactly how a half-feature
+ships. It also pins that the message NAMES the milestone, so whoever hits it
+learns what is missing rather than that "2D is broken".
 
-TWO of the four have landed, and each left the opposite kind of test behind:
-the thing the gate forbade must now be ACCEPTED and stream finite records. M2
-(relativistic qr/cr) and M1 (float32) both on 2026-07-27. See
-tests/test_propagator2d.py and tests/test_precision.py for their physics.
+THREE of the four have landed, and each left the opposite kind of test behind:
+the thing the gate forbade must now be ACCEPTED and work. M2 (relativistic
+qr/cr) and M1 (float32) on 2026-07-27, M4 (mp4 export) on 2026-07-28. See
+tests/test_propagator2d.py, tests/test_precision.py and tests/test_export2d.py.
 """
 
 import json
@@ -93,8 +92,8 @@ def test_a_2d_session_streams_planes_not_the_state():
 
 
 def test_2d_setup_document_round_trips():
-    """The setup document (and therefore mp4 import) works for 2D from the
-    first cut — only the VIDEO render is gated (M4)."""
+    """The setup document (and therefore mp4 import) worked for 2D from the
+    first cut, before the video render did (M4, landed 2026-07-28)."""
     with TestClient(app) as client:
         info = client.post("/api/sessions", json=cfg2()).json()
         sid = info["session_id"]
@@ -271,13 +270,18 @@ def test_auto_expand_is_also_refused_live():
         client.delete("/api/sessions/%s" % sid)
 
 
-def test_mp4_export_is_refused_for_2d():
+def test_the_2d_export_gate_is_gone():
+    """M4 landed on 2026-07-28: a 2D export must get PAST the ndim check and
+    be refused only by the ordinary paused-only/empty-history rules, which are
+    what a fresh session trips. The frame itself is pinned in
+    tests/test_export2d.py."""
     with TestClient(app) as client:
         info = client.post("/api/sessions", json=cfg2()).json()
         sid = info["session_id"]
         r = client.post("/api/sessions/%s/export" % sid, json={"fps": 30})
         assert r.status_code == 422, r.text
-        assert "M4" in r.text
+        assert "M4" not in r.text and "not available for 2D" not in r.text
+        assert "no computed records" in r.text
         client.delete("/api/sessions/%s" % sid)
 
 
