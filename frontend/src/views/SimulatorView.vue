@@ -19,7 +19,7 @@ import PlotsColumn from '../components/PlotsColumn.vue'
 import SetupPanel from '../components/SetupPanel.vue'
 import Timeline from '../components/Timeline.vue'
 import { useSession } from '../composables/useSession'
-import { applyNdimInvariants, applyPrecisionInvariants, geomOf,
+import { applyPrecisionInvariants, geomOf,
          loadConfig, precisionForPayload, precisionIsUserChosen, saveConfig,
          setHostPrecision, type GeomCfg } from '../lib/config'
 import { labels as axisLabels } from '../lib/axes'
@@ -105,7 +105,6 @@ function payload() {
   // payload built from a half-fixed config asked for float32 + auto-expand and
   // came back a 422 naming a pair the user never chose. Idempotent, so this
   // costs nothing when the fix-up has already run.
-  applyNdimInvariants(cfg)
   applyPrecisionInvariants(cfg)
   const p: Record<string, unknown> = JSON.parse(JSON.stringify(cfg))
   if (cfg.mode === 'interactive') delete p.t2
@@ -344,6 +343,24 @@ const boundaryText = computed(() => {
            're-entering from the opposite side'
   if (b.action === 'invalid_potential')
     return b.message ?? 'cannot expand: U is invalid on the larger domain'
+  // Distinct from 'capped' on purpose: that one means plan_axis stopped at the
+  // per-axis cell ceiling, this one means the guard made us give a doubling up —
+  // and `limit` says which ceiling did it, because the remedies are unrelated
+  // (a bigger card vs. a host setting). The server's message carries the numbers
+  // either way; the fallback has to follow `limit` or it names the wrong one.
+  // TWO wordings, because a denied doubling can still leave a window SHIFT to
+  // commit: `applied` non-empty means a regrid went out with this, and the
+  // ⤢ flash beside this line says the domain moved. One sentence covering both
+  // read as a self-contradiction on screen.
+  if (b.action === 'no_room') {
+    const why = b.message ?? (b.limit === 'cells'
+      ? 'over the host\'s total-cell rail'
+      : 'not enough device memory')
+    return Object.keys(b.applied ?? {}).length
+      ? `${axes} could not be doubled — ${why}; the window was moved instead.`
+      : `${wOf.value} reached the ${axes} edge and the domain could not be ` +
+        `expanded — ${why}.`
+  }
   // ONE LINE, and short enough to finish reading. This warning can clear again
   // within a couple of records as a state drifts back out of the band, so a
   // sentence that explains periodicity and offers a remedy was regularly gone
@@ -367,16 +384,40 @@ const boundaryBand = computed(() => {
 /** The explanation the message no longer carries, on hover. */
 const boundaryTitle = computed(() => {
   const b = session.boundary.value
-  if (!b || b.action !== 'warn') return ''
-  const advice = sessionNdim.value > 1
-    // auto-expand is deferred in 2D (milestone M3), so offering it would be a
-    // dead end: the only remedy there is a bigger domain at restart
-    ? 'Restart with a larger domain.'
-    // the SESSION's toggle, not the form's: this describes the run that raised
-    // the warning, and the two can differ for a moment before a status echo
-    : ((session.status.value?.auto_expand ?? cfg.auto_expand)
-        ? 'Auto-expand is on, so the domain will be regridded.'
-        : 'Enable auto-expand, or restart with a larger domain.')
+  if (!b) return ''
+  // 'no_room' gets the remedy its message deliberately leaves out — and WHICH
+  // remedy depends on `limit`, because the two ceilings have nothing in common.
+  // The device one is hardware and wants more of it; the cell rail is a host
+  // setting, where freeing VRAM and switching to float32 both do exactly
+  // nothing (a cell count does not depend on precision), so saying so is the
+  // point rather than a caveat.
+  if (b.action === 'no_room' && b.limit === 'cells')
+    return 'The domain could not be doubled because the result is over this'
+         + ' host\'s WIGNERF_MAX_CELLS_2D rail — a configured total-cell'
+         + ' ceiling, not a hardware limit. Boundary detection keeps running,'
+         + ' and a whole-cell window shift is still applied whenever one is'
+         + ' available. Freeing the card will NOT help, and neither will'
+         + ' float32: the rail counts cells, which do not depend on precision.'
+         + ' Raise WIGNERF_MAX_CELLS_2D on the host, or restart on a grid with'
+         + ' room to double.'
+  if (b.action === 'no_room')
+    return 'The domain could not be doubled because the device this session\'s'
+         + ' workers are on cannot hold the result. Boundary detection keeps'
+         + ' running, and a whole-cell window shift is still applied whenever'
+         + ' one is available. To get the expansion: free the card (another'
+         + ' session, another process), restart with fewer variants so each one'
+         + ' gets more of it, restart on a roomier device, or restart in float32'
+         + ' — which is half the footprint, but note it refuses auto-expand.'
+  if (b.action !== 'warn') return ''
+  // ONE piece of advice at either dimensionality since M3 (2026-08-01). This
+  // used to read "Restart with a larger domain." in 2D, because auto-expand was
+  // gated there and offering it would have been a dead end. It is not gated any
+  // more, so pointing a 2D user at a restart would send them the long way round.
+  // The SESSION's toggle, not the form's: this describes the run that raised the
+  // warning, and the two can differ for a moment before a status echo.
+  const advice = (session.status.value?.auto_expand ?? cfg.auto_expand)
+    ? 'Auto-expand is on, so the domain will be regridded.'
+    : 'Enable auto-expand, or restart with a larger domain.'
   // In a float32 2D session the SOLVER puts mass in the band by itself, so the
   // reading is true but this advice is not the right one. Measured 2026-07-27 on
   // the shipping 2D default, a fully contained state: 1.0e-3 of the integral in
@@ -416,21 +457,24 @@ watch(() => session.status.value?.precision, (v) => {
     applyPrecisionInvariants(cfg)
   }
 })
-// TWO settings forbid auto-expand — float32 (single-precision noise passes its
-// own detector) and ndim=2 (no memory guard on a 4-axis doubling, milestone M3) —
-// and applyPrecisionInvariants / applyNdimInvariants have already cleared the
-// FORM for both. Make the LIVE session agree, because nothing else can: the
-// watcher above cannot (status.auto_expand does not CHANGE, so it never fires),
-// the checkbox is disabled in both states, and auto_expand is not in LivePhysics
-// so there is no amber marker either — a session left quietly expanding behind an
-// unchecked, unreachable box. dims is restart-only, so a switch can sit here for
-// a long time with the old session still running and still regridding.
-// Keyed on precision and ndim, not on cfg.auto_expand, so it never duplicates the
-// checkbox's own apply-live; that path leaves both of these alone. Covers the two
-// selects, an import and probeHost's adoption in one place. send() no-ops on a
-// closed socket, so this is safe before a session exists.
-watch([() => cfg.precision, () => cfg.grid.ndim], () => {
-  if ((cfg.precision === 'float32' || cfg.grid.ndim > 1)
+// float32 forbids auto-expand (single-precision noise passes its own detector)
+// and applyPrecisionInvariants has already cleared the FORM. Make the LIVE
+// session agree, because nothing else can: the watcher above cannot
+// (status.auto_expand does not CHANGE, so it never fires), the checkbox is
+// disabled in that state, and auto_expand is not in LivePhysics so there is no
+// amber marker either — a session left quietly expanding behind an unchecked,
+// unreachable box.
+// ndim was in this key until M3 (2026-08-01) because 2D refused auto-expand too,
+// and it mattered MORE there than for precision: dims is restart-only, so a
+// switch could sit here for a long time with the old 1D session still running
+// and still regridding. That gate is gone — a 2D session auto-expands like any
+// other — so precision is the whole condition again.
+// Keyed on precision, not on cfg.auto_expand, so it never duplicates the
+// checkbox's own apply-live; that path leaves this alone. Covers the select, an
+// import and probeHost's adoption in one place. send() no-ops on a closed
+// socket, so this is safe before a session exists.
+watch(() => cfg.precision, () => {
+  if (cfg.precision === 'float32'
       && session.status.value?.auto_expand && session.connected.value)
     applyLive({ auto_expand: false })
 })
@@ -889,7 +933,7 @@ onBeforeUnmount(() => {
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
-                    :max-grid="hostLimits.maxGrid[cfg.grid.ndim]"
+                    :max-grid="hostLimits.maxGrid"
                     :max-cells="hostLimits.maxCells[cfg.grid.ndim] ?? null"
                     :bytes-per-cell="footprintBytesPerCell"
                     :live-devices="session.status.value?.devices ?? null"
@@ -936,7 +980,7 @@ onBeforeUnmount(() => {
                     :live-grid="session.status.value?.grid ?? null"
                     :live-physics="livePhysics"
                     :live-run="liveRun" :has-run="hasRun"
-                    :max-grid="hostLimits.maxGrid[cfg.grid.ndim]"
+                    :max-grid="hostLimits.maxGrid"
                     :max-cells="hostLimits.maxCells[cfg.grid.ndim] ?? null"
                     :bytes-per-cell="footprintBytesPerCell"
                     :live-devices="session.status.value?.devices ?? null"

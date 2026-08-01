@@ -39,9 +39,31 @@ export interface BoundaryState {
 export interface BoundaryEvent extends BoundaryState {
   type: 'boundary'
   record: number
-  action: 'warn' | 'capped' | 'invalid_potential'
+  // An ACTION is what happened to the PLAN: 'capped' = plan_axis refused at the
+  // per-axis WIGNERF_MAX_GRID ceiling and we denied nothing ourselves;
+  // 'no_room' = the M3 regrid guard made us give a doubling up, so it carries
+  // denied/applied and its own latch. Different payloads, hence different
+  // actions.
+  action: 'warn' | 'capped' | 'invalid_potential' | 'no_room'
   message?: string
   max_grid?: number
+  /**
+   * WHICH ceiling ran out ('no_room'): 'device' = the card cannot hold the
+   * result, 'cells' = the host's WIGNERF_MAX_CELLS_2D rail. A field rather than
+   * a third action because the payload is identical and only the remedy differs
+   * — and it differs completely: freeing VRAM does nothing for a cell rail, and
+   * neither does float32, since a cell count is precision-independent.
+   */
+  limit?: 'device' | 'cells'
+  /** axes whose doubling was given up to make the plan affordable ('no_room') */
+  denied?: string[]
+  /**
+   * what was committed anyway despite the denial, {} when nothing — same shape
+   * as RegridEvent.kind. The wording turns on it: giving up a doubling and
+   * moving the window instead must not read as "the domain cannot be expanded"
+   * while the regrid flash beside it says the domain moved.
+   */
+  applied?: Record<string, string>
 }
 
 /** Server 'regrid' event: the domain moves/doubles for records >= at_record. */

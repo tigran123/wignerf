@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 import config
 from core import describe
+from core import fit
 from core import session as sessions
 from core.potential import PotentialError, compile_potential
 from core.protocol import VARIANTS, SessionCreate, grid_limit_error
@@ -51,13 +52,12 @@ async def compile_for(cfg_grid, expr, hbar_eff, variants):
     return cp
 
 
-# One CUDA context + cuFFT plan cache per process per device, on top of the
-# per-worker arrays (CLAUDE.md's GPU section measures it at ~300 MiB).
-CONTEXT_BYTES = 300*1024**2
-# Leave a tenth of the card. Free memory is a moving target — another process
-# can claim some between this check and the first allocation — and unlike the
-# IC preview a session has no CPU fallback to drop to.
-FIT_MARGIN = 0.9
+# The arithmetic lives in core.fit, shared with the auto-expand planner's
+# regrid-time check so the two can never drift; the MESSAGES stay here, because
+# the advice differs (mid-run you cannot change device or drop a variant).
+# Re-exported under their old names: tests and the frontend mirror both.
+CONTEXT_BYTES = fit.CONTEXT_BYTES
+FIT_MARGIN = fit.FIT_MARGIN
 
 
 def _fit_error(cfg, devices):
@@ -84,22 +84,14 @@ def _fit_error(cfg, devices):
     """
     if cfg.grid.ndim < 2:
         return None
-    per = cfg.grid.cells*config.bytes_per_cell(cfg.grid.ndim, cfg.precision)
-    assignment = sessions.assign_devices(cfg.variants, devices)
-    counts = {}
-    for dev in assignment.values():
-        counts[dev] = counts.get(dev, 0) + 1
+    per = fit.per_worker(cfg.grid.cells, cfg.grid.ndim, cfg.precision)
+    counts = fit.worker_counts(
+        sessions.assign_devices(cfg.variants, devices).values())
 
     # What each assigned device could actually take, once its CUDA context is
-    # paid for. None = unknowable, and those devices are dropped rather than
-    # guessed at.
-    budget = {}
-    for dev in counts:
-        free = xp.device_free_bytes(dev)
-        if free is None:
-            continue                       # cannot tell: the rail is the guard
-        budget[dev] = (free, free*FIT_MARGIN
-                       - (0 if dev == "cpu" else CONTEXT_BYTES))
+    # paid for. Unreadable free memory = the device is dropped rather than
+    # guessed at (there the rail is the guard).
+    budget = fit.budgets(counts)
     if not budget:
         return None
 
@@ -113,7 +105,7 @@ def _fit_error(cfg, devices):
     # with more room" on a host whose other card ALSO could not hold one worker
     # (26.0 GiB needed against a 23.6 GiB 3090) — advice that cannot be taken,
     # pointing at a card that is not really the problem. Report the pool.
-    best, (best_free, best_budget) = max(budget.items(), key=lambda kv: kv[1][1])
+    best, best_free, best_budget = fit.roomiest(budget)
     ctx = "" if all(d == "cpu" for d in budget) else " + 0.3 GiB CUDA context"
 
     if per > best_budget:
@@ -197,9 +189,10 @@ async def create_session(cfg: SessionCreate, request: Request):
     # The devices this session's workers will actually land on — and whether
     # they have room. Checked here, after the device policy above has settled
     # which pool applies, and before anything is allocated.
-    fit = _fit_error(cfg, resolve_devices(device))
-    if fit:
-        raise HTTPException(422, fit)
+    # NOT named `fit`: that shadows the core.fit module for the whole function
+    fit_err = _fit_error(cfg, resolve_devices(device))
+    if fit_err:
+        raise HTTPException(422, fit_err)
     s = sessions.create_session(
         cfg, cp, device=device,
         fft_threads=_fft_threads(len(cfg.variants)),

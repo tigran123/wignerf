@@ -155,7 +155,12 @@ class SolverWorker(threading.Thread):
                 plan = self.session.current_regrid()
                 if plan is not None and k >= plan.k_star \
                    and self._applied_epoch < plan.epoch:
-                    W = self._apply_regrid(plan, prop, backend, W)
+                    # hand W over in a box and drop this frame's own reference,
+                    # so the old state is unreachable while the new (at ndim=2,
+                    # multi-GiB) one is allocated — see _apply_regrid
+                    box = [W]
+                    W = None
+                    W = self._apply_regrid(plan, prop, backend, box)
                     self._applied_epoch = plan.epoch
                 W, t = self._advance(prop, W, t, t_tgt)
                 self._emit(k, t_tgt, W, prop, backend)
@@ -245,14 +250,31 @@ class SolverWorker(threading.Thread):
 
     # -- regrid -------------------------------------------------------------
 
-    def _apply_regrid(self, plan, prop, backend, W):
+    def _apply_regrid(self, plan, prop, backend, box):
         """Exact fixed-lattice regrid of the live state: whole-cell window
-        move/double on the frozen (dx, dp) lattice — W values are COPIED to
-        their identical lattice points, entering cells are zero, nothing is
-        ever interpolated. The transform runs in natural order (the window
-        overlap is contiguous there; fftshifted order would split it)."""
+        move/double on the frozen lattice — W values are COPIED to their
+        identical lattice points, entering cells are zero, nothing is ever
+        interpolated. The transform runs in natural order (the window overlap
+        is contiguous there; fftshifted order would split it).
+
+        `box` is a one-element list holding W, so this can DROP the caller's
+        reference to the old state before the new grid is built. That is not
+        fastidiousness: at ndim=2 a doubling allocates a multi-GiB array while
+        the old one is still live, and _run's own local would otherwise pin it
+        for the whole switch. The exponent slots go first for the same reason —
+        they are 64 B/cell, the largest single item in the working set, and a
+        grid change invalidates them anyway (force_adjust below rebuilds).
+        """
         old, new = self._grid_state, plan.state
-        Wnew = embed_window(prop.grid.unshift(W), old, new, backend.xp)
+        # 1. the slots, before anything new is allocated
+        self._exp_clear()
+        # 2. the state: unshift, embed, and drop every old reference as we go
+        Wnat = prop.grid.unshift(box[0])
+        box[0] = None
+        Wnew = embed_window(Wnat, old, new, backend.xp)
+        del Wnat
+        # 3. the propagator, which releases its own old meshes and the pool
+        #    before rebuilding at the new shape (Propagator.set_grid)
         g = new.make_grid(backend)
         prop.set_grid(g)
         if not self._finite(prop, backend):
@@ -261,7 +283,6 @@ class SolverWorker(threading.Thread):
             raise ValueError("non-finite propagator exponents after regrid "
                              "to %s" % new.describe())
         self._grid_state = new
-        self._exp_clear()
         self.force_adjust = True
         log.info("%s: regrid epoch %d applied at k>=%d: %s",
                  self.name, plan.epoch, plan.k_star, new.describe())

@@ -239,13 +239,106 @@ class Propagator:
     def set_grid(self, grid):
         """Adopt a regridded domain (auto-expand): swap the grid, rebuild
         the FFT plans only when the shape changed, rebuild the exponents.
-        U/gradU callables are shape-agnostic closures — nothing to re-derive."""
-        if grid.shape != self.grid.shape:
+        U/gradU callables are shape-agnostic closures — nothing to re-derive.
+
+        RELEASE BEFORE ALLOCATE when the shape grows. rebuild() builds the new
+        full-shape meshes while the old ones are still referenced by self, and a
+        4D doubling makes that overlap the difference between fitting on a card
+        and not: measured on a 3090, the switch peaked at 1.27x the NEW
+        footprint with the old arrays merely dropped at the end. Dropping them
+        first, and handing the blocks back to the driver rather than leaving
+        them in the pool at the wrong size, is what lets the M3 regrid guard
+        count what we already hold as available instead of hoping for it.
+
+        A MOVE DELIBERATELY GETS NEITHER, and that is measured rather than
+        assumed — the obvious symmetry argument (it rebuilds the same meshes, so
+        holding both pairs must be 16 B/cell of pure overlap) predicts a saving
+        that does not exist. `scripts/bench.py --ndim 2 --regrid move`, with the
+        drop hoisted out of this branch and without, on a 3090 at 32^4/48^4/64^4:
+
+            float64   peak/steady 1.000   driver +0 MiB      both orders
+            float32   peak/steady 1.143   driver +16/82/256  both orders
+
+        In float64 the pool is already holding blocks of every size the rebuild
+        asks for (the arena high-water is set by adjust_step's two exponent pairs
+        and qd()'s Bopp temporaries, both larger than anything here), so the card
+        never sees the switch at all. In float32 the extra 16 B/cell is exactly
+        ONE complex128 mesh pair over a 112 B/cell arena, and dropping the old
+        pair first merely swaps which 16 B/cell it is: the pair overlap becomes
+        rebuild()'s own float64 Bopp intermediate, since single precision leaves
+        no double-sized free blocks to reuse. That row is also unreachable in a
+        session — auto-expand is float64-only (MSG_EXPAND_F32) — so on the only
+        path a move takes, its transient is zero. Which is the whole reason
+        core/fit.py refuses a move for nothing.
+
+        And _release_pool() on a move would make an OOM MORE likely, not less: it
+        clears this thread's cuFFT plan cache, whose work area is real VRAM
+        (~16 B/cell, see config.BYTES_PER_CELL_2D), and on an unchanged shape
+        that plan is still VALID. Throwing a correctly-sized live allocation away
+        to force a re-plan and a fresh cudaMalloc, at the instant the pool is
+        most loaded, is the opposite of the trade it makes for a doubling — where
+        the cached plan is for the old shape and is dead weight.
+
+        This changes ALLOCATION ORDER ONLY — every array rebuilt here is a pure
+        function of (grid, U, gradU, mass, c, hbar_eff), so ndim=1 results are
+        bitwise unaffected. The FFT plans are rebuilt only on a shape change, as
+        before; the difference is that the old ones are dropped first.
+        """
+        reshaped = grid.shape != self.grid.shape
+        if reshaped:
+            # Drop the old full-shape arrays and plans BEFORE the new ones are
+            # built. Nothing below reads them: rebuild() derives everything from
+            # the grid and the physics, and every outside reader (exponents,
+            # worker._finite, observables.energy) runs after this returns. If
+            # rebuild() then raises, this object is left unusable rather than
+            # holding its previous meshes — which is the same outcome as before,
+            # because the only caller (worker._apply_regrid) treats a failure
+            # here as fatal by design: a per-worker rollback would desync the
+            # lockstep geometry. NB set_physics() deliberately does NOT do this:
+            # its caller rolls back and keeps evolving, which works only because
+            # a failed rebuild there leaves the previous meshes in place.
+            self.dU_im = self.dT_im = self.U_mesh = self.T_mesh = None
+            self._fft_sp = self._ifft_sp = self._fft_mo = self._ifft_mo = None
+            self._release_pool()
             self.grid = grid
             self._plan(grid)
         else:
             self.grid = grid
         self.rebuild()
+
+    def _release_pool(self):
+        """Return this device's free pool blocks to the driver, plus this
+        thread's cuFFT plans (their work areas are real VRAM and the old
+        shape's are dead). Same treatment worker._release_gpu_pool gives a
+        closing session, for the same reason: free_all_blocks() returns only
+        blocks that are FREE, so it is worth calling exactly when we have just
+        dropped a multi-GiB set of them.
+
+        THE BLAST RADIUS IS THE WHOLE PROCESS, not this session. The CuPy
+        default pool is per process and nothing installs a per-backend allocator
+        — that is exactly why routers/preview.py owns a `_pool` of its own — so
+        this also returns the cached blocks of every OTHER session's workers on
+        this device. Acceptable on these grounds and no others: it hands back
+        only blocks that are already FREE, so the cost is a cudaMalloc for
+        whoever asks next and never correctness; and it runs once per regrid,
+        not once per IC keystroke, which is what made the preview's version of
+        this the wrong trade. The pinned pool is deliberately left alone: it is
+        host memory and a regrid does not churn it.
+        """
+        if not self.backend.is_gpu:
+            return                     # host arrays: refcounting already did it
+        # Best effort throughout: this only hands back memory that is already
+        # free, so failing to do it costs headroom, never correctness — and it
+        # must never be the thing that kills a worker mid-regrid.
+        try:
+            xp = self.xp
+            try:
+                xp.fft.config.get_plan_cache().clear()
+            except Exception:          # pragma: no cover - cupy internals
+                pass
+            xp.get_default_memory_pool().free_all_blocks()
+        except Exception:              # pragma: no cover - never fatal
+            pass
 
     def set_physics(self, *, U=None, gradU=None, mass=None, c=None,
                     hbar_eff=None, tol=None):

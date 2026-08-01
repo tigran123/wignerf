@@ -374,30 +374,33 @@ MSG_EXPAND_F32 = (
     "precision float64 to auto-expand, or size the domain by hand.")
 
 
-# 2D still ships without auto-expand — milestone M3 in CLAUDE.md, wanted and out
-# only until the work it names is done. It is refused explicitly here rather than
-# half-working: a gate that says what it stands in for cannot be mistaken for
-# settled scope, and cannot be relaxed by accident.
-#
-# THREE gates that were here are gone, and each left its verification behind
-# rather than being waved through. M2 (relativistic qr/cr, 2026-07-27): the mc^2
-# cancellation inside the 4D kinetic difference and the massless gradient at the
-# lattice origin, measured and pinned in tests/test_propagator2d.py. M1 (float32,
-# 2026-07-27): the mixed-precision rules re-verified BITWISE against the
-# correlated 2D Bopp shift for all four variants, the adjust_step residual floor
-# re-measured at 4D sizes (it saturates at ~2.5e-6, so TOL_MIN_F32 = 1e-5 keeps
-# 4x margin and did not move), and the footprint measured at 112 B/cell against
-# float64's 208 — see tests/test_precision.py and config.BYTES_PER_CELL_2D.
+# THERE IS NO LONGER A 2D-ONLY GATE. All four are gone, and each left its
+# verification behind rather than being waved through. M2 (relativistic qr/cr,
+# 2026-07-27): the mc^2 cancellation inside the 4D kinetic difference and the
+# massless gradient at the lattice origin, measured and pinned in
+# tests/test_propagator2d.py. M1 (float32, 2026-07-27): the mixed-precision
+# rules re-verified BITWISE against the correlated 2D Bopp shift for all four
+# variants, the adjust_step residual floor re-measured at 4D sizes (it saturates
+# at ~2.5e-6, so TOL_MIN_F32 = 1e-5 keeps 4x margin and did not move), and the
+# footprint measured at 112 B/cell against float64's 208 — see
+# tests/test_precision.py and config.BYTES_PER_CELL_2D.
 # M4 (mp4 export, 2026-07-28): the figure generalized over a plane x variant
 # panel grid and a selectable diagnostics column (ExportSpec.planes /
 # .diagnostics below), and the constant the gate had been hiding — RangeStats'
 # one-colour-scale-per-variant shape, which would have mis-scaled five of every
 # six 2D panels in silence. See tests/test_export2d.py.
-MSG_EXPAND_2D = (
-    "auto-expand is not available for 2D runs yet (milestone M3): in 4D every "
-    "axis doubling doubles a multi-GiB working set, so the planner needs a "
-    "memory guard it does not have. Boundary DETECTION still runs on all four "
-    "axes and will warn you; size the domain by hand.")
+# M3 (auto-expand, 2026-08-01): the memory guard the gate named, now asked at
+# REGRID time and not only at create time (core/fit.py, shared with
+# routers/sessions._fit_error so the two cannot drift), plus the release-before-
+# allocate ordering that makes its budget honest — measured on a 3090, the
+# switch peaked at 1.269x the new footprint and now peaks at 1.038x (float64;
+# 1.071 in float32), with 0.92 of the old footprint returning to the driver
+# (0.86 in float32) against 0.46 before. See tests/test_regrid2d.py and
+# scripts/bench.py --regrid. The guard asks that question of a DOUBLING only:
+# a plan that does not grow the window is refused by nothing (core/fit.py).
+#
+# What stays gated is float32, at EITHER dimensionality: MSG_EXPAND_F32 above is
+# about single-precision noise passing the detector, which 2D did not change.
 
 
 class SessionCreate(BaseModel):
@@ -474,8 +477,6 @@ class SessionCreate(BaseModel):
             raise ValueError("the grid is %dD but %d initial-condition "
                              "component(s) carry %d coordinate(s) each"
                              % (nd, len(bad), bad[0].ndim))
-        if nd > 1 and self.auto_expand:
-            raise ValueError(MSG_EXPAND_2D)
         return self
 
 

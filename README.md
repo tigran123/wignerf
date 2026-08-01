@@ -53,15 +53,18 @@ exported to mp4.
 - **Auto-expanding domain.** The spectral domain is a torus, so a spreading
   state eventually wraps and the run silently solves the wrong problem. Edge
   mass is watched every record — at either dimensionality — and with
-  auto-expand on (1D for now) the grid regrids onto an exact fixed lattice
-  (whole-cell shift or power-of-two doubling, never interpolated) before any
-  mass wraps.
+  auto-expand on the grid regrids onto an exact fixed lattice (whole-cell shift
+  or power-of-two doubling, never interpolated) before any mass wraps. In 2D a
+  doubling doubles a multi-GiB working set, so the planner asks the driver
+  whether the devices can afford it first, and says which one cannot when they
+  cannot — a shift costs nothing and is never subject to that, so a drifting
+  state keeps getting relief even on a full card.
 - **Diagnostics.** Energy, one ΔQ·ΔK per dimension and purity
   γ = (2πħ)^ndim ∫W² per record, with a marginal per axis alongside the
   phase-space panels — plus ⟨L_z⟩(t) in 2D. Everything but the purity is
   computed from the same reductions the panels are drawn from, leaving ∫W² as
   the only pass over the full array.
-- **mp4 export** (1D for now). Any already-computed record range is rendered on
+- **mp4 export.** Any already-computed record range is rendered on
   the backend (matplotlib → ffmpeg/libx264) into a video that reads like the
   screen, with a metadata block documenting the run — and the same document
   embedded in the file's `comment` tag, so a kept video restores its own setup
@@ -75,15 +78,13 @@ SI (fs / Å / eV) appears in display labels only.
 
 ### What 2D does not do yet
 
-Two features are 1D-only for now, each refused at the door with a message naming
-the gate rather than half-working: **auto-expand** (boundary *detection* does run
-in 2D, and warns on all four axes — only the automatic regrid is deferred) and
-**mp4 export** of a 2D run. The Export panel's other half — the setup document,
-and import of a `.json` or a previously exported `.mp4` — works at either
-dimensionality.
+Nothing. Every feature is available at either dimensionality: the relativistic
+variants and float32 (2026-07-27), mp4 export of a 2D run (2026-07-28) and
+auto-expand (2026-08-01) were each gated behind an explicit refusal while the
+work they named was outstanding, and all four gates are gone.
 
-Two more used to be on that list and now work. The **relativistic** variants
-restore the anharmonic-shear diagnostic in 2D; one caveat worth knowing is that a
+Two of them carry a caveat worth knowing. The **relativistic** variants
+restore the anharmonic-shear diagnostic in 2D; the one to know is that a
 **massless** (m = 0) relativistic run loses purity at a rate set by how well the
 momentum grid resolves the kink in T = c|p| — ~7e-6 per 100 steps at 32⁴, falling
 ~10× at 48⁴, independent of the timestep, so the remedy is a finer momentum axis
@@ -232,7 +233,7 @@ holds the per-machine values for the systemd unit.
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session — the scrub/replay window. 32 GiB ≈ 4000 four-variant records at 1024². Lower it on small hosts. |
 | `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling for **1D** sessions, at creation and for auto-expand alike. A 4096² working set is ~2.7 GiB per variant worker. |
 | `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **2D** sessions. A sanity rail only: a 4D array grows as N⁴, so a per-axis cap is no real guard — 128⁴ is ~52 GiB per worker with every axis inside the rail. |
-| `WIGNERF_MAX_CELLS_2D` | `134217728` (2²⁷) | Total-cell rail for 2D — a cheap deterministic stop for absurd values (256⁴ is one dimensionality switch away from the 1D default), and the only guard on a host whose free memory cannot be read. Deliberately not the operative limit: that is a per-device fit check which runs the worker→device assignment, then compares the estimate against the driver's free memory, so the **smaller card binds** and unknown free memory never refuses. |
+| `WIGNERF_MAX_CELLS_2D` | `134217728` (2²⁷) | Total-cell rail for 2D — a cheap deterministic stop for absurd values (a dimensionality switch that carried N over would mean 1024⁴ from the 1D default, which is why the form caps it at the target's own), and the only guard on a host whose free memory cannot be read. Deliberately not the operative limit: that is a per-device fit check which runs the worker→device assignment, then compares the estimate against the driver's free memory, so the **smaller card binds** and unknown free memory never refuses. |
 | `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); a session may override it. float32 is a **preview mode** — ~3.3–3.8× faster in 1D but only 1.5–2.6× in 2D, and ~54–58% of the working set on CUDA, nothing at all on CPU — and it costs the diagnostics this project navigates by, so do not make it the host default anywhere a result might be read off. It refuses auto-expand and `tol` below 1e-5. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto. Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download; a file is deleted once downloaded, when its session closes, at shutdown, or 30 minutes after finishing. Under systemd's `PrivateTmp=yes` the default is a RAM tmpfs — point it at a disk path for long 4K renders. |
@@ -277,6 +278,7 @@ VRAM that decides whether a 2D session can start at all:
 .venv/bin/python scripts/ws_smoke.py --ndim 2
 .venv/bin/python scripts/bench.py cpu cuda:1
 .venv/bin/python scripts/bench.py --ndim 2 -N 32,48,64,80 cuda:1
+.venv/bin/python scripts/bench.py --ndim 2 --regrid -N 32,64 cuda:1   # doubling cost
 ```
 
 ## Deployment
@@ -360,16 +362,18 @@ under `~/.claude` and are not covered by this.
 
 A personal research tool, under active development.
 
-2D space (4D phase space) landed in July 2026 as a first cut: the physics core
-is verified, and the features listed under *What 2D does not do yet* are
-committed follow-up work rather than optional extras — mp4 export of a 2D run
-next, with the automatic regrid after it. The relativistic variants and float32
-were the first two to land, the latter halving what a 2D worker holds. Two
-further items are already scoped: cuts at
-fixed (y, p_y) alongside the projections, which are exact for separable states
-but average away the fringe contrast of precisely the entangled regime 2D exists
-to show; and merging the inverse/forward FFT pair across step boundaries, worth
-about +50% in 2D.
+2D space (4D phase space) landed in July 2026 as a first cut with four features
+held back behind explicit refusals so the physics core could land verified. All
+four are now in: the relativistic variants and float32 (2026-07-27, the latter
+halving what a 2D worker holds), mp4 export of a 2D run (2026-07-28), and the
+automatic regrid (2026-08-01, which needed a per-device memory guard on the
+doubling and an allocation order that hands the old grid back before building
+the new one). Three further items are already scoped: cuts at fixed (y, p_y)
+alongside the projections, which are exact for separable states but average away
+the fringe contrast of precisely the entangled regime 2D exists to show; merging
+the inverse/forward FFT pair across step boundaries, worth about +50% in 2D; and
+collapsing the propagator's two exponent slots into one, which is the largest
+single item in a 4D worker's memory (−22%).
 
 Beyond that: destructive forking (resume computation from any record, which
 needs periodic float64 checkpoints alongside the quantized display history),

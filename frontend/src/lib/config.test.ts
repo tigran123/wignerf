@@ -160,23 +160,42 @@ describe('reset keeps the dimensionality', () => {
     expect(cfg.auto_expand).toBe(false)
   })
 
-  it('keeps variants and precision in 2D (M2 and M1 landed 2026-07-27)', async () => {
-    // applyNdimInvariants used to strip qr/cr AND force float64, to match
-    // backend gates that no longer exist. If either starts again, a 2D user
-    // silently loses what they picked and the form stops describing what will
-    // be computed — and for precision that is worse than losing it, because
-    // payload() would put float64 back behind an amber "restart to apply" that
-    // no restart could ever clear.
-    const { m, cfg } = await load(BASE_2D)
+  it('leaves every 2D setting alone — there are no ndim gates left', async () => {
+    // applyNdimInvariants is GONE (M3, 2026-08-01), and this is the test that
+    // notices if anything grows back into its place. It used to strip qr/cr,
+    // force float64 and clear auto_expand, to match backend gates retired by
+    // M2/M1 (2026-07-27) and M3. If any of them starts again, a 2D user silently
+    // loses what they picked and the form stops describing what will be
+    // computed — worst for precision, where payload() would put float64 back
+    // behind an amber "restart to apply" that no restart could ever clear.
+    // FROM THE 1D BASE, and that is load-bearing: setNdim returns at its first
+    // line when the config is already at the target ndim, so running it against
+    // BASE_2D would assert nothing but that the three assignments below still
+    // hold — passing against a function whose body never executed.
+    const { m, cfg } = await load(BASE)
     cfg.variants.splice(0, cfg.variants.length, 'qn', 'qr', 'cn', 'cr')
-    cfg.precision = 'float32'
+    cfg.precision = 'float64'
     cfg.auto_expand = true
-    m.applyNdimInvariants(cfg)
+    m.setNdim(cfg, 2)                 // the one path that used to apply them
+    expect(cfg.grid.ndim).toBe(2)     // ...and it really ran
+    expect(cfg.grid.axes.length).toBe(4)
     expect(cfg.variants).toEqual(['qn', 'qr', 'cn', 'cr'])
-    expect(cfg.precision).toBe('float32')
-    // ...while the ONE gate that does remain still bites (M3)
-    expect(cfg.auto_expand).toBe(false)
-  })
+    expect(cfg.precision).toBe('float64')
+    expect(cfg.auto_expand).toBe(true)
+    expect(m.precisionForPayload(cfg)).toBe('float64')   // asking to expand
+  })                                                     // IS asking for f64
+
+  it('still clears auto_expand in 2D float32 — a precision gate, not an ndim one',
+     async () => {
+       // The one refusal M3 did not retire, checked at ndim=2 because that is
+       // where the removed gate used to mask it.
+       const { m, cfg } = await load(BASE_2D)
+       cfg.precision = 'float32'
+       cfg.auto_expand = true
+       m.applyPrecisionInvariants(cfg)
+       expect(cfg.auto_expand).toBe(false)
+       expect(cfg.tol).toBeGreaterThanOrEqual(1e-5)
+     })
 
   it('gives the IC editor the right default for its dimensionality', async () => {
     const { m } = await load(undefined)
@@ -386,5 +405,84 @@ describe('axisSizeOptions', () => {
     // the API refuses it at Restart with a message naming the ceiling
     const { axisSizeOptions } = await mod()
     expect(axisSizeOptions(2, 128, [256, 48])).toEqual([32, 48, 64, 128, 256])
+  })
+
+  it('a dims round trip leaves no value off its own list', async () => {
+    // THE BUG: setNdim capped N from above and not from below, so 1D -> 2D -> 1D
+    // brought the 2D choice back with it — 64, in a 1D list that starts at 256 —
+    // and the select rendered `64, 256, 512, …` with a hole in it while the
+    // session ran at 64², a resolution nothing had asked for.
+    const { axisSizeOptions, axisFloor, setNdim, defaultConfig } = await mod()
+    const cfg = defaultConfig()
+    setNdim(cfg, 2, 128)
+    cfg.grid.axes.forEach((a) => { a.N = 64 })
+    setNdim(cfg, 1, 4096)
+    // the 1D DEFAULT, not the 1D floor: 64 is unrepresentable in this list, and
+    // snapping to its smallest member would quarter the resolution of anyone who
+    // started at the default and merely looked at 2D
+    expect(cfg.grid.axes.map((a) => a.N)).toEqual([1024, 1024])
+    // ...and the list is the fixed one, with nothing appended to it
+    const opts = axisSizeOptions(1, 4096, cfg.grid.axes.map((a) => a.N))
+    expect(opts).toEqual([256, 512, 1024, 2048, 4096])
+    // both directions land INSIDE the list, which is the property that matters
+    for (const [nd, cap] of [[2, 128], [1, 4096]] as const) {
+      setNdim(cfg, nd, cap)
+      const list = axisSizeOptions(nd, cap)
+      for (const a of cfg.grid.axes) expect(list).toContain(a.N)
+      expect(Math.min(...cfg.grid.axes.map((a) => a.N)))
+        .toBeGreaterThanOrEqual(axisFloor(nd, cap))
+    }
+  })
+
+  it('a round trip lands on the target default, and that is the ceiling of what it can do', async () => {
+    // What a round trip CANNOT do, stated so it is not mistaken for a bug: on a
+    // default host the two lists do not overlap (2D tops out at 128, 1D starts
+    // at 256), so no 2D choice is representable in 1D and a detour through it
+    // lands on the target's own default, both ways. Preserving 32⁴ across 1D
+    // would need a per-dimensionality memory in the form — a different feature.
+    const { setNdim, defaultConfig, DEFAULT_AXES } = await mod()
+    const cfg = defaultConfig()
+    setNdim(cfg, 2, 128)
+    cfg.grid.axes.forEach((a) => { a.N = 32 })
+    setNdim(cfg, 1, 4096)
+    expect(cfg.grid.axes.map((a) => a.N))
+      .toEqual(DEFAULT_AXES[1].map((a) => a.N))
+    setNdim(cfg, 2, 128)
+    expect(cfg.grid.axes.map((a) => a.N))
+      .toEqual(DEFAULT_AXES[2].map((a) => a.N))
+  })
+
+  it('resetting to defaults is 1024² in 1D and 64⁴ in 2D', async () => {
+    // 256² was the SMALLEST N the panel offers, which is a strange thing for a
+    // default to be — 2D's 64⁴ is mid-list. Changed 2026-08-01.
+    const { defaultConfig, setNdim } = await mod()
+    const cfg = defaultConfig()
+    expect(cfg.grid.axes.map((a) => a.N)).toEqual([1024, 1024])
+    setNdim(cfg, 2, 128)
+    expect(cfg.grid.axes.map((a) => a.N)).toEqual([64, 64, 64, 64])
+  })
+
+  it('the floor is not a flat reset where a small choice IS offerable', async () => {
+    // min() is still doing its job in the direction that has room for it: a 1D
+    // grid at 32 (reachable by import, not from the select) is a legal 2D choice
+    // and must arrive intact rather than being pulled up to the 2D default.
+    const { setNdim, defaultConfig } = await mod()
+    const cfg = defaultConfig()
+    cfg.grid.axes.forEach((a) => { a.N = 32 })
+    setNdim(cfg, 2, 128)
+    expect(cfg.grid.axes.map((a) => a.N)).toEqual([32, 32, 32, 32])
+  })
+
+  it('the floor never pushes N past a lowered WIGNERF_MAX_GRID', async () => {
+    // A host at 128 offers exactly [128] in 1D. Landing on the unclamped 256
+    // floor there would put the form over the ceiling the same select is drawn
+    // from, and POST /sessions would refuse a value nobody typed.
+    const { axisSizeOptions, setNdim, defaultConfig } = await mod()
+    const cfg = defaultConfig()
+    setNdim(cfg, 2, 128)
+    cfg.grid.axes.forEach((a) => { a.N = 64 })
+    setNdim(cfg, 1, 128)
+    expect(cfg.grid.axes.map((a) => a.N)).toEqual([128, 128])
+    expect(axisSizeOptions(1, 128)).toEqual([128])
   })
 })

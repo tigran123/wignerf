@@ -282,9 +282,11 @@ def test_the_resolution_rule_is_the_same_at_every_ndim(monkeypatch):
 
     The auto-expand gate is still here and still float64-only, and it is checked
     alongside deliberately: it is the remaining reason the two can disagree, and
-    THAT one refuses rather than resolves, because it is asked for explicitly."""
+    THAT one refuses rather than resolves, because it is asked for explicitly.
+    Note it is a PRECISION gate at either ndim — M3 removed the 2D one, so 2D +
+    float64 + auto_expand is now a perfectly ordinary session."""
     import config
-    from core.protocol import SessionCreate, MSG_EXPAND_2D
+    from core.protocol import SessionCreate, MSG_EXPAND_F32
     monkeypatch.setattr(config, "PRECISION", "float32")
     g2 = {"ndim": 2, "axes": [{"lo": -6.0, "hi": 6.0, "N": 16}]*2
                              + [{"lo": -7.0, "hi": 7.0, "N": 16}]*2}
@@ -297,10 +299,14 @@ def test_the_resolution_rule_is_the_same_at_every_ndim(monkeypatch):
     # an explicit choice still wins over the host's, at either ndim
     assert SessionCreate(**dict(two_d, precision="float64")).precision \
         == "float64"
-    # ...and 2D still refuses auto-expand, by name (M3)
+    # 2D + float64 + auto-expand is ordinary since M3...
+    assert SessionCreate(**dict(two_d, precision="float64",
+                                auto_expand=True)).auto_expand is True
+    # ...while the FLOAT32 refusal stands, and stands at ndim=2 as well: it is
+    # about single-precision noise passing the detector, which 2D never changed
     with pytest.raises(ValidationError) as e:
-        SessionCreate(**dict(two_d, precision="float64", auto_expand=True))
-    assert MSG_EXPAND_2D[:40] in str(e.value)
+        SessionCreate(**dict(two_d, precision="float32", auto_expand=True))
+    assert MSG_EXPAND_F32[:40] in str(e.value)
 
 
 def test_bad_host_precision_falls_back_to_float64(monkeypatch):

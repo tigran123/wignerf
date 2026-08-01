@@ -464,9 +464,9 @@ def test_the_header_follows_the_painted_record_and_the_block_does_not():
     moving target. When the two can diverge (an auto-expand regrid mid-range)
     the block says so and quotes the widest window separately.
 
-    Untestable in a 2D session today — auto-expand is gated at ndim=2 (M3), so
-    every record shares one geometry — which is exactly why it is pinned at 1D
-    here rather than left to be discovered when M3 lands."""
+    Pinned at 1D here because that is where the wording lives; the 2D case it
+    was WAITING for is the test below, now that M3 (2026-08-01) lets a 2D
+    session regrid mid-range."""
     g1 = dict(x1=-6.0, x2=6.0, Nx=32, p1=-7.0, p2=7.0, Np=32)
     ic1 = {"type": "mixture",
            "components": [{"x0": 2.0, "p0": 0.0, "sigma_x": 0.707,
@@ -499,6 +499,116 @@ def test_the_header_follows_the_painted_record_and_the_block_does_not():
         assert "[-6, 6]" not in head
     finally:
         fig.close()
+
+
+def test_the_header_and_block_diverge_in_2d_too():
+    """The 2D case the test above was waiting for — M3 (2026-08-01) made a
+    mid-range regrid reachable at ndim=2, so this is no longer hypothetical.
+
+    Four axes rather than two is the whole point: the header must re-render
+    every one of them from the PAINTED record, while the block stays at record
+    k0 and states the union separately. An axis-order slip here shows up as a
+    momentum extent in a spatial slot, which is exactly the class of silent
+    multi-D error the geometry readouts exist to make visible.
+
+    Note the regrid doubles ONE axis (x, 32 -> 64) and leaves the other three
+    alone, which is what a single tripped axis really produces — a uniform
+    doubling would hide a per-axis bug by symmetry.
+    """
+    cfg = protocol.SessionCreate(**cfg2(variants=["qn"]))
+    small = protocol.RecordGeom(2, (32, 32, 32, 32), (-6.0,)*4, (6.0,)*4)
+    big = protocol.RecordGeom(2, (64, 32, 32, 32),
+                              (-12.0, -6.0, -6.0, -6.0), (12.0, 6.0, 6.0, 6.0))
+    st = _stats2d(("qn",), n=2, N=16)
+    st.lo, st.hi = (-12.0, -6.0, -6.0, -6.0), (12.0, 6.0, 6.0, 6.0)
+    left, _r = meta_columns(cfg, small, st, ["qn"], 0, 1, 2, 30)
+    text = " ".join(" ".join(left).split())
+    assert "grid at record 0: 32×32×32×32" in text
+    assert "axes follow each record (auto-expand); widest:" in text
+    assert "x ∈ [-12, 12]" in text                      # the union, on x only
+
+    fig = FrameFigure(["qn"], st, (left, _r), width=640, height=360,
+                      planes=[(0, 2)])
+    try:
+        fig.update(0, 0.0, small, [_vframe2d(1, 16)], 0, 1)
+        head = fig.geom_text.get_text()
+        assert "32×32×32×32" in head, head
+        assert "record 0 ∈ [0, 1]" in head
+        fig.update(1, 0.05, big, [_vframe2d(2, 16)], 0, 1)
+        head = fig.geom_text.get_text()
+        assert "64×32×32×32" in head, head
+        assert "x ∈ [-12, 12]" in head, head
+        # ...and the three axes that did NOT move stay GROUPED at their shared
+        # extent, which is the geometry line's own rule (see
+        # test_the_header_geometry_line_groups_equal_extents) doing exactly the
+        # right thing across a regrid: before the switch all four axes shared
+        # one group, and the doubling splits x out of it.
+        assert "y,$p_x$,$p_y$ ∈ [-6, 6]" in head, head
+        # the header is not showing the block's record-0 x window
+        assert "x ∈ [-6, 6]" not in head, head
+    finally:
+        fig.close()
+
+
+def test_the_auto_expand_union_line_does_not_overflow_the_2d_block():
+    """M3 made a regrid reachable at ndim=2, which adds the "axes follow each
+    record (auto-expand); widest: …" line — and at four axes it wraps to two.
+    That is the constant M3 had to check: the block grows DOWNWARD from
+    META_TOP with nothing below it to stop at.
+
+    Measured two ways, because which column dominates depends on the IC:
+    with a short mixture IC the union line takes the LEFT column from 9 lines
+    to 11 and it becomes the taller one — landing exactly on the 11 that fit at
+    the full 8 pt, so nothing shrinks; with a long 2D cat IC the RIGHT column
+    is 12 either way and the union line changes nothing at all. Neither reaches
+    the 5 pt floor, past which _meta_fit elides (17 lines fit there).
+
+    So what is pinned is the BOUND — the union line costs two wrapped lines and
+    must never push the block into elision — rather than a line count that any
+    wording change would invalidate."""
+    keys = ["qn", "qr", "cn", "cr"]
+    cfg = protocol.SessionCreate(**cfg2(variants=keys))
+    log = [{"at_record": i, "t": 0.05*i, "applied": {f: v}, "before": {f: b}}
+           for i, (f, v, b) in enumerate(
+               [("hbar_eff", 2.0, 1.0), ("mass", 2.0, 1.0),
+                ("c", 50.0, 137.035999),
+                ("U", "(x^2-y^2)/2 + 0.9*x^4", "(x^2-y^2)/2 + 0.3*x^4")], 1)]
+    geom = protocol.RecordGeom(2, (128, 128, 64, 64), (-8.0, -8.0, -7.0, -7.0),
+                               (8.0, 8.0, 7.0, 7.0))
+    planes = list(ax.planes(2))
+
+    def build(union):
+        st = _stats2d(tuple(keys), n=48, N=16)
+        st.lo = (-16.0, -8.0, -7.0, -7.0) if union else (-8.0, -8.0, -7.0, -7.0)
+        st.hi = (16.0, 8.0, 7.0, 7.0) if union else (8.0, 8.0, 7.0, 7.0)
+        cols = meta_columns(cfg, geom, st, keys, 0, 47, 48, 30,
+                            planes=planes, param_log=log)
+        fig = FrameFigure(keys, st, cols, width=1920, height=1080,
+                          planes=planes)
+        try:
+            n = max(len(cols[0]), len(cols[1]))
+            return cols, n, fig._meta_fontsize(n), fig.META_MIN_FONTSIZE
+        finally:
+            fig.close()
+
+    plain, n_plain, fs_plain, _ = build(False)
+    grown, n_grown, fs_grown, fmin = build(True)
+
+    text = " ".join(" ".join(grown[0]).split())
+    assert "axes follow each record (auto-expand); widest:" in text
+    assert "x ∈ [-16, 16]" in text                # all four axes, union on x
+    assert "y ∈ [-8, 8]" in text
+    assert "$p_x$ ∈ [-7, 7]" in text
+    assert text.count("∈") == 8                   # 4 at record 0 + 4 widest
+    # the union line lands in the LEFT column and costs it two wrapped lines —
+    # four axes do not fit on one, and that is the whole risk being bounded
+    assert len(grown[0]) == len(plain[0]) + 2
+    assert len(grown[1]) == len(plain[1])          # the right column is untouched
+    # ...and the block still renders at a readable size, well clear of the
+    # floor past which _meta_fit starts dropping facts on the ground
+    assert fs_grown > fmin, "shrunk to the floor: the next stop is elision"
+    assert fs_grown >= fs_plain - 1.0, (fs_plain, fs_grown)
+    assert n_grown <= n_plain + 2
 
 
 def test_the_metadata_block_never_breaks_a_line_mid_fact():

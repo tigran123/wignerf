@@ -107,7 +107,14 @@ const ALL_KEYS = ALL_VARIANTS
  *  serious run rather than a toy, and comfortably inside the default
  *  WIGNERF_MAX_CELLS_2D. Drop to 32 per axis for quick exploration. */
 export const DEFAULT_AXES: Record<Ndim, AxisCfg[]> = {
-  1: [{ lo: -6.0, hi: 6.0, N: 256 }, { lo: -7.0, hi: 7.0, N: 256 }],
+  // 1024², not the 256² this used to be: 256 is the SMALLEST N the panel offers
+  // (AXIS_N_FLOOR), and opening on the minimum is a strange default when 1024² is
+  // ~550 steps/s on a 3090 at 160 MiB per worker and its display frames are 2 MiB
+  // — an eighth of where the browser's receive path starts to bind. The default
+  // BOX is unchanged and so is its boundary behaviour: `edge_band` is
+  // max(4, N/32) CELLS, and the N/32 term wins from N=128 up, so the band is
+  // 0.375 a.u. wide at 1024 exactly as it was at 256 (32 cells against 8).
+  1: [{ lo: -6.0, hi: 6.0, N: 1024 }, { lo: -7.0, hi: 7.0, N: 1024 }],
   // The 2D spatial box is WIDER than the 1D one at the same extents, and that
   // is not arbitrary. boundary.edge_band is max(4, N/32) CELLS, so its physical
   // width is max(4, N/32)*L/N: at N=256 the N/32 term wins (0.375 a.u.) but at
@@ -229,8 +236,29 @@ export function gridCells(g: GridCfg): number {
 }
 
 /**
- * The per-axis N values the Setup panel offers: powers of two up to the host's
- * ceiling FOR THIS NDIM, plus whatever the form currently holds.
+ * Smallest per-axis N the Setup panel offers, per dimensionality — the FLOOR of
+ * the fixed list `axisSizeOptions` builds (its ceiling is the host's
+ * WIGNERF_MAX_GRID / _MAX_GRID_2D, from /api/device).
+ *
+ * Here rather than inline in that function because `setNdim` needs the SAME
+ * number: it lands N in the target dimensionality, and a value under the floor
+ * is one the select cannot offer. Switching 1D -> 2D -> 1D used to come back
+ * with the 2D choice intact — 64, in a 1D list that starts at 256 — so the
+ * select rendered `64, 256, 512, …` with a hole in it and a 1D session ran at
+ * 64² because nothing had asked for that.
+ *
+ * 2D starts at 32, not 16: `boundary._band_mass` reports nothing below 32 cells
+ * per axis (the edge band would cover a quarter of the axis), so a 16⁴ session
+ * has no boundary watch at all and says so nowhere. 1D starts at 256, which is
+ * DEFAULT_AXES[1]'s own resolution — below it a 1D run is coarse enough that its
+ * diagnostics stop meaning much, and 1D cells are cheap (256² is 65k).
+ */
+export const AXIS_N_FLOOR: Record<Ndim, number> = { 1: 256, 2: 32 }
+
+/**
+ * The per-axis N values the Setup panel offers: powers of two from
+ * AXIS_N_FLOOR[ndim] up to the host's ceiling FOR THIS NDIM, plus whatever the
+ * form currently holds.
  *
  * It lives here, not in SetupPanel, so it can be pinned by a unit test rather
  * than eyeballed through the DOM — the same reason `lib/potentialCuts.ts` was
@@ -240,27 +268,27 @@ export function gridCells(g: GridCfg): number {
  * form switched back to 1D over a live 2D session collapsed to a single option
  * (cap 128, loop starting at 256, body never entered).
  *
- * Two floors matter:
- *  - 2D starts at 32, not 16. `boundary._band_mass` reports nothing below 32
- *    cells per axis — the edge band would otherwise cover a quarter of the axis
- *    — so a 16⁴ session has no boundary watch at all and says so nowhere.
- *    Starting at 32 means every grid on offer has a working one, and it matches
- *    DEFAULT_AXES's own "drop to 32 per axis for quick exploration". 16⁴ stays
- *    reachable through the API and through an imported config, which the
- *    `current` merge below keeps listed.
- *  - the start is clamped to `cap`, or a host that lowered WIGNERF_MAX_GRID
- *    (which CLAUDE.md recommends on VRAM-constrained hosts) would get an empty
- *    1D list the same way.
+ * The floor is clamped to `cap`, or a host that lowered WIGNERF_MAX_GRID (which
+ * CLAUDE.md recommends on VRAM-constrained hosts) would get an empty list the
+ * same way — the 1D floor of 256 is above a cap of 128. `axisFloor` is what
+ * `setNdim` asks for the same reason, so the two cannot disagree about what is
+ * offerable.
  *
- * `current` values are always listed even when over cap, so an imported
- * oversized setup renders its own value rather than a blank select; the API
- * refuses it at Restart with a message naming the ceiling.
+ * `current` values are always listed even when off the list, so an imported
+ * setup renders its own value rather than a blank select — a select whose bound
+ * value is absent shows nothing at all, which hides the very number the API is
+ * about to refuse. That is for values arriving from OUTSIDE the form (an import,
+ * a session created by hand); nothing the panel itself does should produce one.
  */
+export function axisFloor(ndim: number, cap: number): number {
+  return Math.min(AXIS_N_FLOOR[ndim === 2 ? 2 : 1], Math.max(cap, 16))
+}
+
 export function axisSizeOptions(ndim: number, cap: number,
                                 current: number[] = []): number[] {
   const top = Math.max(cap, 16)
   const out: number[] = []
-  for (let n = Math.min(ndim > 1 ? 32 : 256, top); n <= top; n *= 2) out.push(n)
+  for (let n = axisFloor(ndim, top); n <= top; n *= 2) out.push(n)
   for (const n of current) if (!out.includes(n)) out.push(n)
   return out.sort((a, b) => a - b)
 }
@@ -273,7 +301,7 @@ export function axisSizeOptions(ndim: number, cap: number,
  * origin, which is the least surprising state to land in (a separable product
  * of what was there). Going back drops it.
  */
-export function setNdim(c: SimConfig, ndim: Ndim) {
+export function setNdim(c: SimConfig, ndim: Ndim, cap = Infinity) {
   if (c.grid.ndim === ndim) return
   const wasDefaultU = c.potential === DEFAULT_POTENTIAL[c.grid.ndim]
   const keep = c.grid.axes
@@ -302,11 +330,29 @@ export function setNdim(c: SimConfig, ndim: Ndim) {
     return a.lo === d.lo && a.hi === d.hi
   })
   const src = boxWasDefault ? DEFAULT_AXES[ndim] : box
-  const next = DEFAULT_AXES[ndim].map((d, i) => ({
-    // extents from whichever source applies; N always the user's own choice,
-    // capped at the target's default (a 1D 256 is 4.3e9 cells at ndim=2)
-    lo: src[i]!.lo, hi: src[i]!.hi, N: Math.min(box[i]!.N, d.N),
-  }))
+  // N LANDS INSIDE THE TARGET'S OWN LIST: the user's own choice when it is
+  // offerable there, and the target's DEFAULT when it is not.
+  //
+  // Capping from above alone was wrong in both directions. Going up, a 1D 1024
+  // would be 1.1e12 cells at ndim=2, over every ceiling, so the first Restart
+  // after a switch failed on a grid nobody chose — hence min() against the
+  // target's default. Coming DOWN, a 2D 64 stayed 64 in a 1D list that starts at
+  // 256, which put a hole in the select (64, 256, 512, …) and ran 1D at a
+  // resolution the panel does not offer.
+  //
+  // The unrepresentable case falls back to `top`, NOT to the floor, and the
+  // difference is only visible because DEFAULT_AXES[1] is 1024 while the 1D floor
+  // is 256: a user who starts at the 1D default, looks at 2D and comes back must
+  // land on 1024 again. Snapping to the floor would quietly quarter their
+  // resolution on the way through — the same class of surprise as the hole.
+  // `cap` is the host's per-axis ceiling for the TARGET ndim, so nothing here can
+  // exceed it on a host that lowered WIGNERF_MAX_GRID.
+  const floor = axisFloor(ndim, cap)
+  const next = DEFAULT_AXES[ndim].map((d, i) => {
+    const top = Math.max(floor, Math.min(d.N, Math.max(cap, 16)))
+    const want = Math.min(box[i]!.N, top)
+    return { lo: src[i]!.lo, hi: src[i]!.hi, N: want >= floor ? want : top }
+  })
   c.grid.ndim = ndim
   c.grid.axes.splice(0, c.grid.axes.length, ...next)
   for (const k of c.ic.components) {
@@ -325,29 +371,23 @@ export function setNdim(c: SimConfig, ndim: Ndim) {
   // U(x) cannot mean U(x,y): only replace it if the user never edited it away
   // from the default, so a hand-written potential is never silently discarded.
   if (wasDefaultU) c.potential = DEFAULT_POTENTIAL[ndim]
-  applyNdimInvariants(c)
 }
 
-/**
- * The one thing a 2D run still cannot do, applied to the config rather than
- * argued with at Restart time — the exact counterpart of
- * applyPrecisionInvariants, and for the same reason: the backend refuses the
- * combination outright (milestone M3), so reaching it from a stale localStorage
- * entry, an imported 1D setup or a probe-adopted host default would leave
- * Restart failing with a 422 the user never chose.
+/*
+ * applyNdimInvariants USED TO LIVE HERE and is deliberately gone. It existed to
+ * keep the FORM out of combinations the backend refused at ndim=2, and all three
+ * are now retired: M2 (the relativistic variants) and M1 (float32) on
+ * 2026-07-27, and M3 (auto-expand) on 2026-08-01. There is no 2D-only gate left
+ * to mirror, so the function is not kept as an empty hook — an invariant helper
+ * that enforces nothing is a place for a future gate to be added silently,
+ * which is exactly what the amber-marker/tooltip/disabled pattern exists to
+ * prevent. applyPrecisionInvariants stays: float32 still refuses auto-expand and
+ * tol < 1e-5, at EITHER dimensionality.
  *
- * Two of the three gates this used to enforce are gone. M2 (the relativistic
- * variants) landed 2026-07-27, so qr/cr are no longer filtered out; M1 (float32)
- * landed the same day, so `precision` is no longer forced to float64 and 2D now
- * resolves it exactly as 1D does. A stored 2D config that this function once
- * stripped down to ['qn'], or pinned to float64, keeps whatever it was left with
- * — there is nothing to migrate, because both were destructive at the time and
- * float64 remains a perfectly good choice.
+ * A stored 2D config that the old function once stripped to ['qn'], pinned to
+ * float64, or cleared auto_expand on keeps whatever it was left with. Nothing to
+ * migrate: each was a legitimate value at the time.
  */
-export function applyNdimInvariants(c: SimConfig) {
-  if (c.grid.ndim < 2) return
-  c.auto_expand = false            // M3
-}
 
 /** Axis labels for this config's dimensionality ('x','p' / 'x','y','px','py'). */
 export function gridLabels(c: SimConfig): readonly string[] {
@@ -460,10 +500,9 @@ export function mergeConfig(target: SimConfig, s: unknown) {
   // imported setup so it is not rejected by the backend's mode literal.
   if ((target as unknown as Record<string, unknown>).mode === 'runahead')
     target.mode = 'batch'
-  // ndim first: both clear auto_expand, and running the precision invariants
-  // last is what guarantees tol is raised to the float32 floor for whatever
-  // precision the merge ended up with
-  applyNdimInvariants(target)
+  // after the merge, not before: this is what guarantees auto_expand is cleared
+  // and tol raised to the float32 floor for whatever precision the merge
+  // actually ended up with, rather than the one it started from
   applyPrecisionInvariants(target)
 }
 
@@ -604,13 +643,11 @@ export function resetToDefaults(c: SimConfig) {
   // "reset to defaults" un-chooses: the form goes back to deferring to the
   // host, which is what the default IS.
   precisionWasStored = false
-  // Both invariants, at a point where a whole config is constructed. Neither
-  // fires against today's defaults (auto_expand is false and tol is 0.01), and
-  // that is the reason to call them rather than not to: this used to exist
-  // solely to undo a float32 host default in 2D, which M1 made legal, so
-  // dropping the calls with that reason would leave the ONE path that builds a
-  // config from scratch as the one path that never checks it.
-  applyNdimInvariants(c)
+  // The precision invariants, at a point where a whole config is constructed.
+  // They do not fire against today's defaults (auto_expand is false and tol is
+  // 0.01), and that is the reason to call them rather than not to: dropping the
+  // call because it happens to be a no-op today would leave the ONE path that
+  // builds a config from scratch as the one path that never checks itself.
   applyPrecisionInvariants(c)
 }
 

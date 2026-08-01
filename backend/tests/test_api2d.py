@@ -1,17 +1,21 @@
 """
-2D sessions through the API: the record path end to end, and the one explicit
-refusal that still stands in for deferred work (milestone M3 in CLAUDE.md).
+2D sessions through the API: the record path end to end, and the gate tests
+turned inside out.
 
-The refusal test is not box-ticking. The gate replaces a feature that would
-otherwise half-work — an auto-expanding 4D grid with no memory guard on the
-doubling — and a gate that silently stopped firing is exactly how a half-feature
-ships. It also pins that the message NAMES the milestone, so whoever hits it
-learns what is missing rather than that "2D is broken".
+There are no 2D-only refusals left — M3 (auto-expand) was the last, on
+2026-08-01. What used to be "this is refused, by the name of its milestone" is
+now "this is ACCEPTED", and those tests earn their place the same way the
+refusals did: a gate that silently came back, or a feature that quietly stopped
+being reachable at ndim=2, fails here loudly. The one refusal still checked is
+float32 + auto_expand, which is a PRECISION gate rather than a 2D one — it is
+tested at ndim=2 precisely because the 2D gate in front of it is gone and can no
+longer mask it.
 
-THREE of the four have landed, and each left the opposite kind of test behind:
-the thing the gate forbade must now be ACCEPTED and work. M2 (relativistic
-qr/cr) and M1 (float32) on 2026-07-27, M4 (mp4 export) on 2026-07-28. See
-tests/test_propagator2d.py, tests/test_precision.py and tests/test_export2d.py.
+ALL FOUR have landed, and each left the opposite kind of test behind: the thing
+the gate forbade must now be ACCEPTED and work. M2 (relativistic qr/cr) and M1
+(float32) on 2026-07-27, M4 (mp4 export) on 2026-07-28, M3 (auto-expand) on
+2026-08-01. See tests/test_propagator2d.py, tests/test_precision.py,
+tests/test_export2d.py and tests/test_regrid2d.py.
 """
 
 import json
@@ -173,14 +177,29 @@ def test_float32_2d_sessions_are_accepted_and_stream():
         client.delete("/api/sessions/%s" % sid)
 
 
-@pytest.mark.parametrize("over,needle", [
-    (dict(auto_expand=True), "M3"),
-])
-def test_deferred_features_are_refused_with_their_milestone(over, needle):
+def test_the_2d_auto_expand_gate_is_gone():
+    """M3 landed on 2026-08-01: a 2D session may now ask for auto-expand and be
+    created, where it used to 422 with the milestone's name.
+
+    The inverse of the gate test this replaces — and it earns its place the same
+    way M2's and M4's do, by failing loudly if the refusal ever came back."""
     with TestClient(app) as client:
-        r = client.post("/api/sessions", json=cfg2(**over))
+        r = client.post("/api/sessions", json=cfg2(auto_expand=True))
+        assert r.status_code == 200, r.text
+        sid = r.json()["session_id"]
+        assert client.get("/api/sessions/%s" % sid).json()["auto_expand"] is True
+        client.delete("/api/sessions/%s" % sid)
+
+
+def test_float32_still_refuses_auto_expand_at_ndim_2():
+    """The one gate M3 did NOT retire, and the reason it is checked here: it is
+    a PRECISION gate, so it must still bite at ndim=2 now that the 2D gate in
+    front of it is gone and no longer masking it."""
+    with TestClient(app) as client:
+        r = client.post("/api/sessions",
+                        json=cfg2(auto_expand=True, precision="float32"))
         assert r.status_code == 422, r.text
-        assert needle in r.text, r.text
+        assert "float32" in r.text, r.text
 
 
 @pytest.mark.parametrize("variants", [["qr"], ["cr"], ["qn", "qr", "cn", "cr"]])
@@ -246,9 +265,10 @@ def test_massless_needs_relativistic_variants_and_now_works_in_2d():
         client.delete("/api/sessions/%s" % sid)
 
 
-def test_auto_expand_is_also_refused_live():
-    """auto_expand is live-toggleable, so the create-time refusal is otherwise
-    two clicks away."""
+def test_auto_expand_applies_live_in_2d():
+    """The live half of M3's gate removal. auto_expand is live-toggleable, so
+    the create-time refusal used to be mirrored on this path too — both are
+    gone, and a 2D session must now accept the toggle and report it."""
     with TestClient(app) as client:
         info = client.post("/api/sessions", json=cfg2()).json()
         sid = info["session_id"]
@@ -260,13 +280,13 @@ def test_auto_expand_is_also_refused_live():
                 if not m.get("text"):
                     continue
                 d = json.loads(m["text"])
-                assert d["type"] != "params_applied", d
-                if d["type"] == "error":
-                    assert "M3" in d["message"]
+                assert d["type"] != "error", d
+                if d["type"] == "params_applied":
+                    assert d["applied"]["auto_expand"] is True, d
                     break
             else:
-                raise AssertionError("live auto_expand was not refused")
-        assert client.get("/api/sessions/%s" % sid).json()["auto_expand"] is False
+                raise AssertionError("live auto_expand was not applied")
+        assert client.get("/api/sessions/%s" % sid).json()["auto_expand"] is True
         client.delete("/api/sessions/%s" % sid)
 
 

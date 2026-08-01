@@ -37,11 +37,11 @@ from dataclasses import dataclass
 import config
 
 from . import axes as axes_mod
-from . import boundary, videoexport
+from . import boundary, fit, videoexport
 from .grid import GridState
 from .history import FrameHistory
 from .potential import PotentialError, compile_potential
-from .protocol import (MSG_EXPAND_2D, MSG_EXPAND_F32, MSG_TOL_F32,
+from .protocol import (MSG_EXPAND_F32, MSG_TOL_F32,
                        TOL_MIN_F32, VARIANTS)
 from .worker import SolverWorker
 from .xp import resolve_devices
@@ -373,6 +373,9 @@ class SimSession:
         self._regrid_epoch = 0
         self._capped_posted = False    # latched warnings (reset on all-clear)
         self._invalid_posted = False
+        # a doubling the devices cannot afford: a message latch like
+        # _capped_posted, NOT a scheduling gate (see report_edge)
+        self._no_room_posted = False
         self.frame_evt = asyncio.Event()
         self.msgs = deque(maxlen=64)     # server->client JSON side channel
         # live parameter changes, in record order: an mp4 export prints the
@@ -479,6 +482,16 @@ class SimSession:
             if not axes:
                 self._capped_posted = False
                 self._invalid_posted = False
+                self._no_room_posted = False
+            # `_invalid_posted` gates SCHEDULING because retrying costs a ~ms
+            # sympy probe under this lock every record. `_capped_posted` and
+            # `_no_room_posted` deliberately do not: retrying is a support scan
+            # the planner runs anyway plus — only when the plan grows — one
+            # microsecond-scale driver reading, and gating on them takes away the
+            # relief a state that is merely DRIFTING keeps getting. That is the
+            # long-standing "pure moves still work at the cap" property, and
+            # _no_room_posted gated `want` for one revision, which silently
+            # switched auto-expand off for the rest of an edge episode.
             want = (bool(axes) and self.auto_expand
                     and not self._plan_pending() and not self._invalid_posted)
         if want:
@@ -524,6 +537,84 @@ class SimSession:
             return "; ".join(cp.reasons)
         return None
 
+    def _afford_regrid(self, gs, new, counts, budget):
+        """None when this session's devices can afford the window `new`, else
+        `(limit, reason)` — WHICH ceiling ran out, and a sentence about it.
+
+        `limit` exists because the two guards below need OPPOSITE advice and the
+        caller only has a string to post. "cells" is a host setting
+        (WIGNERF_MAX_CELLS_2D): freeing the card cannot help and neither can
+        float32, since a cell count does not depend on precision. "device" is
+        hardware: free it, or use less of it. Reported as one sentence with the
+        wrong remedy, a rail denial sent the user to look at their GPU.
+
+        THE CHECK routers/sessions._fit_error MAKES AT CREATE TIME, ASKED AGAIN
+        MID-RUN — which is the whole of milestone M3. That one runs once, before
+        anything is allocated; nothing re-asked it when auto-expand doubled the
+        grid, because at ndim=1 a doubling is a rounding error next to VRAM and
+        the per-axis WIGNERF_MAX_GRID cap was guard enough. In 4D one doubling
+        doubles a multi-GiB working set.
+
+        Two guards, in order of how much they can be trusted:
+
+        1. the WIGNERF_MAX_CELLS_2D rail, which was stored on the session and
+           consulted by nothing until now. Cheap, deterministic, and the ONLY
+           guard on a host whose free memory cannot be read.
+        2. the per-device fit, which asks the driver. Skipped at ndim=1, where
+           behaviour must stay exactly as it was.
+
+        Neither can refuse a window that does not GROW: the rail cannot fire on
+        a cell count the session is already running under, and `fit` returns
+        early (see the comment there — the doubling inequality applied to a pure
+        move refuses one that allocates nothing). `counts`/`budget` are read once
+        per attempt by the caller, so the greedy walk-back below compares every
+        candidate against the same driver reading rather than watching the card
+        move under it.
+        """
+        if self.ndim < 2:
+            return None
+        cells_new, cells_old = fit.cells_of(new.N), fit.cells_of(gs.N)
+        if self.max_cells is not None and cells_new > self.max_cells:
+            per = fit.per_worker(cells_new, self.ndim, self.cfg.precision)
+            return ("cells",
+                    "%s cells is over WIGNERF_MAX_CELLS_2D=%s (~%.1f GiB per "
+                    "worker)" % (format(cells_new, ","),
+                                 format(self.max_cells, ","), fit.gib(per)))
+        short = fit.regrid_shortfall(cells_old, cells_new, self.ndim,
+                                     self.cfg.precision, counts, budget)
+        if not short:
+            return None
+        dev, n, need, have = short[0]
+        return ("device",
+                "%s would have to hold %.1f GiB for %d worker%s and has %.1f "
+                "GiB to give" % (dev, fit.gib(need), n, "" if n == 1 else "s",
+                                 fit.gib(have)))
+
+    def _veto_potential(self, k, gs, new):
+        """True when U is not valid on the window a regrid would move into,
+        having posted the reason (latched) — the caller then commits nothing.
+
+        The extended Bopp box moves with the SPATIAL windows (the momentum cell
+        sizes are frozen, so its half-widths never change), so a plan that
+        touches only momentum axes needs no probe at all. Revalidated on the
+        UNION of old and new, because records below k_star keep evolving on the
+        old one.
+        """
+        if not any(new.offset[a] != gs.offset[a] or new.N[a] != gs.N[a]
+                   for a in range(gs.ndim)):
+            return False
+        reason = self._potential_invalid(self.cfg.potential, gs.union(new),
+                                         self.cfg.hbar_eff)
+        if reason is None:
+            return False
+        if not self._invalid_posted:
+            self._invalid_posted = True
+            self.post_msg({"type": "boundary", "record": k,
+                           "action": "invalid_potential",
+                           "message": "cannot expand: %s" % reason,
+                           **self.boundary_state})
+        return True
+
     def _schedule_regrid(self, k, axes):
         """Plan and commit an exact fixed-lattice regrid (move and/or double
         of the tripped axes, support centered, capped at max_grid). The
@@ -543,56 +634,133 @@ class SimSession:
             if geom != gs.geom():
                 return                 # regrid landed under us: retry later
             labels = self.axis_labels
-            new, kinds, capped = gs, {}, []
+            sup_of, plans, capped = {}, {}, []
             for a in range(gs.n_axes):
                 if labels[a] not in axes:
                     continue
                 sup = [boundary.support_cells(vf.marg[a], gs.d[a])
                        for vf in frames]
-                pl = boundary.plan_axis(gs.offset[a], gs.N[a],
-                                        min(s[0] for s in sup),
-                                        max(s[1] for s in sup), self.max_grid)
+                sup_of[a] = (min(s[0] for s in sup), max(s[1] for s in sup))
+                pl = boundary.plan_axis(gs.offset[a], gs.N[a], sup_of[a][0],
+                                        sup_of[a][1], self.max_grid)
                 if pl.kind == "capped":
                     capped.append(labels[a])
                 else:
-                    new = new.moved(a, pl.offset, pl.n)
-                    kinds[labels[a]] = pl.kind
+                    plans[a] = pl
+
+            def compose():
+                out = gs
+                for a, pl in plans.items():
+                    out = out.moved(a, pl.offset, pl.n)
+                return out
+
+            new = compose()
+            denied, shortfall, limit, ask = [], None, None, None
+            # AFFORDABILITY (M3). Give up doublings, least-tripped axis first,
+            # until the devices can hold the result. Reverting one axis is
+            # plan_axis with the cap set to the CURRENT size, which by
+            # construction can only answer "move" or "capped" — so a denied
+            # axis still gets whatever pure window shift is available.
+            #
+            # Be honest about how often that helps: at the moment an axis trips,
+            # ~1e-6 of the state is in the outer band and some of it has already
+            # re-entered at the far edge, so the support legitimately spans the
+            # axis and the fallback is usually "capped" rather than a useful
+            # move (measured — see the M3 notes in CLAUDE.md). Greedy earns its
+            # place on the case it was chosen for: several axes trip together
+            # and only some of the doublings fit.
+            #
+            # Asked ONLY of a plan that GROWS, and against ONE driver reading for
+            # the whole attempt: a walk-back that compared each candidate against
+            # a freshly-read card could accept a plan neither reading allows, and
+            # a move needs no reading at all (fit.regrid_shortfall says why).
+            # Degradation only ever shrinks the plan, so a first plan that does
+            # not grow means no later one does and no device is asked.
+            if self.ndim > 1 and fit.cells_of(new.N) > fit.cells_of(gs.N):
+                counts = fit.worker_counts(w.device for w in self.workers)
+                budget = fit.budgets(counts, context=False)
+                while True:
+                    verdict = self._afford_regrid(gs, new, counts, budget)
+                    if verdict is None:
+                        break
+                    if shortfall is None:
+                        # the FULL ask names the real deficit, and which ceiling
+                        # it ran into decides what the warning advises
+                        limit, shortfall = verdict
+                    grew = [i for i, pl in plans.items() if pl.kind == "double"]
+                    if not grew:
+                        break            # growth implies a doubling: unreachable
+                    mass = self.boundary_state["mass"]
+                    least = min(grew, key=lambda i: mass.get(labels[i], 0.0))
+                    denied.append(labels[least])
+                    # cap = the CURRENT size, so this can only come back "move"
+                    # or "capped" — either way `least` leaves `grew` and the loop
+                    # terminates in at most one pass per planned axis
+                    pl = boundary.plan_axis(gs.offset[least], gs.N[least],
+                                            sup_of[least][0], sup_of[least][1],
+                                            gs.N[least])
+                    if pl.kind == "capped":
+                        # NOT added to `capped`: that warning is about
+                        # WIGNERF_MAX_GRID, and this axis is in `denied` instead
+                        del plans[least]
+                    else:
+                        plans[least] = pl
+                    new = compose()
+                # What was accepted, and against what reading — logged on the
+                # ACCEPT path and not only on the refusal, because a reading can
+                # be stale (fit.py's "WHAT THIS CANNOT SEE": a sibling session's
+                # committed-but-unlanded plan, another process, the IC preview),
+                # and then the failure surfaces as an OOM at k_star with nothing
+                # in the journal to say what the card had promised.
+                per = fit.per_worker(fit.cells_of(new.N), self.ndim,
+                                     self.cfg.precision)
+                ask = ", ".join(
+                    "%s %d x %.2f GiB of %.2f free"
+                    % (dev, counts[dev], fit.gib(per), fit.gib(free))
+                    for dev, (free, _spend) in sorted(budget.items()))
+            kinds = {labels[a]: pl.kind for a, pl in plans.items()}
             if capped and not self._capped_posted:
                 self._capped_posted = True
                 self.post_msg({"type": "boundary", "record": k,
                                "action": "capped", "max_grid": self.max_grid,
                                **{**self.boundary_state, "axes": capped}})
-            if new == gs:
+            plan = None
+            if new != gs and not self._veto_potential(k, gs, new):
+                k_star = max(self.history.variant_frontier(s)
+                             for s in range(len(self.workers))) + 2
+                self._regrid_epoch += 1
+                self._prev_grid_state = gs
+                self.grid_state = new
+                plan = self._regrid_plan = RegridPlan(self._regrid_epoch,
+                                                      k_star, new)
+            # POSTED ONCE THE OUTCOME IS KNOWN, because a denial and a committed
+            # move are two different stories and the header used to carry both at
+            # once — "the domain cannot be expanded" over "domain moved to
+            # [-4, 12]". `applied` is what the frontend picks its wording from,
+            # and it is empty when nothing was committed. `denied` is the whole
+            # condition: after fit's non-growing early return the only way to end
+            # unaffordable is to have given a doubling up, which also keeps
+            # `axes` non-empty (useSession drops an empty-axes event).
+            if denied and not self._no_room_posted:
+                self._no_room_posted = True
+                self.post_msg({"type": "boundary", "record": k,
+                               "action": "no_room", "message": shortfall,
+                               "limit": limit, "denied": denied,
+                               "applied": kinds if plan is not None else {},
+                               **{**self.boundary_state, "axes": denied}})
+            elif plan is not None and not denied:
+                # everything asked for fitted: the card has room again, so a
+                # LATER denial is announced instead of being swallowed by a latch
+                # that only the all-clear would otherwise reset
+                self._no_room_posted = False
+            if plan is None:
                 return
-            if any(new.offset[a] != gs.offset[a] or new.N[a] != gs.N[a]
-                   for a in range(gs.ndim)):
-                # the extended Bopp box moves with the SPATIAL windows (the
-                # momentum cell sizes are frozen, so its half-widths never
-                # change): revalidate U on the union of old and new windows
-                # BEFORE committing
-                reason = self._potential_invalid(self.cfg.potential,
-                                                 gs.union(new),
-                                                 self.cfg.hbar_eff)
-                if reason is not None:
-                    if not self._invalid_posted:
-                        self._invalid_posted = True
-                        self.post_msg({"type": "boundary", "record": k,
-                                       "action": "invalid_potential",
-                                       "message": "cannot expand: %s" % reason,
-                                       **self.boundary_state})
-                    return
-            k_star = max(self.history.variant_frontier(s)
-                         for s in range(len(self.workers))) + 2
-            self._regrid_epoch += 1
-            self._prev_grid_state = gs
-            self.grid_state = new
-            plan = self._regrid_plan = RegridPlan(self._regrid_epoch,
-                                                  k_star, new)
             self.post_msg({"type": "regrid", "at_record": plan.k_star,
                            "epoch": plan.epoch, "kind": kinds,
                            "grid": grid_payload(new)})
-        log.info("session %s: regrid epoch %d at record %d: %s -> %s",
-                 self.id, plan.epoch, plan.k_star, kinds, new.describe())
+        log.info("session %s: regrid epoch %d at record %d: %s -> %s%s",
+                 self.id, plan.epoch, plan.k_star, kinds, new.describe(),
+                 "" if ask is None else " [budget: %s]" % ask)
         self.clock.kick()
 
     # called from the router/streamer coroutines
@@ -635,15 +803,6 @@ class SimSession:
         if new.get("auto_expand") and self.cfg.precision == "float32":
             self.post_msg({"type": "error", "code": "bad_auto_expand",
                            "message": MSG_EXPAND_F32})
-            new.pop("auto_expand")
-            old.pop("auto_expand")
-        # ...and for exactly the same reason in 2D: the create-time refusal
-        # (milestone M3) is otherwise two clicks away, and what it prevents —
-        # a 4-axis planner with no memory guard doubling a multi-GiB footprint
-        # — reads as the solver dying, not as a setting.
-        if new.get("auto_expand") and self.ndim > 1:
-            self.post_msg({"type": "error", "code": "bad_auto_expand",
-                           "message": MSG_EXPAND_2D})
             new.pop("auto_expand")
             old.pop("auto_expand")
         if not new:

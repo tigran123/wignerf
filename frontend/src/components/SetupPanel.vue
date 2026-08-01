@@ -18,7 +18,13 @@ const props = defineProps<{ cfg: SimConfig; live: boolean; sign?: number
                             // there a run for U(x)'s "Apply live" to reach —
                             // status.running is true during playback too)
                             computing?: boolean
-                            liveGrid?: GeomCfg | null; maxGrid?: number
+                            liveGrid?: GeomCfg | null
+                            // per-axis N ceiling BY NDIM (WIGNERF_MAX_GRID /
+                            // _MAX_GRID_2D from /api/device). The whole map, not
+                            // just the current ndim's: a dims switch has to land
+                            // N inside the TARGET's list, and it runs before the
+                            // form's ndim — and so this prop — has moved.
+                            maxGrid?: Record<number, number>
                             // 2D memory facts (status): the total-cell ceiling
                             // and the measured device bytes per cell per worker
                             maxCells?: number | null
@@ -77,13 +83,13 @@ const runStale = computed(() =>
   (['mode', 't2', 'record_dt'] as const).some(runDiffers))
 
 const f32 = computed(() => props.cfg.precision === 'float32')
-// auto-expand is gated by float32 (single-precision noise trips its own
-// detector) AND by 2D (no memory guard on a 4-axis doubling) — two different
-// reasons, one disabled state, so the marker and tooltip pick the right words
-const expandGated = computed(() => f32.value || props.cfg.grid.ndim > 1)
+// auto-expand is gated by float32 alone (single-precision noise trips its own
+// detector). It was ALSO gated at ndim=2 until M3 landed (2026-08-01) and the
+// planner got the regrid memory guard it was standing in for.
+const expandGated = computed(() => f32.value)
 // The precision select had the same treatment until M1 landed (2026-07-27) and
 // float32 became a legal 2D choice. Nothing gates it now — and note what it must
-// NOT go back to: a control left enabled while applyNdimInvariants put its value
+// NOT go back to: a control left enabled while an invariant helper put its value
 // back in payload(), which left the select amber against a value no restart could
 // send and, on a fresh session, made syncFreshSessionToForm build TWO of them.
 
@@ -104,11 +110,6 @@ const AUTO_EXPAND_F32_HELP = 'Unavailable in float32, and refused by the API: a'
   + ' new domain reads the whole axis, so the domain would double for no'
   + ' physical reason. Boundary detection still runs on a raised threshold and'
   + ' still warns you. Restart in float64 to auto-expand.'
-const AUTO_EXPAND_2D_HELP = 'Not available for 2D runs yet, and refused by the'
-  + ' API (milestone M3): in 4D every axis doubling doubles a multi-GiB working'
-  + ' set, so the planner needs a memory guard it does not yet have. Boundary'
-  + ' DETECTION still runs on all four axes and will warn you — size the domain'
-  + ' by hand.'
 const PRECISION_HELP = 'spectral working precision. float64 is the physics'
   + ' setting. float32 is a PREVIEW mode, and what it buys depends on the'
   + ' dimensionality: in 1D 3.3-3.8× faster, in 2D only 1.5-2.6× (the 4-axis'
@@ -121,8 +122,9 @@ const PRECISION_HELP = 'spectral working precision. float64 is the physics'
 const NDIM_HELP = 'spatial dimensions. 1D solves W(x,p,t); 2D solves'
   + ' W(x,y,px,py,t) and streams the six pairwise 2D projections instead of the'
   + ' 4D array. Restart-only, and it rebuilds the grid, the initial condition'
-  + ' and (if untouched) U. NB 2D still defers auto-expand and mp4 export'
-  + ' — the API refuses each with the reason.'
+  + ' and (if untouched) U. Nothing is refused at 2D any more — relativistic'
+  + ' variants, float32, mp4 export and auto-expand all work there; what binds'
+  + ' is the per-axis N ceiling and the footprint below it.'
 const TOL_HELP = 'adaptive-step relative tolerance'
 // toExponential: JS prints 1e-5 as "0.00001", which is neither how the field is
 // typed nor how the backend's own refusal words it
@@ -291,9 +293,9 @@ const axisNamesHtml = computed(() =>
 // `status`, which reports the ceiling of the ndim that is RUNNING. See
 // lib/config.axisSizeOptions for the floors and for what reading it off the
 // session did to both directions of a dims switch.
+const capFor = (nd: number) => props.maxGrid?.[nd] ?? (nd > 1 ? 128 : 4096)
 const sizeOptions = computed(() => axisSizeOptions(
-  ndim.value, props.maxGrid ?? (ndim.value > 1 ? 128 : 4096),
-  props.cfg.grid.axes.map((a) => a.N)))
+  ndim.value, capFor(ndim.value), props.cfg.grid.axes.map((a) => a.N)))
 
 const cells = computed(() => gridCells(props.cfg.grid))
 const overCells = computed(() =>
@@ -382,7 +384,10 @@ const footprint = computed(() => {
 
 /** Switching dimensionality rebuilds grid + IC, so it is restart-only. */
 function onNdimChange(v: string) {
-  setNdim(props.cfg, v === '2' ? 2 : 1)
+  const target = v === '2' ? 2 : 1
+  // the TARGET's ceiling, so setNdim can land N inside the list this select is
+  // about to show (see lib/config.setNdim on the hole a 2D 64 left in the 1D one)
+  setNdim(props.cfg, target, capFor(target))
   emit('dirty')
 }
 
@@ -576,22 +581,22 @@ function adoptLive() {
              not equal thirds) plus short labels are what make three fit inside
              320px — verified at the real width, per the UI-debugging note in
              CLAUDE.md. flex-wrap is only a safety valve.
-             That budget is why auto-expand's gate marker is "(1D)" / "(f64)"
-             rather than a spelled-out clause: it stays PERMANENT and visible,
-             which is the load-bearing part (a touch device gets no hover), and
-             the full reason lives in the tooltip. The float32 gate is still
-             stated three ways, none of them a standing paragraph: this marker,
-             the tooltip, and the one-off amber note in Compute at the switch. -->
+             That budget is why auto-expand's gate marker is "(f64)" rather than
+             a spelled-out clause: it stays PERMANENT and visible, which is the
+             load-bearing part (a touch device gets no hover), and the full
+             reason lives in the tooltip. There was a "(1D)" marker beside it
+             until M3 landed (2026-08-01); the float32 gate is the only one
+             left, and it is still stated three ways, none of them a standing
+             paragraph: this marker, the tooltip, and the one-off amber note in
+             Compute at the switch. -->
         <label class="flex items-center gap-1 select-none"
                :class="expandGated ? 'cursor-not-allowed' : 'cursor-pointer'"
-               :title="ndim > 1 ? AUTO_EXPAND_2D_HELP
-                       : (f32 ? AUTO_EXPAND_F32_HELP : AUTO_EXPAND_HELP)">
+               :title="f32 ? AUTO_EXPAND_F32_HELP : AUTO_EXPAND_HELP">
           <input type="checkbox" v-model="props.cfg.auto_expand"
                  :disabled="expandGated"
                  @change="emit('apply-live', { auto_expand: props.cfg.auto_expand })" />
           <span :class="expandGated ? 'text-dim' : 'text-fg-3'">auto-expand<template
-            v-if="ndim > 1"> (1D)</template><template
-            v-else-if="f32"> (f64)</template></span>
+            v-if="f32"> (f64)</template></span>
         </label>
         <label class="flex items-center gap-1 cursor-pointer select-none"
                title="axis grid lines at nice value intervals — on all plots, the W panels and the IC preview">

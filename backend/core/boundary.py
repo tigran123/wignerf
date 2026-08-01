@@ -88,6 +88,33 @@ def edge_band(n):
 EDGE_THRESHOLD = 1e-6   # band mass (both sides) that trips an axis (float64)
 SUPPORT_EPS = 1e-8      # per-side tail mass excluded from the support box
 
+# SUPPORT_EPS IS NOT NOISE-GATED, AND THAT WAS MEASURED RATHER THAN ASSUMED.
+# The obvious worry when M3 (auto-expand in 2D) landed: MSG_EXPAND_F32 refuses
+# float32 precisely because noise above 1e-8 makes support_cells "report the
+# WHOLE axis", and the docstring above records a float64 band-mass noise floor
+# of 5.35e-05 at 2D N=32 — 5000x SUPPORT_EPS. So the same failure looked like it
+# should reach float64 on a coarse 4D grid. Measured 2026-08-01 on a 3090, it
+# does not, for three reasons worth keeping:
+#
+# 1. session._schedule_regrid scans an axis ONLY if that axis has TRIPPED. The
+#    contained mid-box marginal whose noise is 5e-05 is never handed to
+#    support_cells at all.
+# 2. At the moment an axis DOES trip, a support of (0, N) is CORRECT, not noise.
+#    An axis trips when ~1e-6 of the mass is in the outer band; the domain is a
+#    torus, so ~1e-7 of it has genuinely re-entered at the opposite edge, which
+#    is 10x SUPPORT_EPS. Measured with noise identically 0.00e+00 in 1D at
+#    N=64 and N=256, where this is the shipping behaviour that
+#    test_e2e_free_particle_expands already pins.
+# 3. At 32^4 the noise (9.0e-06) and the real wrapped mass (a 7.6e-05 band) are
+#    the same order, so a gate cannot separate them — it would discard real
+#    wrapped mass along with the ringing.
+#
+# Across every measured case (1D N=64/256, 2D N=32/48/64, mid-box, drifting and
+# edge-placed) a noise gate changed no plan KIND — only the centring of one 32^4
+# window, by 4 cells, in a direction that cannot be shown to be more correct.
+# Hence: not implemented. If this is revisited, measure at the TRIGGER point;
+# measuring a contained state reproduces a scenario the planner never reaches.
+
 # How far above the marginal's own measured noise a band mass must sit before it
 # counts as edge mass, and how many consecutive records must agree (the latter
 # enforced by session.report_edge). Both come from the sweep in the docstring
