@@ -19,11 +19,11 @@ because N^4 outruns any per-axis cap. On a CUDA device the peak pool usage is
 measured, not estimated.
 
 `--footprint` measures config.BYTES_PER_CELL_2D instead of throughput, and it
-exists because the throughput loop CANNOT: that loop holds one exponent pair and
-calls solve_spectral, so it never allocates adjust_step's W1/W2 and second
-exponent pair (+80 B/cell), the _exp_odd slot (+32) or frame.build's reductions
-— i.e. it measures roughly half of what a real worker holds. This mode runs one
-whole worker record instead, in worker._advance/_emit's own order, and prints
+exists because the throughput loop CANNOT: that loop calls solve_spectral and
+nothing else, so it never allocates adjust_step's W1/W2 and second exponent pair
+(+80 B/cell) or frame.build's reductions — i.e. it measures well under what a
+real worker holds. This mode runs one whole worker record instead, in
+worker._advance/_emit's own order, and prints
 B/cell so the number in config.py can be reproduced rather than trusted.
 `--relativistic` covers the quantum relativistic construction (the mc^2
 cancellation inside qd(T, ...)), which the throughput path never builds either.
@@ -39,7 +39,7 @@ served out of the pool without the card seeing it at all.
 
 import argparse
 import sys
-from math import prod
+from math import ceil, prod
 from pathlib import Path
 from time import perf_counter
 
@@ -86,7 +86,7 @@ def bench(device, N, ndim=1, precision="float64", nsteps=200,
         g = _grid(b, ndim, N)
         prop = Propagator(g, quantum=True, U=U, gradU=gradU,
                           relativistic=relativistic)
-        W = g.shift(mixture_wigner(g, [comp]))
+        W = g.shift(mixture_wigner(g, [comp])).astype(b.real_dtype, copy=False)
         expU, expT = prop.exponents(0.01)
         for _ in range(10):                      # warm up plans/pool
             W = prop.solve_spectral(W, expU, expT)
@@ -108,12 +108,11 @@ def footprint(device, N, ndim=1, precision="float64", relativistic=False):
     Returns (backend name, peak bytes or None, bytes per cell or None).
 
     The order below is worker._advance followed by worker._emit, and it is the
-    order that matters rather than the individual calls: the pool high-water is
-    reached with the two exponent slots and W already resident, so a harness
-    that measured adjust_step on its own would under-report exactly the overlap
-    this is for. Both slots are held to the end for the same reason — a worker
-    holds them across the whole record, and dropping either here would return
-    32 B/cell to the pool before the frame build asks for its reductions.
+    order that matters rather than the individual calls: a pending boundary
+    probe overlaps its temporary pairs with the cached slot from the preceding
+    record, then drops both before the new record's one production pair is
+    built. A harness that only measures either phase would under-report the
+    arena a worker actually needs.
     """
     b = _backend(device, precision)
     with b.device():
@@ -123,41 +122,41 @@ def footprint(device, N, ndim=1, precision="float64", relativistic=False):
         g = _grid(b, ndim, N)
         prop = Propagator(g, quantum=True, U=U, gradU=gradU,
                           relativistic=relativistic)
-        W = g.shift(mixture_wigner(g, [comp]))
-
-        # both exponent slots, as worker._exponents fills them: the full step
-        # and the shorter one clamped onto tau_k
-        dt = 0.01
-        exp_main = prop.exponents(dt)
-        exp_odd = prop.exponents(0.7*dt)
-        for _ in range(10):                    # warm plans + the cuFFT work area
-            W = prop.solve_spectral(W, *exp_main)
-        W = prop.solve_spectral(W, *exp_odd)
-        # every 20 steps, and the largest transient in the record
-        W, _, eU, eT = prop.adjust_step(dt, W)
-        # ...and the record itself: six plane reductions plus the int W^2 pass
-        frame.build(W, g, prop.hbar_eff, prop=prop, dt=dt)
+        # Pass the IC inline: a caller-local W would pin that old state for
+        # the entire helper call and overstate the worker arena by one state.
+        W, slots = _record(
+            prop, g,
+            g.shift(mixture_wigner(g, [comp])).astype(b.real_dtype, copy=False))
         b.synchronize()
         peak = (b.xp.get_default_memory_pool().total_bytes()
                 if b.is_gpu else None)
-        # keep the slots alive to here: see the docstring
-        del exp_main, exp_odd, eU, eT
+        # keep the current production slot alive to here: see the docstring
+        del slots
     per = None if peak is None else peak/float(prod(g.N))
     return b.name, peak, per
 
 
-def _record(prop, g, W, dt=0.01):
+def _record(prop, g, W, dt=0.01, record_dt=0.05):
     """One whole worker record, in worker._advance/_emit's order — the same
     sequence footprint() measures, factored out so the regrid mode can hold a
-    worker's real steady state on both sides of the switch."""
-    exp_main = prop.exponents(dt)
-    exp_odd = prop.exponents(0.7*dt)
-    for _ in range(10):                    # warm plans + the cuFFT work area
-        W = prop.solve_spectral(W, *exp_main)
-    W = prop.solve_spectral(W, *exp_odd)
-    W, _, eU, eT = prop.adjust_step(dt, W)
+    worker's real steady state on both sides of the switch.
+
+    Model a periodic adjustment at a boundary: the old production slot remains
+    live while adjust_step probes a larger dt, but its returned state and pairs
+    are dropped. The whole new record is then advanced at one quotient of the
+    selected cap, retaining only that production slot."""
+    old_exp = prop.exponents(dt)
+    for _ in range(11):                    # warm plans + the cuFFT work area
+        W = prop.solve_spectral(W, *old_exp)
+    trial, dt, eU, eT = prop.adjust_step(dt/0.7, W)
+    del trial, eU, eT, old_exp
+    n = ceil(record_dt/abs(dt))
+    dts = (record_dt/n) if dt > 0 else -(record_dt/n)
+    exp = prop.exponents(dts)
+    for _ in range(n):
+        W = prop.solve_spectral(W, *exp)
     frame.build(W, g, prop.hbar_eff, prop=prop, dt=dt)
-    return W, (exp_main, exp_odd, eU, eT)   # slots stay alive: see footprint()
+    return W, (exp,)                       # the slot stays alive: footprint()
 
 
 def regrid(device, N, ndim=2, precision="float64", axis=0,
@@ -212,9 +211,11 @@ def regrid(device, N, ndim=2, precision="float64", axis=0,
         # — whether it is passed inline or bound to a local, the name is rebound
         # by the first step either way. Which is what makes the two harnesses
         # comparable, and they are: this mode prints B/cell for exactly that
-        # check, and both report 208.0 / 112.0 at 32^4 and 64^4 on the 3090,
+        # check, and both report 176.0 / 96.0 at 32^4 and 64^4 on the 3090,
         # i.e. config.BYTES_PER_CELL_2D.
-        W, slots = _record(prop, g, g.shift(mixture_wigner(g, [comp])))
+        W, slots = _record(
+            prop, g,
+            g.shift(mixture_wigner(g, [comp])).astype(b.real_dtype, copy=False))
         b.synchronize()
         old_arena = pool.total_bytes()
         free_before = device_free_bytes(device)
@@ -247,7 +248,9 @@ def regrid(device, N, ndim=2, precision="float64", axis=0,
         g3 = new.make_grid(b)
         prop3 = Propagator(g3, quantum=True, U=U, gradU=gradU,
                            relativistic=relativistic)
-        W3, slots3 = _record(prop3, g3, g3.shift(mixture_wigner(g3, [comp])))
+        W3, slots3 = _record(
+            prop3, g3,
+            g3.shift(mixture_wigner(g3, [comp])).astype(b.real_dtype, copy=False))
         b.synchronize()
         new_arena = pool.total_bytes()
         del W3, slots3, prop3, g3

@@ -323,8 +323,8 @@ def test_the_device_fit_check_is_the_operative_2d_guard(monkeypatch):
     driver how much is free on the devices this session's workers land on.
 
     A fixed cell count cannot do that job — it is wrong in both directions. It
-    refused 128x128x64x64 (67M cells, 13.0 GiB for ONE worker) on a 24 GiB card,
-    and it would wave through two 6.5 GiB workers onto an 11 GiB one. This test
+    refused 128x128x64x64 (67M cells, 11.0 GiB for ONE worker) on a 24 GiB card,
+    and it would wave through two 5.5 GiB workers onto an 11 GiB one. This test
     stubs the free-memory probe so it runs anywhere, GPU or not.
     """
     import routers.sessions as rs
@@ -338,8 +338,8 @@ def test_the_device_fit_check_is_the_operative_2d_guard(monkeypatch):
                                {"lo": -7.0, "hi": 7.0, "N": 16},
                                {"lo": -7.0, "hi": 7.0, "N": 16}]}
     # float64 explicitly: these sessions omit `precision`, so they take the
-    # host default, and the fit check scales with it since M1 (112 B/cell in
-    # float32 against 208). A bare constant here would silently stop matching
+    # host default, and the fit check scales with it since M1 (96 B/cell in
+    # float32 against 176). A bare constant here would silently stop matching
     # the server on a float32 host.
     per = 32*32*16*16*config.bytes_per_cell(2, "float64")
     with TestClient(app) as client:
@@ -399,8 +399,8 @@ def test_the_fit_refusal_describes_the_POOL_not_the_first_device(monkeypatch):
                                {"lo": -7.0, "hi": 7.0, "N": 16},
                                {"lo": -7.0, "hi": 7.0, "N": 16}]}
     # float64 explicitly: these sessions omit `precision`, so they take the
-    # host default, and the fit check scales with it since M1 (112 B/cell in
-    # float32 against 208). A bare constant here would silently stop matching
+    # host default, and the fit check scales with it since M1 (96 B/cell in
+    # float32 against 176). A bare constant here would silently stop matching
     # the server on a float32 host.
     per = 32*32*16*16*config.bytes_per_cell(2, "float64")
     with TestClient(app) as client:
@@ -583,9 +583,9 @@ def test_the_device_endpoint_carries_the_per_ndim_ceilings(monkeypatch):
         # per PRECISION since M1, for the same reason the two above are per
         # ndim: precision is restart-only too, so the form must be able to
         # estimate for the one it is SHOWING. float32 is the smaller figure and
-        # the panel would over-report by 1.9x without it.
-        assert d["bytes_per_cell_2d"]["float64"] == 208
-        assert d["bytes_per_cell_2d"]["float32"] == 112
+        # the panel would over-report by 1.8x without it.
+        assert d["bytes_per_cell_2d"]["float64"] == 176
+        assert d["bytes_per_cell_2d"]["float32"] == 96
         assert d["bytes_per_cell_2d"] == config.BYTES_PER_CELL_2D
         # ...and the probe's cache does not freeze them
         monkeypatch.setattr(config, "MAX_GRID_2D", 64)

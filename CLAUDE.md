@@ -39,10 +39,11 @@ labels only (`frontend/src/lib/units.ts`).
   the 150k-char limit at which Claude Code stops loading it (2026-08-02). It is
   not auto-loaded, so what remains here is what changes the code you would write
   today, and each pointer names when to go and read the rest. Currently
-  `notes/2d-milestones.md`: the M1–M4 retrospectives with every measurement
-  behind the auto-expand memory guard, the float32 and relativistic 2D
-  verification, and the export figure's typesetting. **Anything moved there
-  stays a pointer here — never a silent deletion.**
+  `notes/2d-milestones.md`: the M1–M4 and M7 retrospectives with every
+  measurement behind the auto-expand memory guard, the float32 and relativistic
+  2D verification, the export figure's typesetting, and the before/after
+  footprint and REGRID_PEAK figures for the one-exponent-slot change.
+  **Anything moved there stays a pointer here — never a silent deletion.**
 
 Dependency workflow (same as urantia-library): edit `requirements*.in`,
 then `uv pip compile requirements[-x].in -o requirements[-x].txt` and
@@ -85,7 +86,7 @@ source) is what keeps startup fast. See `README.md`.
   that enforces nothing is a place for a future gate to be added silently,
   which is the opposite of the marker/tooltip/amber pattern. What survives is
   `applyPrecisionInvariants`, because float32 still refuses auto-expand and
-  `tol < 1e-5` — at EITHER dimensionality. The remaining M5/M6/M7 rows are
+  `tol < 1e-5` — at EITHER dimensionality. The remaining M5/M6 rows are
   enhancements, not gates: nothing refuses them, they simply do not exist yet.
 - **2D streams PLANE REDUCTIONS, never the state.** W(x,y,px,py) can be neither
   drawn nor sent, so each worker reduces it on the device to the six pairwise
@@ -733,12 +734,12 @@ the ROOMIEST device decides which of two stories it tells** — it used to name
 whichever assigned device sorted first and always close with "pick a device with
 more room", which on the real pair said *"cuda:0 has 8.9 GiB free … pick a device
 with more room"* for a 128×128×128×64 grid: the small card named, a roomier one
-implied, and the 3090's 23.6 GiB unable to hold one 26.0 GiB worker either. The
-honest reading of that is "so what, I have cuda:1", and it is wrong. So: if the
-per-worker footprint exceeds EVERY device's budget it says *no device in the pool
-can hold even one*, names the roomiest with its free/installed figures, and
-states that dropping a variant or changing device will not help — because
-neither will, and only the grid is left. Otherwise a worker does fit somewhere,
+implied, and the 3090's 23.6 GiB unable to hold one 22.0 GiB worker either (its
+budget is 20.97). The honest reading of that is "so what, I have cuda:1", and it
+is wrong. So: if the per-worker footprint exceeds EVERY device's budget it says
+*no device in the pool can hold even one*, names the roomiest with its
+free/installed figures, and states that dropping a variant or changing device
+will not help — because neither will, and only the grid is left. Otherwise a worker does fit somewhere,
 which makes it a DISTRIBUTION problem: it names the over-subscribed device and
 points at the one with room, with a count ("set device to cuda:1, which has room
 for 2 of them"). Pinned by
@@ -824,15 +825,15 @@ pins the frame past the release.
 |---|---|---|
 | `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and an enforced POLICY**: `SessionCreate.device` (Setup → Compute, restart-only) may narrow it per session but never widen it — a spec outside `xp.devices_allowed(WIGNERF_DEVICE)` (the pool **plus cpu**) is a 422 naming the pool, as is a malformed or absent one. It used to check only that the spec parsed and the card existed, so a host pinned to `cuda:1` (or to `cpu`, to keep its cards free) could be overridden by any client. `GET /api/device` returns BOTH `devices` (the pool) and `choices` — and `choices` IS `devices_allowed`, the same list the validator uses, so the Setup select can never offer a device the API refuses. That endpoint is where every HOST fact the form needs before it can create anything lives: the device lists, `WIGNERF_PRECISION`, and the per-ndim grid ceilings (`max_grid`, `max_cells`, `bytes_per_cell_2d` — see the `WIGNERF_MAX_GRID_2D` row for why those cannot come off `status`). Those three sit OUTSIDE `_probe_backend`'s `lru_cache`, so they follow a monkeypatched `config` and ride the probe's error path too. CPU is always a legal target but never appears in an `auto` pool on a CUDA host, which is why it is appended. `resolve_devices` returns CANONICAL specs (a bare `cuda` → `cuda:0`), without which that membership test would reject a device the host does offer. |
 | `WIGNERF_PORT` | `8010` | Backend port (8000 belongs to urantia-library). Used by start.sh; `uvicorn --port` otherwise. |
-| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster in 1D but only **1.5-2.6× in 2D**, and ~54-58% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`, which is `Optional` and **resolved in `_check`, not by a `default_factory`** — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing, and a factory once collided with the (now retired) M1 gate by refusing 2D sessions over a value the client never sent: a gate must refuse what was ASKED FOR. An omitted precision now resolves to the host default at **every** ndim, so a float32 host gives a 2D session float32, which is where the memory saving actually matters. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the precision control — or an IMPORT supplies one — the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. Two exceptions, both deliberate. An **imported** setup document or mp4 marks the precision CHOSEN (`importConfig` → `markPrecisionChosen`): it is the run someone exported, and reproducing it is what the document is for — without it the import silently ran at the host default and left the form showing a float32 that never happened, behind a "restart to apply" no restart could clear (`status.precision` never CHANGES, so the sync watcher never fires). And a form with **auto-expand on** sends `float64` explicitly rather than deferring, because auto-expand is float64-only, so asking for it IS asking for float64 — deferring on a float32 host asks for a pair the schema refuses and 422s every create. (Belt and braces with the backend resolution above: the backend keeps a non-SPA client working, the SPA keeps the payload saying what the form shows, and the exported setup document then records the precision the run actually had.) |
+| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster in 1D but only **1.5-2.6× in 2D**, and ~54-55% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`, which is `Optional` and **resolved in `_check`, not by a `default_factory`** — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing, and a factory once collided with the (now retired) M1 gate by refusing 2D sessions over a value the client never sent: a gate must refuse what was ASKED FOR. An omitted precision now resolves to the host default at **every** ndim, so a float32 host gives a 2D session float32, which is where the memory saving actually matters. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the precision control — or an IMPORT supplies one — the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. Two exceptions, both deliberate. An **imported** setup document or mp4 marks the precision CHOSEN (`importConfig` → `markPrecisionChosen`): it is the run someone exported, and reproducing it is what the document is for — without it the import silently ran at the host default and left the form showing a float32 that never happened, behind a "restart to apply" no restart could clear (`status.precision` never CHANGES, so the sync watcher never fires). And a form with **auto-expand on** sends `float64` explicitly rather than deferring, because auto-expand is float64-only, so asking for it IS asking for float64 — deferring on a float32 host asks for a pair the schema refuses and 422s every create. (Belt and braces with the backend resolution above: the backend keeps a non-SPA client working, the SPA keeps the payload saying what the form shows, and the exported setup document then records the precision the run actually had.) |
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` (Setup → Compute) may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long 1440p exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
 | `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` encoder if a runtime probe succeeds (dedicated encoder block, ~3× faster at 4K, frees CPU for the render pool), else `libx264 -preset veryfast`. `cpu` forces libx264, `nvenc` forces the GPU. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to our rawvideo input). The host default; `ExportSpec.encoder` (the Export panel's encoder select) overrides it per JOB, which is the right granularity — the best choice depends on what else is competing for cores at that moment. |
 | `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering a frame (matplotlib/Agg) dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` (spawn, not fork: the backend has CUDA up) while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`) uses all of these; a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
-| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, so a host at 128 still gets a usable select — and `setNdim` asks the same function, so a dims switch cannot land N over a lowered ceiling either). Measured peak per variant worker: 160 MiB at 1024², 672 MiB at 2048², 2.7 GiB at 4096², 10.0 GiB at 8192² (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~5.4 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~20 GiB/card, which fits the 3090 and does NOT fit the 2080 Ti — cap by variant count, not just by grid. In a **float32** session those peaks fall to ~58% (measured arena: 448 MiB at 2048², 1.79 GiB at 4096², 7.0 GiB at 8192²), so 4 variants at 8192² is ~12 GiB/card at 2+2 — comfortable on the 3090, still too much for the 2080 Ti. float32 moves that line; it does not remove it. At the cap the session warns and keeps computing (moves still allowed). |
-| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all (128⁴ = 268M cells is ~52 GiB per worker while every axis sits inside a 128 rail). What actually binds is the per-device fit check, `routers/sessions._fit_error` — see the GPU section. **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree for as long as a switch waits for its restart. Reading them off `status` broke the panel in both directions (measured 2026-07-27): over a live 1D session a 2D form offered N up to 4096 against this 128 ceiling AND rendered no footprint line at all (`bytes_per_cell` is null at ndim=1 — the number that says whether a 2D session can start, missing exactly before the first 2D restart), and over a live 2D session a 1D form's N select collapsed to one option (cap 128, 1D list starting at 256, loop body never entered). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted for that reason: both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling** (1D 256…`WIGNERF_MAX_GRID`, 2D 32…`WIGNERF_MAX_GRID_2D`; verified in a headless DOM at 256…8192 and 32…128 on a host whose `wignerf.env` sets 8192). **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis (the edge band would cover a quarter of the axis), so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API and through an imported config, which the select keeps listed. **`AXIS_N_FLOOR` is shared with `setNdim`, and that is the whole point of it being a constant**: a dims switch lands N *inside the target's list* — their own choice when it is offerable, else that ndim's DEFAULT (`DEFAULT_AXES`, 1024² in 1D and 64⁴ in 2D), everything clamped by the target's cap so a host at 128 is not pushed over its own ceiling. Capping from ABOVE alone was wrong in the other direction: 1D → 2D → 1D brought the 2D choice back with it, so the select rendered `64, 256, 512, …` **with a hole in it** and a 1D session ran at 64², a resolution the panel does not offer. Falling back to the FLOOR would be its quieter twin — 256² for a user who started at the 1D default and only looked at 2D. What a round trip cannot do, since the two lists do not overlap on a default host, is preserve a 2D 32 across 1D; that needs a per-dimensionality memory in the form. Pinned in `config.test.ts` (`a dims round trip leaves no value off its own list`, the round-trip-lands-on-the-default case, the lowered-cap case, and the small-choice case the `min()` still serves). |
-| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values (a dims switch that carried N over would mean 1024⁴ = 1.1e12 cells from the 1D default, which is why `setNdim` caps it at the target's own), and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3 (2026-08-01)** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 26.0 GiB per worker, far past any card here. A fixed cell count cannot do that job — it is wrong in both directions, refusing 128×128×64×64 (13.0 GiB, one worker) on a 24 GiB card while permitting 6.5 GiB × 2 workers on an 11 GiB one — so the real check asks the driver (`_fit_error`, GPU section). Measured on an RTX 3090 with `scripts/bench.py --ndim 2 --footprint`, which runs a whole worker record (both exponent slots, an `adjust_step` pass, a frame build) rather than a step loop — a step loop misses half of it, which is why that mode had to be written before M1 could set a number. **208 B/cell in float64 and 112 in float32 (54%), both flat across sizes and both identical for the relativistic variants** — float64 0.20 / 1.03 / 3.25 / 7.93 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ against float32's 0.11 / 0.55 / 1.75 / 4.27. So 4 variants at 64⁴ split 2+2 is ~6.5 GiB/card in float64 (fits both the 3090 and the 2080 Ti) and ~3.5 in float32, and **80⁴ is reachable only in float32** (8.5 GiB/card against float64's 15.9). **The STATE is only 4% of that** — W is real, so float64 = 8 B/cell, 0.12 GiB at 64⁴; the rest is the step's machinery at full shape, the two exponent slots (64 B/cell) largest among it, which is also why float32 lands at 54% rather than 50% (`dU_im`/`dT_im` stay float64). `config.BYTES_PER_CELL_2D` carries the measured stage-by-stage breakdown and is **keyed by precision** — `config.bytes_per_cell(ndim, precision)` — because `_fit_error` reads it: a flat float64 figure there would refuse precisely the grids float32 makes affordable. It is what M7 attacks next. Throughput on the same card: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run** (~0.23 s per record at 8 substeps). Both the rail's refusal and the fit check's quote the estimate, and `/api/device`'s `bytes_per_cell_2d` feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — from `/device` and not from `status`, or the line is absent on the one path that reaches 2D (see the `WIGNERF_MAX_GRID_2D` row). |
+| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, so a host at 128 still gets a usable select — and `setNdim` asks the same function, so a dims switch cannot land N over a lowered ceiling either). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`, the same instrument as the 2D row): **192 B/cell in float64 and 104 in float32** since M7 dropped the second exponent slot (was 224/120) — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², and 0.10 / 0.41 / 1.63 / 6.50 in float32 (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. **These are HIGHER than the step-loop figures this row used to quote** (160 MiB / 672 MiB / 2.7 / 10.0 GiB) and that is not a regression: a step loop misses `adjust_step`'s transient and the frame build, exactly as the 2D row warns, so the old numbers under-reported a real worker. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~6.0 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~24 GiB/card, which does **not** fit even the 3090 — cap by variant count, not just by grid. In a **float32** session those peaks fall to ~54%, so 4 variants at 8192² is ~13 GiB/card at 2+2 — comfortable on the 3090, still too much for the 2080 Ti. float32 moves that line; it does not remove it. At the cap the session warns and keeps computing (moves still allowed). |
+| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all (128⁴ = 268M cells is ~44 GiB per worker while every axis sits inside a 128 rail). What actually binds is the per-device fit check, `routers/sessions._fit_error` — see the GPU section. **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree for as long as a switch waits for its restart. Reading them off `status` broke the panel in both directions (measured 2026-07-27): over a live 1D session a 2D form offered N up to 4096 against this 128 ceiling AND rendered no footprint line at all (`bytes_per_cell` is null at ndim=1 — the number that says whether a 2D session can start, missing exactly before the first 2D restart), and over a live 2D session a 1D form's N select collapsed to one option (cap 128, 1D list starting at 256, loop body never entered). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted for that reason: both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling** (1D 256…`WIGNERF_MAX_GRID`, 2D 32…`WIGNERF_MAX_GRID_2D`; verified in a headless DOM at 256…8192 and 32…128 on a host whose `wignerf.env` sets 8192). **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis (the edge band would cover a quarter of the axis), so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API and through an imported config, which the select keeps listed. **`AXIS_N_FLOOR` is shared with `setNdim`, and that is the whole point of it being a constant**: a dims switch lands N *inside the target's list* — their own choice when it is offerable, else that ndim's DEFAULT (`DEFAULT_AXES`, 1024² in 1D and 64⁴ in 2D), everything clamped by the target's cap so a host at 128 is not pushed over its own ceiling. Capping from ABOVE alone was wrong in the other direction: 1D → 2D → 1D brought the 2D choice back with it, so the select rendered `64, 256, 512, …` **with a hole in it** and a 1D session ran at 64², a resolution the panel does not offer. Falling back to the FLOOR would be its quieter twin — 256² for a user who started at the 1D default and only looked at 2D. What a round trip cannot do, since the two lists do not overlap on a default host, is preserve a 2D 32 across 1D; that needs a per-dimensionality memory in the form. Pinned in `config.test.ts` (`a dims round trip leaves no value off its own list`, the round-trip-lands-on-the-default case, the lowered-cap case, and the small-choice case the `min()` still serves). |
+| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values (a dims switch that carried N over would mean 1024⁴ = 1.1e12 cells from the 1D default, which is why `setNdim` caps it at the target's own), and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3 (2026-08-01)** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, far past any card here. A fixed cell count cannot do that job — it is wrong in both directions, refusing 128×128×64×64 (11.0 GiB, one worker) on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one — so the real check asks the driver (`_fit_error`, GPU section). Measured on an RTX 3090 with `scripts/bench.py --ndim 2 --footprint`, which runs a whole worker record (the exponent slot, an `adjust_step` pass, a frame build) rather than a step loop — a step loop misses half of it, which is why that mode had to be written before M1 could set a number. **176 B/cell in float64 and 96 in float32 (55%), both flat across sizes and both identical for the relativistic variants** — float64 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ against float32's 0.09 / 0.47 / 1.50 / 3.66. So 4 variants at 64⁴ split 2+2 is ~5.5 GiB/card in float64 (fits both the 3090 and the 2080 Ti) and ~3.0 in float32, and **80⁴ is reachable only in float32** (7.3 GiB/card against float64's 13.4, and the 2080 Ti's 10.6 is what binds). **The STATE is only 5% of that** — W is real, so float64 = 8 B/cell, 0.12 GiB at 64⁴; the rest is the step's machinery at full shape, `adjust_step`'s transient (80 B/cell) largest among it since M7 removed the second exponent slot. float32 lands at 55% rather than 50% because `dU_im`/`dT_im` stay float64. `config.BYTES_PER_CELL_2D` carries the measured stage-by-stage breakdown and is **keyed by precision** — `config.bytes_per_cell(ndim, precision)` — because `_fit_error` reads it: a flat float64 figure there would refuse precisely the grids float32 makes affordable. M7 (2026-08-02) took it from 208/112 by dropping the second exponent slot. Throughput on the same card: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run** (~0.23 s per record at 8 substeps). Both the rail's refusal and the fit check's quote the estimate, and `/api/device`'s `bytes_per_cell_2d` feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — from `/device` and not from `status`, or the line is absent on the one path that reaches 2D (see the `WIGNERF_MAX_GRID_2D` row). |
 
 ## Commands
 
@@ -943,7 +944,8 @@ without the release and 0 with it.
    the top). **COMPLETE as of 2026-08-01**: its four deferred follow-ups
    (M1–M4) have all landed and no 2D-only gate remains — their retrospectives
    are in `notes/2d-milestones.md`, their operative findings in the gotchas
-   below. M5–M7 are enhancements rather than gates.
+   below. M5–M7 were enhancements rather than gates, and M7 landed 2026-08-02
+   (one exponent slot, −32 B/cell at both dimensionalities), leaving M5 and M6.
 
 ## 2D follow-up milestones (deferred from the first 2D cut, 2026-07-26)
 
@@ -952,9 +954,10 @@ first 2D cut only so the physics core lands verified.** **EVERY GATE IS NOW
 GONE**: M1 (float32, 2026-07-27), M2 (relativistic, -27), M4 (mp4, -28) and M3
 (auto-expand, 2026-08-01) have all landed, and nothing in the codebase refuses
 anything on the grounds of `ndim == 2`; what each cost is in its gotcha below.
-What is left (M5, M6, M7) are enhancements that simply do not exist yet at
-either dimensionality — no refusal to relax, no half-feature to mistake for a
-working one.
+**M7 landed 2026-08-02** — not a gate either, an enhancement, and the first of
+these to be finished at BOTH dimensionalities at once. What is left (M5, M6) are
+enhancements that simply do not exist yet at either dimensionality — no refusal
+to relax, no half-feature to mistake for a working one.
 
 Three lessons from retiring those four, kept because the next milestone will
 need them (the full retrospectives are in `notes/2d-milestones.md`):
@@ -962,7 +965,8 @@ need them (the full retrospectives are in `notes/2d-milestones.md`):
 physics core was already generic every time, and M1's measurement contradicted
 its prediction in both directions at once; **look for the accounting the gate
 was hiding**, since each milestone's real work turned out to be a constant
-nobody had listed (`BYTES_PER_CELL_2D`, `RangeStats.scale`, `session.max_cells`)
+nobody had listed (`BYTES_PER_CELL_2D`, `RangeStats.scale`, `session.max_cells`,
+and M7's `fit.REGRID_PEAK`, which got RELATIVELY worse as the worker got smaller)
 — but expect false positives there too, and settle them by measuring at the
 point the code actually runs, not by reasoning from two documented measurements;
 and **a gate can carry a stale REASON**, so re-measure the claim it rests on and
@@ -972,7 +976,7 @@ not only the risk it names.
 |---|---|---|---|
 | M5 | **Cuts / slices** | the wire reserves a per-plane `mode` byte; only `mode=0` (projection) is defined | Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime. A cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
 | M6 | **FFT fusion** | — | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, which changes numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass in both 1D and 2D. |
-| M7 | **One exponent slot instead of two** | — | `worker._exponents` pins the full step and keeps a second slot for the substep clamped onto τ_k: 4 complex meshes = 64 B/cell, the largest single item in the 4D working set. Choosing `dt' = rem/ceil(rem/dt)` makes every substep within a record identical, so the straggler and its slot both disappear: −32 B/cell, −22% of the 4D footprint, and 1D benefits too. Changes 1D numerics (uniform substeps instead of n equal plus one short), hence not bundled with the 2D work. |
+| ~~M7~~ | ~~**One exponent slot instead of two**~~ | — | **DONE 2026-08-02.** `worker._advance` divides each record into `ceil(rem/dt)` EQUAL substeps instead of walking at `dt` and clamping a straggler, so the second exponent slot that straggler needed is gone. Measured **208 → 176 B/cell in 2D and 224 → 192 in 1D** (float32 112 → 96 and 120 → 104), i.e. −32 B/cell everywhere and −15.4%, NOT the −22% this row used to claim — see the one-exponent-slot gotcha below for why that figure was stale and what else had to move. |
 
 ## Conventions / gotchas
 
@@ -1137,8 +1141,11 @@ not only the risk it names.
   `worker._apply_regrid` or `Propagator.set_grid`**, which has the measurements:
   the per-device inequality is `n·per_new·REGRID_PEAK ≤ (F + n·per_old)·
   FIT_MARGIN`, and **the `+ n·per_old` term is load-bearing, not a refinement**
-  (it is what correctly allows a single-worker 64⁴ doubling on the 2080 Ti,
-  6.50 GiB against 7.15 free, which `F` alone refuses);
+  (it is what correctly allows a single-worker 64⁴ doubling on the 2080 Ti —
+  5.50 GiB of new footprint against ~6.4 free on a card that is ALREADY holding
+  the 2.75 GiB worker wanting to grow, which `F` alone refuses: 6.05 needed
+  against 5.81, and 8.28 once its own worker is counted. The figures moved with
+  M7 and the shape did not; recompute them, do not carry them);
   **it is asked of a DOUBLING and of nothing else** — for a pure window shift
   `per_new == per_old` and the same expression demands `0.222·n·per_old` free to
   slide a window that allocates nothing, so `fit.regrid_shortfall` returns `[]`
@@ -1188,9 +1195,10 @@ not only the risk it names.
   dimension-aware line in it and holds BITWISE at 4 axes, which had to be checked
   because the multi-D Bopp shift moves every spatial argument of U together;
   pinned by `test_exponent_construction_stays_double`, parametrized over ndim.
-  **MEMORY: 112 B/cell against float64's 208** — 54%, flat across 32⁴–80⁴,
+  **MEMORY: 96 B/cell against float64's 176** — 55%, flat across 32⁴–80⁴,
   identical for the relativistic variants, and better than the ~58% predicted
-  from 1D. 3.25 → 1.75 GiB/worker at 64⁴, and 80⁴ becomes reachable at all.
+  from 1D. 2.75 → 1.50 GiB/worker at 64⁴, and 80⁴ becomes reachable at all.
+  (Those are post-M7 figures; M1 measured 3.25 → 1.75 at 208/112 B/cell.)
   **SPEED: 1.48× at 64⁴, not the ~3.4× predicted** (2.63× at 32⁴, 2.09 at 48⁴,
   1.64 at 80⁴) — and not the machine, since the 1D control on the same card in
   the same session gave 3.29× at the SAME 16.8M cell count. The 2D step
@@ -1283,12 +1291,13 @@ not only the risk it names.
     and cupy (correct answer, via a full complex128 temporary). No physics
     assertion can catch either. Hence `fft_pair` takes an explicit dtype and
     `exponents()` casts.
-  - **Memory drops to ~58%, not 50%** — `dU_im`/`dT_im`/`H` stay float64 and are
-    irreducible (24 B/cell = 1.5 GiB at 8192²). Measured per-worker CuPy arena
-    on the 3090: 768 → 448 MiB at 2048², 3072 → 1792 MiB at 4096², 12.0 → 7.0
-    GiB at 8192². Note the frame history is NOT affected: it is already uint16
-    via `core/quantize.py`, so `WIGNERF_HISTORY_MB` buys the same record count
-    either way.
+  - **Memory drops to ~54%, not 50%** — `dU_im`/`dT_im` stay float64 and are
+    irreducible. Measured per-worker arena on the 3090 with `bench.py
+    --footprint` (float64 → float32, post-M7): 768 → 420 MiB at 2048²,
+    3.00 → 1.63 GiB at 4096², 12.0 → 6.5 GiB at 8192², i.e. **192 vs 104
+    B/cell** — 224 vs 120 before M7 dropped the second exponent slot. Note the
+    frame history is NOT affected: it is already uint16 via `core/quantize.py`,
+    so `WIGNERF_HISTORY_MB` buys the same record count either way.
   - **float32 REFUSES auto-expand, and `tol` below 1e-5** (`protocol.py`
     `MSG_EXPAND_F32` / `MSG_TOL_F32`, enforced at create AND on the live
     ParamChange path, because both fields are reachable live). Auto-expand,
@@ -1372,12 +1381,65 @@ not only the risk it names.
   real part exceeds 1e-13 relative to its imaginary part, rather than
   truncating it: a real part means |expU| ≠ 1, an evolution that quietly
   gains or loses norm.
-- The worker keeps **two** exponent slots, not a cache (`_exp_main` for the
-  full dt, `_exp_odd` for the substep clamped onto τ_k). The 8-entry dict
-  this replaced retained seven dead complex128 pairs — two thirds of the
-  whole working set — and measurably saved zero rebuilds, because dt is
-  re-tuned by `adjust_step` every 20 steps so the old entries were never
-  asked for again. Measured 4 workers at 1024²: 1781 → 904 MiB.
+- **ONE exponent slot, because every committed substep inside a record is the
+  same size (M7, 2026-08-02) — and the CACHED PLAN is what makes that true.**
+  `worker._advance` used to walk a record at the full `dt` and clamp the last
+  substep onto τ_k; that straggler was a different dt, so it needed a second
+  slot (`_exp_odd`) beside `_exp_main`, 4 complex meshes = 64 B/cell, the
+  largest single item in the 4D working set. `_substep` now divides what is
+  left of the record into `n = ceil(|rem|/|dt|)` EQUAL steps of `rem/n`. `ceil`
+  rounds UP after a one-ulp quotient correction, so the step never materially
+  exceeds `dt` and the schedule is never less accurate than the one it replaced.
+  (The 8-entry dict THAT replaced kept seven dead pairs alive — 1781 → 904 MiB
+  at 4 workers, 1024² — because dt is re-tuned every 20 steps so old entries
+  were never asked for again.)
+  **Adaptive retuning is a NON-COMMITTING boundary probe.** `adjust_step`
+  selects the cap before a record, but its trial state is dropped; the whole
+  record then runs on `_substep`'s quotient. A cadence reached mid-record is
+  latched and probed at the next target, rather than splitting the record into
+  two production sizes.
+  **`_substep` caches its plan against `t_tgt`, and that is not an
+  optimization — without it the milestone backfires.** `rem` shrinks as the
+  record is walked, so recomputing `rem/n` at every substep returns sizes that
+  differ in the last ulps: nominally identical, but DISTINCT float keys, so the
+  one slot misses on nearly every step. Measured without the cache: **5 distinct
+  sizes across 12 substeps and 22 rebuilds over three records**, against the
+  two-slot scheme's one cached production pair per record. A stale plan is as
+  wrong as a stale exponent, so `_exp_clear` drops both together — every site
+  that invalidates one must invalidate the other.
+  **And because the size is cached, `_advance` iterates on the substep COUNT and
+  must never go back to summing toward τ_k.** The pre-M7 loop could exit on
+  `|τ_k − t| > eps` because its last step was clamped to `min(|dt|, |rem|)` and
+  therefore self-correcting; a cached size has no such step. Once n accumulations
+  of `rem/n` land further than `eps = 1e-12·max(1, |τ_k|)` from the target — n
+  ~ 25000 at t ~ 5, which two maximal `adjust_step` contractions reach — the loop
+  takes ANOTHER full substep, marches PAST τ_k and never returns, since dts keeps
+  its sign. Measured on the residual loop at dt = record_dt/50000 from t = 5:
+  **11.5 million substeps for a record wanting 50000**, still going when a
+  watchdog stopped it — an unkillable spin with no error and no emitted record,
+  where the old scheme was merely slow. Pinned by
+  `test_a_record_that_needs_many_substeps_still_terminates`.
+  **The production rebuild COUNT is at most one per record**, because
+  τ_k − τ_(k−1) normally changes the quotient's float key. The controller's
+  temporary probe pairs are separate and dropped before that production pair is
+  built. So M7 buys MEMORY, not speed; do not let the halved slot count imply a
+  halved rebuild rate. Measured 208 → 176 B/cell in 2D and 224 → 192 in 1D
+  (float32 112 → 96, 120 → 104) — a flat −32 B/cell at both dimensionalities,
+  −15.4% and −14.3%. The row that promised −22% predated M1's measurement of the
+  208 it was a fraction OF.
+  **`adjust_step`'s returned state and pair are DROPPED, not stored.** It
+  selects the cap from a trial state; no trial becomes a production substep, so
+  the cached pair always belongs to `_substep`'s quotient. Storing the pair, as
+  the old code did for free, would be the second slot resurrected once per
+  adjust.
+  **What the physics suite cannot see**: `test_propagator*.py` and
+  `test_precision.py` drive `Propagator` directly through a private fixed-dt
+  `evolve()` helper, so they never enter `_advance` — all 72 items were bitwise
+  unchanged by M7 and would be just as unchanged by a scheduler that never
+  landed on τ_k. `tests/test_substep.py` exists for that gap: one size per
+  record, the step within one ulp of `dt`, one cached production pair per
+  record, boundary-only probes, both time directions, and O(dt²) convergence
+  (measured ratio 4.51). It caught the missing plan cache.
 - **`close()` must tear the streamer down, or the whole FrameHistory leaks.**
   The `ws_endpoint` coroutine holds `s` (hence its entire history) as a local;
   `close()` pops the session from `SESSIONS` and stops its workers but the
@@ -1629,9 +1691,11 @@ not only the risk it names.
   TOTAL, not free, deliberately: total is static, so the panel needs no polling
   and can never contradict the server, whose live-free refusal is a strict
   superset. Before this the line was plain grey at **26.00 GiB/device on a host
-  whose largest card is 24**, and `WIGNERF_MAX_CELLS_2D` did not cover it either
-  — 128×128×128×64 is 134,217,728 cells, EXACTLY 2²⁷, so the `>` rail is not
-  tripped. At the cap and far past the hardware, and reading as fine.
+  whose largest card is 24** — the same grid reads 22.00 since M7, still far past
+  the 10.6 GiB card that actually binds — and `WIGNERF_MAX_CELLS_2D` did not
+  cover it either — 128×128×128×64 is 134,217,728 cells, EXACTLY 2²⁷, so the
+  `>` rail is not tripped. At the cap and far past the hardware, and reading as
+  fine.
 - **A marginal's NEGATIVE part measures the noise floor its edge-band mass is
   read against, and on a coarse grid that floor is ABOVE the trigger.** ρ(x) is
   a probability density, so any negative value in it is pure numerical error —

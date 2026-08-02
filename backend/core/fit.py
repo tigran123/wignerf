@@ -22,8 +22,15 @@ allocates the new full-shape meshes. Measured on an RTX 3090 with
 across 32^4 / 48^4 / 64^4:
 
     before release-before-allocate      1.269   (0.46 of the old came back)
-    after                               1.038   (0.92) float64
-                                        1.071   (0.86) float32
+    after                               1.045   (0.91) float64
+                                        1.083   (0.83) float32
+
+Re-measured after M7 (2026-08-02), which took the steady state from 208 to 176
+B/cell by dropping the second exponent slot. Note the transient got RELATIVELY
+worse, not better — 1.038 -> 1.045 and 1.071 -> 1.083, recovery 0.92 -> 0.91 and
+0.86 -> 0.83 — because there is now half as much exponent mesh to hand back
+before the new grid is built. A smaller worker is not automatically a cheaper
+regrid, and 1.10 still covers it, with the float32 margin down from 2.7% to 1.6%.
 
 REGRID_PEAK is the rounded ceiling of the second row. The improvement is what
 makes the `+ what we already hold` term below legitimate rather than hopeful:
@@ -52,7 +59,7 @@ all three are accepted deliberately rather than modelled:
    report_edge) with a wider blast radius and no all-clear to reset it.
 3. The un-guarded transients elsewhere in a worker's life, which are LARGER than
    the one this module budgets: `set_physics` -> `rebuild()` runs qd()'s ~80
-   B/cell Bopp construction with both exponent slots still resident (~168 B/cell
+   B/cell Bopp construction with the exponent slot still resident (~136 B/cell
    in float64 at ndim=2), on any live parameter change, at any instant, at either
    dimensionality — and a 1D doubling is unguarded outright (per_worker returns
    None), including 4096^2, the same cell count as 64^4.
@@ -83,9 +90,11 @@ CONTEXT_BYTES = 300*1024**2
 # IC preview a session has no CPU fallback to drop to.
 FIT_MARGIN = 0.9
 # Transient headroom a regrid needs over the new footprint. See the module
-# docstring: measured 1.038 (float64) and 1.071 (float32); one rounded constant
-# rather than a precision-keyed pair, because 3-6% sits far inside FIT_MARGIN
-# and a second table to keep in step with a measurement is not worth that.
+# docstring: measured 1.045 (float64) and 1.083 (float32) post-M7; one rounded
+# constant rather than a precision-keyed pair, because 5-8% sits inside
+# FIT_MARGIN and a second table to keep in step with a measurement is not worth
+# that. Re-measure with `bench.py --ndim 2 --regrid --precision both` after any
+# change to what a worker HOLDS, not just to what it allocates in the switch.
 REGRID_PEAK = 1.10
 
 
@@ -153,7 +162,7 @@ def regrid_shortfall(cells_old, cells_new, ndim, precision, counts,
     # is not an optimization — the inequality below is simply wrong there. With
     # per_new == per_old it reduces to F >= (REGRID_PEAK/FIT_MARGIN - 1)*n*per_old
     # = 0.222*n*per_old, i.e. it refuses a whole-cell window SHIFT on a card that
-    # is merely holding the session the shift belongs to (1.44 GiB free needed at
+    # is merely holding the session the shift belongs to (1.22 GiB free needed at
     # 64^4 float64 with 2 workers on it). The `+ n*per_old` term is wrong for a
     # move too: Propagator.set_grid takes its `else` branch on an unchanged shape
     # and releases nothing.
@@ -163,10 +172,11 @@ def regrid_shortfall(cells_old, cells_new, ndim, precision, counts,
     # peak/steady 1.000 and driver +0 MiB in FLOAT64, which is the only precision
     # a move happens in (auto-expand is float64-only, MSG_EXPAND_F32). Its peak
     # stage is rebuild()'s ~80 B/cell Bopp construction, and every block that
-    # needs is a size class the 208 B/cell arena is already holding from
-    # adjust_step. So there is nothing here to guard, and a guard would be
-    # incoherent besides: the same rebuild runs ~168 B/cell on any live parameter
-    # change (set_physics, both exponent slots still resident), unguarded, at
+    # needs is a size class the 176 B/cell arena is already holding from
+    # adjust_step (re-verified post-M7 at 32^4/48^4/64^4: still 1.000 and +0).
+    # So there is nothing here to guard, and a guard would be
+    # incoherent besides: the same rebuild runs ~136 B/cell on any live parameter
+    # change (set_physics, the exponent slot still resident), unguarded, at
     # either dimensionality. Refusing a move would only trade a REPORTED OOM for
     # mass wrapping through the seam — the failure auto-expand exists to prevent.
     # Returning early also keeps the driver query off the path entirely, which is

@@ -189,16 +189,18 @@ def test_the_regrid_guard_asks_the_driver_not_a_cell_count(monkeypatch):
 
 
 def test_the_guard_is_precision_aware_and_inert_at_1d(monkeypatch):
-    """float32 halves the footprint (112 B/cell against 208), so it must widen
-    what a doubling can reach — that is most of what M1 bought in 2D. And at
-    ndim=1 there is no estimate at all (config.bytes_per_cell returns None), so
-    the guard must decline to have an opinion rather than invent one."""
+    """float32 cuts the footprint to 55% (96 B/cell against 176), so it must
+    widen what a doubling can reach — that is most of what M1 bought in 2D. And
+    at ndim=1 there is no estimate at all (config.bytes_per_cell returns None),
+    so the guard must decline to have an opinion rather than invent one."""
     # Free memory chosen INSIDE the window where the two answers differ, in
-    # units of one float64 worker (32^4 x 208 B), for 2 workers on one device:
+    # units of one float64 worker (32^4 x 176 B), for 2 workers on one device:
     #   float64 is refused below F = 2.889   (4.40 needed against 0.9F + 1.80)
-    #   float32 fits from     F = 1.556      (2.37 needed against 0.9F + 0.97)
-    # so anything in (1.56, 2.89) separates them; 2.2 sits clear of both ends.
-    free = {"cuda:9": int(2.2*32**4*208)}
+    #   float32 fits from     F = 1.576      (2.40 needed against 0.9F + 0.98)
+    # so anything in (1.58, 2.89) separates them; 2.2 sits clear of both ends.
+    # The float64 threshold is precision-INDEPENDENT in its own units; what M7
+    # moved is the float32 one, since 96/176 is a shade above 112/208.
+    free = {"cuda:9": int(2.2*32**4*176)}
     monkeypatch.setattr(fit.xp, "device_free_bytes", lambda d: free.get(d))
     args = (32**4, 2*32**4)
     assert fit.regrid_shortfall(*args, 2, "float64", _counts(2)) != []
@@ -256,7 +258,7 @@ def test_a_move_rebuilds_without_releasing_its_plans_or_the_pool(monkeypatch):
     is observable.
 
     A DOUBLING releases before it allocates: M3 measured the switch at 1.269x the
-    new footprint with the old arrays merely dropped at the end, and 1.038 with
+    new footprint with the old arrays merely dropped at the end, and 1.045 with
     them dropped first, which is what lets the guard count them as available. A
     MOVE deliberately does neither, and that is measured too rather than reasoned
     — `scripts/bench.py --ndim 2 --regrid move` reports peak/steady 1.000 and +0
@@ -302,7 +304,7 @@ def test_a_move_rebuilds_without_releasing_its_plans_or_the_pool(monkeypatch):
 def test_the_transient_peak_is_budgeted_for():
     """A doubling is not simply the new footprint: the switch holds the old
     state while it builds the new one. Measured on a 3090 with
-    `scripts/bench.py --ndim 2 --regrid` — 1.038 (float64) / 1.071 (float32)
+    `scripts/bench.py --ndim 2 --regrid` — 1.045 (float64) / 1.083 (float32)
     after the release-before-allocate ordering, against 1.269 before it.
 
     REGRID_PEAK must stay above the measured value with margin, and must not

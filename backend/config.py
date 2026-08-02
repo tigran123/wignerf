@@ -33,20 +33,20 @@ WIGNERF_MAX_GRID     per-axis ceiling for 1D (ndim=1) sessions and for
 WIGNERF_MAX_GRID_2D  per-axis ceiling for 2D (ndim=2) sessions (default 128).
                      A rail only — see below for the operative one.
 WIGNERF_MAX_CELLS_2D total-cell RAIL for 2D sessions (default 2**27 = 134M,
-                     i.e. 26 GiB/worker — past any single card here). A rail,
+                     i.e. 22 GiB/worker — past any single card here). A rail,
                      NOT the operative guard: the real check is per-device,
                      asking the driver how much is actually free and comparing
                      it against the workers assigned to that device
                      (routers/sessions._fit_error). A fixed cell count cannot
                      do that job — it is wrong in both directions, refusing
-                     128x128x64x64 (13.0 GiB, one worker) on a 24 GiB card
-                     while permitting 6.5 GiB x 2 workers on an 11 GiB one.
+                     128x128x64x64 (11.0 GiB, one worker) on a 24 GiB card
+                     while permitting 5.5 GiB x 2 workers on an 11 GiB one.
                      This rail exists to stop absurd values (256^4 = 4.3e9
                      cells) cheaply and deterministically, and to be the only
                      guard on a host where free memory cannot be read. See
                      BYTES_PER_CELL_2D below for where the bytes go (the state
-                     is 4% of them) — and note it is per PRECISION, so the same
-                     cell count is 26.0 GiB/worker in float64 and 14.0 in
+                     is 5% of them) — and note it is per PRECISION, so the same
+                     cell count is 22.0 GiB/worker in float64 and 12.0 in
                      float32, which is why this rail is a rail.
 WIGNERF_EXPORT_DIR   where mp4 exports are written before being downloaded
                      (default <tempdir>/wignerf-exports; files are deleted
@@ -110,42 +110,51 @@ MAX_CELLS_2D = int(os.environ.get("WIGNERF_MAX_CELLS_2D", str(2**27)))
 # Measured on an RTX 3090 with `scripts/bench.py --ndim 2 --footprint`, which
 # runs a whole worker record (worker._advance then _emit) rather than a step
 # loop — the distinction matters, because a step loop misses adjust_step's
-# transients and the second exponent slot and so reports roughly half of this.
+# transients and frame.build's reductions and so reports well under this.
 # Reproduce it rather than trusting it.
 #
-#   float64   208.0 B/cell   0.20 / 1.03 / 3.25 / 7.93 GiB at 32^4 48^4 64^4 80^4
-#   float32   112.0 B/cell   0.11 / 0.55 / 1.75 / 4.27 GiB   (53.85% of float64)
+#   float64   176.0 B/cell   0.17 / 0.87 / 2.75 / 6.71 GiB at 32^4 48^4 64^4 80^4
+#   float32    96.0 B/cell   0.09 / 0.47 / 1.50 / 3.66 GiB   (54.55% of float64)
 #
 # Both are FLAT across sizes, and both are identical for the relativistic
 # variants (measured 2026-07-27, `--relativistic`): a sqrt over meshes that
 # already exist costs nothing.
 #
-# THE STATE IS 4% OF IT, which is the thing everyone gets wrong: W is REAL
+# THE STATE IS 5% OF IT, which is the thing everyone gets wrong: W is REAL
 # (solve_spectral returns B.real), so it is float64 = 8 B/cell — 0.12 GiB at
-# 64^4 — and the other 200 B/cell is the machinery of the step, all at full
+# 64^4 — and the other 168 B/cell is the machinery of the step, all at full
 # shape. Pool high-water by stage, measured at float64:
 #
 #   Propagator rebuild (dU_im + dT_im at 16, plus the two Bopp
 #     evaluations U(q -+ i*hbar*theta/2) at complex argument)      +80
 #   W, the state                                                  + 0  (pooled)
-#   _exp_main = (expU, expT), 2x complex128                       + 0  (pooled)
-#   _exp_odd, the slot for the substep clamped onto tau_k          +32
+#   the exponent slot = (expU, expT), 2x complex128               + 0  (pooled)
 #   one Strang step: complex working arrays + cuFFT work area      +16
 #   adjust_step: W1 and W2, plus a 2nd exponent pair for the halves +80
 #   frame.build: 6 plane reductions + the int W^2 pass            + 0  (pooled)
 #
-# So the two exponent slots (64 B/cell) are the largest single item, which is
-# what milestone M7 removes half of. float32 (M1) halves the complex arrays and
-# the state while dU_im/dT_im stay float64, which is why it lands at 54% rather
-# than 50%. Note the float32 saving is NOT cancelled by exponents()' cast: that
-# builds the phase in complex128 and rounds down, so its transient peak is a
-# mesh higher than float64's per call, but the pool high-water is still 112 —
-# measured, which is the only reason this is known.
+# adjust_step's transient is now the largest single item. It used to be the
+# EXPONENT SLOTS, of which there were two — the full step plus one for the
+# straggler clamped onto tau_k — and M7 (2026-08-02) removed the second by
+# making every committed substep inside a record the same size, measured 208 -> 176 and
+# 112 -> 96, i.e. exactly the 32 B/cell that slot booked. (The M7 row predicted
+# "-22%"; the truth is -15.4%, because that row long predated M1's measurement
+# of the 208 it was a fraction OF.) Note the surviving slot books +0: the pool
+# is already holding blocks of that size class from Propagator.rebuild, which
+# is why removing its twin was worth 32 rather than 64.
+#
+# float32 (M1) halves the complex arrays and the state while dU_im/dT_im stay
+# float64, which is why it lands at 55% rather than 50% — and slightly higher
+# than the pre-M7 53.85%, since the slot that went was pure complex. Note the
+# float32 saving is NOT cancelled by exponents()' cast: that builds the phase
+# in complex128 and rounds down, so its transient peak is a mesh higher than
+# float64's per call, but the pool high-water is still 96 — measured, which is
+# the only reason this is known.
 #
 # Not a display detail: at 4 variants split 2+2 over a card pair this is what
 # decides whether a session starts, so the create-time refusal quotes it and
 # status() reports it for the Setup panel's footprint line.
-BYTES_PER_CELL_2D = {"float64": 208, "float32": 112}
+BYTES_PER_CELL_2D = {"float64": 176, "float32": 96}
 
 
 def max_grid(ndim):

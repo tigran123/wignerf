@@ -70,7 +70,7 @@ before choosing it: measured 2.63x at 32^4, 2.09x at 48^4, 1.48x at 64^4 and
 the same card. The 2D step transforms two axes of a 4D array at a time
 (fft_pair's fftn branch) where 1D transforms one axis of a 2D array, and cuFFT's
 single-precision advantage for that strided layout is far smaller. So in 2D
-float32 is chosen for MEMORY — 112 B/cell against 208, see config.py — and the
+float32 is chosen for MEMORY — 96 B/cell against 176, see config.py — and the
 speed is a bonus.
 """
 
@@ -263,7 +263,7 @@ class Propagator:
         asks for (the arena high-water is set by adjust_step's two exponent pairs
         and qd()'s Bopp temporaries, both larger than anything here), so the card
         never sees the switch at all. In float32 the extra 16 B/cell is exactly
-        ONE complex128 mesh pair over a 112 B/cell arena, and dropping the old
+        ONE complex128 mesh pair over a 96 B/cell arena, and dropping the old
         pair first merely swaps which 16 B/cell it is: the pair overlap becomes
         rebuild()'s own float64 Bopp intermediate, since single precision leaves
         no double-sized free blocks to reuse. That row is also unreachable in a

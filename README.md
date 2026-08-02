@@ -91,7 +91,7 @@ momentum grid resolves the kink in T = c|p| — ~7e-6 per 100 steps at 32⁴, fa
 and not a smaller dt.
 
 **float32** is the other, and in 2D it is a memory setting rather than a speed
-one: it costs 112 bytes per cell against float64's 208, but it is only 1.5–2.6×
+one: it costs 96 bytes per cell against float64's 176, but it is only 1.5–2.6×
 faster here against 3.3–3.8× in 1D, because the 4D step transforms two axes at a
 time and single precision gains far less on that. Two things to expect from it.
 It is still a preview mode, so purity and energy drift with the same secular
@@ -101,10 +101,10 @@ measured 1e-3 of the integral at 32⁴ against 3e-5 for the same state in float6
 within seconds. 48⁴ and above are clear. If that warning appears and purity has
 drifted too, the remedy is float64 or a finer grid, not a wider box.
 
-Sizing a 2D run: a worker costs ~208 B per cell in float64 and ~112 in float32,
-both flat across sizes, of which the state itself is only 4% (the rest is the
-step's machinery at full shape). That is 0.20 GiB per worker at 32⁴ and 3.25 GiB
-at 64⁴ in float64, or 0.11 and 1.75 in float32 — and 80⁴ (7.93 against 4.27) is
+Sizing a 2D run: a worker costs ~176 B per cell in float64 and ~96 in float32,
+both flat across sizes, of which the state itself is only 5% (the rest is the
+step's machinery at full shape). That is 0.17 GiB per worker at 32⁴ and 2.75 GiB
+at 64⁴ in float64, or 0.09 and 1.50 in float32 — and 80⁴ (6.71 against 3.66) is
 reachable only in single precision on these cards. Measured on an RTX 3090:
 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for
 exploration and 64⁴ is a serious run**. Reproduce any of it with
@@ -231,10 +231,10 @@ holds the per-machine values for the systemd unit.
 | `WIGNERF_DEVICE` | `auto` | Device pool: `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). `auto` = every CUDA device, fastest first; an explicit list is trusted as written, its order being the speed ranking. Indices follow PCI order, matching `nvidia-smi`. |
 | `WIGNERF_PORT` | `8010` | Listen port. |
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session — the scrub/replay window. 32 GiB ≈ 4000 four-variant records at 1024². Lower it on small hosts. |
-| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling for **1D** sessions, at creation and for auto-expand alike. A 4096² working set is ~2.7 GiB per variant worker. |
-| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **2D** sessions. A sanity rail only: a 4D array grows as N⁴, so a per-axis cap is no real guard — 128⁴ is ~52 GiB per worker with every axis inside the rail. |
+| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling for **1D** sessions, at creation and for auto-expand alike. A 4096² working set is ~3.0 GiB per variant worker. |
+| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **2D** sessions. A sanity rail only: a 4D array grows as N⁴, so a per-axis cap is no real guard — 128⁴ is ~44 GiB per worker with every axis inside the rail. |
 | `WIGNERF_MAX_CELLS_2D` | `134217728` (2²⁷) | Total-cell rail for 2D — a cheap deterministic stop for absurd values (a dimensionality switch that carried N over would mean 1024⁴ from the 1D default, which is why the form caps it at the target's own), and the only guard on a host whose free memory cannot be read. Deliberately not the operative limit: that is a per-device fit check which runs the worker→device assignment, then compares the estimate against the driver's free memory, so the **smaller card binds** and unknown free memory never refuses. |
-| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); a session may override it. float32 is a **preview mode** — ~3.3–3.8× faster in 1D but only 1.5–2.6× in 2D, and ~54–58% of the working set on CUDA, nothing at all on CPU — and it costs the diagnostics this project navigates by, so do not make it the host default anywhere a result might be read off. It refuses auto-expand and `tol` below 1e-5. |
+| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); a session may override it. float32 is a **preview mode** — ~3.3–3.8× faster in 1D but only 1.5–2.6× in 2D, and ~54–55% of the working set on CUDA, nothing at all on CPU — and it costs the diagnostics this project navigates by, so do not make it the host default anywhere a result might be read off. It refuses auto-expand and `tol` below 1e-5. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto. Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download; a file is deleted once downloaded, when its session closes, at shutdown, or 30 minutes after finishing. Under systemd's `PrivateTmp=yes` the default is a RAM tmpfs — point it at a disk path for long 4K renders. |
 | `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 encoder: `auto` \| `cpu` \| `nvenc`. `auto` uses the GPU `h264_nvenc` encoder if a runtime probe succeeds, else `libx264 -preset veryfast`. Overridable per job from the Export panel. |
@@ -368,12 +368,15 @@ four are now in: the relativistic variants and float32 (2026-07-27, the latter
 halving what a 2D worker holds), mp4 export of a 2D run (2026-07-28), and the
 automatic regrid (2026-08-01, which needed a per-device memory guard on the
 doubling and an allocation order that hands the old grid back before building
-the new one). Three further items are already scoped: cuts at fixed (y, p_y)
+the new one). The last of the four, on 2026-08-02, collapsed the propagator's
+two exponent slots into one by dividing each record into equal substeps instead
+of walking at the adaptive step and clamping a straggler onto the record
+boundary: −32 bytes per cell at both dimensionalities, 208 → 176 in 2D and
+224 → 192 in 1D. Two further items are already scoped: cuts at fixed (y, p_y)
 alongside the projections, which are exact for separable states but average away
-the fringe contrast of precisely the entangled regime 2D exists to show; merging
-the inverse/forward FFT pair across step boundaries, worth about +50% in 2D; and
-collapsing the propagator's two exponent slots into one, which is the largest
-single item in a 4D worker's memory (−22%).
+the fringe contrast of precisely the entangled regime 2D exists to show; and
+merging the inverse/forward FFT pair across step boundaries, worth about +50%
+in 2D.
 
 Beyond that: destructive forking (resume computation from any record, which
 needs periodic float64 checkpoints alongside the quantized display history),

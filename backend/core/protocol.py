@@ -382,7 +382,7 @@ MSG_EXPAND_F32 = (
 # rules re-verified BITWISE against the correlated 2D Bopp shift for all four
 # variants, the adjust_step residual floor re-measured at 4D sizes (it saturates
 # at ~2.5e-6, so TOL_MIN_F32 = 1e-5 keeps 4x margin and did not move), and the
-# footprint measured at 112 B/cell against float64's 208 — see
+# footprint measured at 96 B/cell against float64's 176 — see
 # tests/test_precision.py and config.BYTES_PER_CELL_2D.
 # M4 (mp4 export, 2026-07-28): the figure generalized over a plane x variant
 # panel grid and a selectable diagnostics column (ExportSpec.planes /
@@ -393,9 +393,9 @@ MSG_EXPAND_F32 = (
 # REGRID time and not only at create time (core/fit.py, shared with
 # routers/sessions._fit_error so the two cannot drift), plus the release-before-
 # allocate ordering that makes its budget honest — measured on a 3090, the
-# switch peaked at 1.269x the new footprint and now peaks at 1.038x (float64;
-# 1.071 in float32), with 0.92 of the old footprint returning to the driver
-# (0.86 in float32) against 0.46 before. See tests/test_regrid2d.py and
+# switch peaked at 1.269x the new footprint and now peaks at 1.045x (float64;
+# 1.083 in float32), with 0.91 of the old footprint returning to the driver
+# (0.83 in float32) against 0.46 before. See tests/test_regrid2d.py and
 # scripts/bench.py --regrid. The guard asks that question of a DOUBLING only:
 # a plan that does not grow the window is refused by nothing (core/fit.py).
 #

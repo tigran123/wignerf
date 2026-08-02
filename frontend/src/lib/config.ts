@@ -103,7 +103,7 @@ const STORAGE_KEY = 'wignerf.cfg'
 const ALL_KEYS = ALL_VARIANTS
 
 /** Default axes per dimensionality. 2D starts at 64^4 = 16.8M cells, which
- *  measures 3.25 GiB per variant worker and ~35 steps/s on an RTX 3090 — a
+ *  measures 2.75 GiB per variant worker and ~35 steps/s on an RTX 3090 — a
  *  serious run rather than a toy, and comfortably inside the default
  *  WIGNERF_MAX_CELLS_2D. Drop to 32 per axis for quick exploration. */
 export const DEFAULT_AXES: Record<Ndim, AxisCfg[]> = {

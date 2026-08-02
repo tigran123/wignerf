@@ -66,20 +66,20 @@ def _fit_error(cfg, devices):
 
     This is the guard that MEANS something in 2D. WIGNERF_MAX_CELLS_2D is a
     fixed cell count, i.e. a proxy for "will it fit", and a proxy is wrong in
-    both directions: it refused 128×128×64×64 (13.0 GiB for one worker) on a
-    24 GiB card, and it would have waved through 6.5 GiB × 2 workers onto an
+    both directions: it refused 128×128×64×64 (11.0 GiB for one worker) on a
+    24 GiB card, and it would have waved through 5.5 GiB × 2 workers onto an
     11 GiB one. Ask the driver instead — the same question
     routers/preview.py's _pick_device asks — and let the rail be only a rail.
 
     Skipped at ndim=1: WIGNERF_MAX_GRID already bounds a 2D array to 4096² =
-    16.8M cells (~2.7 GiB/worker), so 1D cannot reach the sizes that need this.
+    16.8M cells (~3.0 GiB/worker), so 1D cannot reach the sizes that need this.
     N⁴ can, which is the whole point.
 
-    The footprint is per PRECISION (measured 208 B/cell in float64 against 112
+    The footprint is per PRECISION (measured 176 B/cell in float64 against 96
     in float32), and reading `cfg.precision` here is what makes M1 worth having:
     with a flat float64 figure this would have refused grids a float32 session
-    holds comfortably — 4 variants at 80⁴ is 15.9 GiB/card at 2+2 in float64 and
-    8.5 in float32 — i.e. it would have blocked exactly the runs single precision
+    holds comfortably — 4 variants at 80⁴ is 13.4 GiB/card at 2+2 in float64 and
+    7.3 in float32 — i.e. it would have blocked exactly the runs single precision
     is FOR. `_check` resolves precision before this runs, so it is never None.
     """
     if cfg.grid.ndim < 2:

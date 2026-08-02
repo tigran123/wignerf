@@ -327,7 +327,7 @@ const CONTEXT_GIB = 300 / 1024
  * device — the fastest — and says nothing whatsoever about the others.
  *
  * Getting that wrong is not academic: comparing one worker against the SMALLEST
- * pool device condemned 128×128×64×64 (13.0 GiB, one qn worker) as "will not fit
+ * pool device condemned 128×128×64×64 (11.0 GiB, one qn worker) as "will not fit
  * this host" against the 10.6 GiB 2080 Ti, while the worker was in fact bound
  * for the 23.6 GiB 3090 and the session started and computed happily. A
  * pre-flight hint that contradicts what the server then does is worse than no
@@ -374,8 +374,8 @@ const footprint = computed(() => {
   const per = cells.value * bpc / 1024 ** 3
   const load = deviceLoad.value
   // The per-device figure only says something when more than one device is
-  // actually USED. At one variant the split is 1×1, so "13.00 GiB per worker ·
-  // 13.00 GiB/device" was the same number twice, dressed up as a distribution.
+  // actually USED. At one variant the split is 1×1, so "11.00 GiB per worker ·
+  // 11.00 GiB/device" was the same number twice, dressed up as a distribution.
   const cardsNote = load && load.length > 1
     ? ` · ${Math.max(...load.map((d) => d.giB)).toFixed(2)} GiB/device`
     : ''
@@ -623,8 +623,8 @@ function adoptLive() {
              + ' Reduce an axis or drop a variant.'
            : 'estimated device memory per variant worker at this grid. Mostly '
              + 'NOT the state: W is real (float64, 8 B/cell), and the rest is '
-             + 'the step\'s machinery at full shape — two exponent slots '
-             + '(2 complex meshes each), the dU/dT rate meshes, the FFT work '
+             + 'the step\'s machinery at full shape — the exponent slot '
+             + '(2 complex meshes), the dU/dT rate meshes, the FFT work '
              + 'arrays and adjust_step\'s two candidate states.'">
         {{ footprint }}<template v-if="overCells"> — over the host cap</template>
         <template v-else-if="wontFit"> — will not fit this host</template>

@@ -1,4 +1,4 @@
-# 2D milestones M1–M4: what it cost to retire each gate
+# 2D milestones M1–M4 and M7: what each one cost
 
 Split out of `CLAUDE.md` on 2026-08-02, which had grown past the 150k-char
 limit at which Claude Code stops loading it. Everything here was in CLAUDE.md
@@ -8,8 +8,9 @@ measurements behind them.
 
 **Read this before touching**: precision handling or `BYTES_PER_CELL_2D` (M1),
 the relativistic kinetic term or a new 2D physics anchor (M2), the auto-expand
-regrid guard `core/fit.py` or `worker._apply_regrid` (M3), or the export
-figure in `core/render_mpl.py` (M4).
+regrid guard `core/fit.py` or `worker._apply_regrid` (M3), the export
+figure in `core/render_mpl.py` (M4), or `worker._advance` / `_substep` /
+`_exponents` (M7).
 
 ## Three lessons from retiring the four, which no single one holds
 
@@ -31,7 +32,8 @@ figure in `core/render_mpl.py` (M4).
   planner scans only TRIPPED axes, so the scenario is unreachable. A plausible
   chain from two documented measurements still got it wrong. Predict, then
   measure the prediction, at the point the code actually runs.
-- **A gate can carry a stale REASON.** M4's row said axis subscripts "must NOT
+- **A gate can carry a stale REASON**, so re-measure the claim it rests on and
+  not only the risk it names. M4's row said axis subscripts "must NOT
   use mathtext", citing a `describe.py` measurement; re-measured it was backwards
 
 ## M1 — float32 in 2D (landed 2026-07-27)
@@ -49,7 +51,8 @@ figure in `core/render_mpl.py` (M4).
   which is the property that had to be checked because the multi-D Bopp shift
   moves every spatial argument of U together. Pinned by
   `test_exponent_construction_stays_double`, now parametrized over ndim.
-  **MEMORY: 112 B/cell against float64's 208** — 54%, flat across 32⁴–80⁴, and
+  **MEMORY: 112 B/cell against float64's 208** (M7 later took both to 96 and
+  176) — 54%, flat across 32⁴–80⁴, and
   identical for the relativistic variants. That is better than the ~58% predicted
   from 1D, and it survives `exponents()`' cast (which builds the phase in
   complex128 and rounds down, so its *transient* peak is a mesh HIGHER than
@@ -133,7 +136,9 @@ figure in `core/render_mpl.py` (M4).
   **Relativistic is FREE in memory and in time**, so `BYTES_PER_CELL_2D` did not
   move: measured on the 3090 at float64, `qn` and `qr` arenas are identical to
   the byte (176.0 B/cell at 32⁴, 48⁴ and 64⁴ — that harness omits the frame
-  build the 208 figure includes) and throughput is within noise (34.8 vs 35.6
+  build the 208 figure includes; **do not confuse this 176 with M7's**, which is
+  the whole-record figure and a coincidence of what each harness leaves out) and
+  throughput is within noise (34.8 vs 35.6
   steps/s at 64⁴, against the 35.1 in the config table). A √ over meshes that
   already exist costs nothing; the FFTs are still the whole cost. Massless is the
   same again — 176.0 B/cell.
@@ -393,3 +398,110 @@ figure in `core/render_mpl.py` (M4).
   float32, all six planes — measures **10 lines against the 11 that fit at 8 pt**:
   no shrink, no elision, one line of margin. `_meta_fontsize` / `_meta_fit` still
   degrade gracefully past that and are pinned at 2D.
+
+
+## M7 — one exponent slot instead of two (landed 2026-08-02)
+
+The first of these finished at BOTH dimensionalities at once, and the only one
+that was never a gate: nothing refused anything, the second slot was simply
+there. `worker._advance` walked a record at the full adaptive `dt` and clamped
+the last substep onto τ_k; that straggler was a different dt, so it needed its
+own `(expU, expT)` pair beside the main one — 4 complex meshes, 64 B/cell, the
+largest single item in the 4D working set. `_substep` now divides what is left
+of the record into `n = ceil(|rem|/|dt|)` equal steps of `rem/n`.
+
+**THE ROW'S OWN NUMBER WAS STALE, in the direction that flatters it.** It
+promised "−32 B/cell, −22% of the 4D footprint". The −32 was right; the −22%
+was not, and `config.py`'s stage table said so all along — it books `_exp_odd`
+at +32 against a 208 total, i.e. **15.4%**. 32/144 is 22%, so the row was
+written against a pre-M1 estimate of the total and never revised when M1
+measured the 208 it was a fraction OF. Third time this file has recorded a
+stale claim in a milestone row; check the arithmetic against the constant, not
+against the prose.
+
+**MEASURED, `bench.py --footprint` on the 3090, before and after with one
+instrument:**
+
+    2D  float64  208 -> 176 B/cell   0.17 / 0.87 / 2.75 / 6.71 GiB at 32/48/64/80^4
+    2D  float32  112 ->  96          0.09 / 0.47 / 1.50 / 3.66
+    1D  float64  224 -> 192          0.19 / 0.75 / 3.00 / 12.00 GiB at 1024..8192^2
+    1D  float32  120 -> 104          0.10 / 0.41 / 1.63 /  6.50
+
+Flat across sizes at both dimensionalities, and a clean −32 (float64) / −16
+(float32) everywhere: −15.4% in 2D, −14.3% in 1D. "1D benefits too" was the one
+part of the row that held exactly.
+
+**THE BUG THE NEW TESTS CAUGHT, which is the whole reason to write them.** The
+first implementation recomputed `rem/n` at every substep. `rem` shrinks as the
+record is walked, so the sizes came out differing in the last ulps — nominally
+identical, but DISTINCT float keys, so the one slot missed on nearly every step:
+**5 distinct sizes across 12 substeps and 22 rebuilds over three records**,
+against the two-slot scheme's one cached production pair per record. A milestone
+that halves the memory and septuples the rebuild rate is not an improvement. The
+fix is to cache the plan against `t_tgt`; `_exp_clear` drops the plan and the
+pair together, because a stale plan is exactly as wrong as a stale exponent.
+
+**AND THE PLAN CACHE HAD A SECOND EDGE THE FIRST TESTS DID NOT REACH.** Caching
+the SIZE removes the clamped final substep the pre-M7 loop relied on to converge,
+so a loop that exits on `|τ_k − t| > eps` can no longer terminate once n
+accumulations of `rem/n` land further than `eps = 1e-12·max(1, |τ_k|)` from the
+target: it takes another FULL substep, overshoots, and dts keeps its sign, so it
+marches away for good. Reachable at n ~ 25000 (t ~ 5), which two maximal
+`adjust_step` contractions reach — `0.7^15` per call takes record_dt/8 to
+record_dt/1684 and then to record_dt/354610. Measured against the residual loop:
+**11.5 million substeps for a record wanting 50000**, still running when a
+watchdog stopped it, where the pre-M7 scheme was merely slow. `_substep` returns
+the COUNT with the size and `_advance` iterates on it. Both the first plan-cache
+bug and this one live in the same three lines, which is the argument for the file
+that found them: the memory win is one attribute, the scheduler is the risk.
+
+**THE FOLLOW-UP BUG WAS MID-RECORD RETUNING.** `adjust_step` used to commit a
+new adaptive step whenever its cadence landed, which could split one record into
+the old quotient, the controller's full step, and a second quotient. Retuning
+now probes at the NEXT record boundary: its trial state and pairs are dropped,
+then all committed steps use that record's one quotient. The cadence is latched
+when crossed so deferral never loses an adjustment.
+
+**AND THE SPEED CLAIM WAS WRONG TOO, this time in the prediction made while
+implementing rather than in the row.** The rebuild rate was expected to FALL,
+since the slot ought to survive across records. It does not: τ_k − τ_(k−1) is
+not bitwise equal from record to record, so the plan is re-keyed and the pair
+rebuilt once per record — exactly what the two-slot scheme paid for its
+straggler. M7 buys memory and nothing else. Measure the second-order claim as
+well as the headline one.
+
+**THE ACCOUNTING IT WAS HIDING: `fit.REGRID_PEAK`.** M3 measured it through
+`bench._record()`, which models a worker's steady state on both sides of a
+regrid — and hard-coded two slots to do it. Re-measured post-M7 the transient
+got RELATIVELY WORSE, not better: **1.038 → 1.045 (float64) and 1.071 → 1.083
+(float32)**, recovery 0.92 → 0.91 and 0.86 → 0.83, because there is now half as
+much exponent mesh to hand back before the new grid is built. A smaller worker
+is not automatically a cheaper regrid. 1.10 still covers it, with the float32
+margin down from 2.7% to 1.6%. The move case was re-verified and is unchanged:
+peak/steady 1.000 and driver +0 MiB in float64 at 32⁴/48⁴/64⁴.
+
+**TWO WORKED EXAMPLES IN THE DOCS INVERTED**, and a third survived by luck.
+The `+ n·per_old` term's proof case — "a single-worker 64⁴ doubling on the
+2080 Ti, 6.50 GiB against 7.15 free, which `F` alone refuses" — stops proving
+anything at 176 B/cell: the doubling needs 6.05 and `F` alone supplies 6.435.
+Rewritten around a card already holding the worker that wants to grow, which is
+the situation the term exists for. The Setup panel's "26.00 GiB/device on a host
+whose largest card is 24" reads 22.00 now and no longer clears any card in the
+pool by itself, so it is kept as history with the current figure beside it. The
+one that survived: the create-time refusal for 128×128×128×64 still cannot fit
+the 3090, 22.0 GiB against a 20.97 budget.
+
+**WHAT THE PHYSICS SUITE COULD NOT SEE.** `test_propagator.py`,
+`test_propagator2d.py` and `test_precision.py` all drive `Propagator` directly
+through a private fixed-`dt` `evolve()` helper, so none of them enters
+`_advance`. All 72 items were bitwise unchanged by M7 — and would be just as
+unchanged by a scheduler that never landed on τ_k at all. The row's stated cost,
+"changes 1D numerics and `test_time_reversal`'s ~1e-9 residue budget", named a
+test that cannot reach the code. `tests/test_substep.py` covers the gap: one
+committed size per record, the step within one ulp of `dt`, an exact divisor not
+split one finer, one cached production pair per record, boundary-only probes,
+termination at 50000 substeps in a record, both time directions, O(dt²)
+convergence against a fine reference (**ratio 4.51**), and a direction-flip
+round trip (**1.31e-6**, against ~1e-9 for the fixed-dt propagator equivalent,
+because the flip forces an adjust and the reverse pass is not the forward one
+played backwards).

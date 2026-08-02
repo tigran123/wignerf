@@ -677,8 +677,8 @@ const hostLimits = ref({
   // per PRECISION, for the same reason the two above are per ndim: precision is
   // restart-only too, so a single figure here would make the footprint line
   // disagree with the server for as long as a switch waits for its restart —
-  // and it disagrees by 1.9x, which at 64^4 is 3.25 GiB/worker against 1.75
-  bytesPerCell2d: { float64: 208, float32: 112 } as Record<string, number>,
+  // and it disagrees by 1.8x, which at 64^4 is 2.75 GiB/worker against 1.50
+  bytesPerCell2d: { float64: 176, float32: 96 } as Record<string, number>,
 })
 const historyCapMb = computed(() => {
   const b = session.status.value?.history_cap_bytes
@@ -690,7 +690,7 @@ const historyCapMb = computed(() => {
  *
  * Keyed off the FORM's precision, not the session's, exactly as the ndim it
  * indexes by is the form's. Both are restart-only, so the panel's job is to
- * describe what a Restart WOULD create — and the difference is 1.9x, big enough
+ * describe what a Restart WOULD create — and the difference is 1.8x, big enough
  * that reading the running session's precision here would put a stale figure
  * under a form the user had just switched to float32 to make a grid fit.
  */

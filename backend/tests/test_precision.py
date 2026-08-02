@@ -278,7 +278,7 @@ def test_the_resolution_rule_is_the_same_at_every_ndim(monkeypatch):
     the client never sent. M1 landed on 2026-07-27 and took the special case with
     it, so there is now one rule — and a 2D session on a float32 host gets
     float32, which is the whole point, since 2D is where single precision's
-    memory saving actually matters (112 B/cell against 208).
+    memory saving actually matters (96 B/cell against 176).
 
     The auto-expand gate is still here and still float64-only, and it is checked
     alongside deliberately: it is the remaining reason the two can disagree, and
