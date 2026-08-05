@@ -37,6 +37,37 @@ _client_msg = TypeAdapter(protocol.ClientMsg)
 STATUS_PERIOD = 1.0
 PROGRESS_PERIOD = 0.25   # batch-mode progress cadence (~4 Hz, ~300 bytes each)
 
+# Transport credit (see protocol.AckCmd). A frame is in flight from the send
+# until the client acks having PAINTED it; past either bound the sender stops
+# and playback slips in wall time, which is what the module docstring below has
+# always claimed and what uvicorn's sansio impl silently stopped delivering.
+#
+# The bound is set by what must still drain before the keepalive PING queued
+# behind it: at the measured browser ceiling (~110 MiB/s at 32 MiB messages)
+# 64 MiB is 0.6 s, and even at a pathological 10 MiB/s it is 6.4 s — both far
+# inside the 20 s pong deadline that killed the socket.
+#
+# It has to be at least TWO records wide or it degenerates to stop-and-wait,
+# and the bubble is measurable. Replaying 100 records at 4096^2 (32 MiB each)
+# to a client draining at the measured browser ceiling: unpaced 3.20 rec/s and
+# the socket KILLED at 84 frames; a 24 MiB cap admitted one frame at a time and
+# finished at 2.72 rec/s (-15%); 64 MiB finished all 100 at 3.21 rec/s, i.e.
+# the client's own receive rate and no cost at all for the correctness.
+#
+# A single record LARGER than the cap is still sent — the check is made with
+# the queue empty, so it never blocks the first frame and cannot deadlock; it
+# simply means one frame in flight, which is the least any transport can do.
+# At 8192^2 x 4 variants that one frame is 512 MiB and its drain time is what
+# display downsampling exists to cut, not something this cap can help with.
+INFLIGHT_MAX_BYTES = 64 << 20
+INFLIGHT_MAX_FRAMES = 3
+
+
+def _no_credit(s):
+    """True when the client owes us acks and must not be sent more."""
+    return s.paced and (s.inflight_bytes > INFLIGHT_MAX_BYTES
+                        or len(s.inflight) >= INFLIGHT_MAX_FRAMES)
+
 
 async def _handle(msg, s, ws):
     if msg.type == "play":
@@ -64,6 +95,12 @@ async def _handle(msg, s, ws):
             s.frame_evt.set()
     elif msg.type == "ping":
         s.post_msg({"type": "pong"})
+    elif msg.type == "ack":
+        # Frame credit returned. Wake the sender NOW rather than letting it
+        # wait out its frame-event timeout: at 60 fps a 50 ms tick is three
+        # frames of latency added to every paint.
+        s.note_ack(msg.record)
+        s.frame_evt.set()
     elif msg.type == "set_params":
         cp = None
         if msg.params.U is not None or msg.params.hbar_eff is not None:
@@ -154,16 +191,23 @@ def _progress_msg(s, lc):
 async def _guard_send(coro):
     """Await a websocket send, treating a transport-closed error as a normal
     disconnect. uvicorn raises RuntimeError('Unexpected ASGI message
-    "websocket.send", after sending "websocket.close"') when a send races the
-    client going away (a plain disconnect, or a reconnect superseding this
-    socket). That is the connection ending, not a streamer failure — unwind
-    quietly instead of the traceback that used to spam the log and, via the
-    frontend's auto-recover, churn reconnects."""
+    "websocket.send", after sending "websocket.close"') once the socket is
+    closed under us. That is the connection ending, not a streamer failure —
+    unwind quietly instead of the traceback that used to spam the log and, via
+    the frontend's auto-recover, churn reconnects.
+
+    It does NOT say the client went away, and it used to: the same error is
+    raised when uvicorn's own keepalive fails the connection because a ping
+    went out behind a backlogged transport buffer (protocol.AckCmd), which is
+    a self-inflicted kill. Log what actually happened and nothing more. The
+    code is None for the same reason — the old hardcoded 1006 read as a wire
+    code and sent a whole investigation after a constant.
+    """
     try:
         await coro
     except RuntimeError as e:
-        log.warning("streamer send failed (client gone / transport closed): %s", e)
-        raise WebSocketDisconnect(code=1006) from e
+        log.warning("streamer send failed, socket already closed: %s", e)
+        raise WebSocketDisconnect(code=None) from e
 
 
 async def _sender(ws, s, recv_task):
@@ -200,7 +244,17 @@ async def _sender(ws, s, recv_task):
     while not recv_task.done() and not s.closed:
         now = monotonic()
         lc = s.history.latest_complete()
-        cursor = s.clock.advance_cursor(now - last_wall, lc, last_sent)
+        # Delivery, for the playback auto-pause and the loop wrap: what the
+        # client has PAINTED once it is acking, else the best we can know.
+        # Strictly more correct than last_sent — with no backpressure on this
+        # transport, "sent" meant "buffered", so the gate that exists to stop
+        # the cursor running past unseen records was reading a number that had
+        # already run past them. A tab that stops painting (hidden, throttled)
+        # now correctly stops the cursor too.
+        delivered = s.acked if s.paced else last_sent
+        hist_first, _ = s.history.extent()
+        cursor = s.clock.advance_cursor(now - last_wall, lc, delivered,
+                                        hist_first)
         last_wall = now
 
         # The cursor wrapped: rearm the replay walk behind loop_from. Without
@@ -295,11 +349,12 @@ async def _sender(ws, s, recv_task):
                 first, _ = s.history.extent()
                 nxt = max(last_sent + 1, first)
                 t0 = monotonic()
-                while nxt <= min(target, lc):
+                while nxt <= min(target, lc) and not _no_credit(s):
                     payload = _pack_record(s, nxt, live=False)
                     if payload is None:
                         break
                     await _guard_send(ws.send_bytes(payload))
+                    s.note_sent(nxt, len(payload))
                     last_sent = nxt
                     nxt += 1
                     if not s.clock.running or s.pending_seek is not None \
@@ -308,10 +363,15 @@ async def _sender(ws, s, recv_task):
                 if s.pending_seek is None and last_sent < target:
                     s.clock.set_cursor(last_sent, lc)
 
-        if k is not None and k != last_sent:
+        # A seek is honoured even with no credit outstanding acks would deny:
+        # it is a direct answer to a click, it is one frame, and the client is
+        # by definition still painting if it just asked for something.
+        if k is not None and k != last_sent and (seek is not None
+                                                 or not _no_credit(s)):
             payload = _pack_record(s, k, live)
             if payload is not None:
                 await _guard_send(ws.send_bytes(payload))
+                s.note_sent(k, len(payload))
                 last_sent = k
 
         s.frame_evt.clear()
@@ -334,13 +394,31 @@ async def ws_endpoint(ws: WebSocket, sid: str):
         await ws.close(code=4404)
         return
     if s.ws_attached:
-        await ws.accept()
-        await ws.close(code=4409)
+        # Give the PREVIOUS attachment a moment to finish unwinding before
+        # refusing. A reconnect races its own predecessor's teardown, which is
+        # bounded at ~3 s (the `finally` awaits both tasks), and a 4409 reads to
+        # the client as a plain close — so it re-entered recover(), waited, and
+        # tried again, turning one dropped socket into a churn loop. Polling is
+        # enough: the flag is cleared by that same event loop.
+        for _ in range(40):
+            await asyncio.sleep(0.1)
+            if not s.ws_attached or s.closed:
+                break
+        if s.ws_attached:
+            await ws.accept()
+            await ws.close(code=4409)
+            return
+    if s.closed:
+        await ws.close(code=4404)
         return
     # claim the session BEFORE the first await — two near-simultaneous
     # connects must not both pass the check above
     s.ws_attached = True
     s.pending_seek = None
+    # A fresh socket has nothing in flight and has issued no credit yet: a
+    # reattach must not inherit the dead socket's debt (which would stall the
+    # new sender outright) nor its armed pacing (the new client might not ack).
+    s.reset_inflight()
     recv_task = None
     send_task = None
     try:
@@ -360,8 +438,11 @@ async def ws_endpoint(ws: WebSocket, sid: str):
         recv_task.add_done_callback(lambda _: send_task.cancel())
         await send_task
     except WebSocketDisconnect as e:
-        log.warning("streamer %s: disconnected (code=%s)", s.id,
-                    getattr(e, "code", "?"))
+        # A code only when one really came off the wire — _guard_send passes
+        # None precisely so a closed transport cannot masquerade as one.
+        code = getattr(e, "code", None)
+        log.warning("streamer %s: disconnected%s", s.id,
+                    "" if code is None else " (code=%s)" % code)
     except asyncio.CancelledError:
         # close() cancelled OUR sender (session deleted) — normal teardown.
         # If instead ws_endpoint itself was cancelled (server shutdown),

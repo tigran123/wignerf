@@ -188,11 +188,16 @@ def test_the_regrid_guard_asks_the_driver_not_a_cell_count(monkeypatch):
                                 _counts(1)) == []
 
 
-def test_the_guard_is_precision_aware_and_inert_at_1d(monkeypatch):
+def test_the_guard_is_precision_aware_and_applies_at_1d(monkeypatch):
     """float32 cuts the footprint to 55% (96 B/cell against 176), so it must
-    widen what a doubling can reach — that is most of what M1 bought in 2D. And
-    at ndim=1 there is no estimate at all (config.bytes_per_cell returns None),
-    so the guard must decline to have an opinion rather than invent one."""
+    widen what a doubling can reach — that is most of what M1 bought in 2D.
+
+    And it applies at ndim=1, where it used to decline to have an opinion. That
+    exemption rested on WIGNERF_MAX_GRID bounding a 2D array to 4096² — the
+    default, not the setting: at the 8192 this repo's wignerf.env sets, a 1D
+    doubling to 8192² is the same 4× jump a 2D one is, and a worker that cannot
+    afford it dies on a cupy OOM rather than the plan being denied.
+    """
     # Free memory chosen INSIDE the window where the two answers differ, in
     # units of one float64 worker (32^4 x 176 B), for 2 workers on one device:
     #   float64 is refused below F = 2.889   (4.40 needed against 0.9F + 1.80)
@@ -205,9 +210,14 @@ def test_the_guard_is_precision_aware_and_inert_at_1d(monkeypatch):
     args = (32**4, 2*32**4)
     assert fit.regrid_shortfall(*args, 2, "float64", _counts(2)) != []
     assert fit.regrid_shortfall(*args, 2, "float32", _counts(2)) == []
-    # ndim=1: not this check's business, at any size
+    # ndim=1 is checked too, and the same free memory answers it both ways:
+    # 4 workers doubling 4096^2 -> 2*4096^2 need 4*2*16.8M*192*1.10 = 26.5 GiB
+    # against 0.9*(F + 4*3.0 GiB) with F = 2.2*32^4*176 = 0.38 GiB, so refused;
+    # one worker at 512^2 wants 0.2 GiB and fits.
     assert fit.regrid_shortfall(4096**2, 2*4096**2, 1, "float64",
-                                _counts(4)) == []
+                                _counts(4)) != []
+    assert fit.regrid_shortfall(512**2, 2*512**2, 1, "float64",
+                                _counts(1)) == []
 
 
 def test_a_pure_move_is_never_refused_for_memory(monkeypatch):

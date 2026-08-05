@@ -516,6 +516,25 @@ function dismissBoundary() {
   session.boundary.value = null
 }
 
+/**
+ * "Your session is gone and this is a new one." Set by recover() on the 404
+ * path, which used to replace a run holding computed records with an empty
+ * session in silence — on screen that was only "0 / [0, 0]", with nothing to
+ * say where the work went.
+ *
+ * Its own `sticky`, never one over a join with the other notices (see above),
+ * and dismissed BY TEXT like the boundary warning so a later, different loss
+ * still shows. No timer clears it: unlike paramFlash this is not a
+ * confirmation of something the user just did, it is a report of work
+ * destroyed, and it should still be there when they look back at the screen.
+ */
+const lostSession = ref('')
+const lostSessionSeen = ref('')
+const lostSessionHeld = sticky(() => lostSession.value)
+const lostSessionShown = computed(() =>
+  lostSessionHeld.value && lostSessionHeld.value !== lostSessionSeen.value
+    ? lostSessionHeld.value : '')
+
 const boundaryTitle = computed(() => {
   const b = session.boundary.value
   if (!b) return ''
@@ -684,9 +703,15 @@ async function recover() {
   // not be stopped at all. userPaused is set by sendCommand and cleared by an
   // explicit play, so the resume fires only if the user still wants one.
   userPaused = false
+  // How much history is at stake, sampled BEFORE we probe: if the session
+  // turns out to be gone, this is the only place that still knows.
+  const hadRecords = (session.status.value?.record_extent?.[1] ?? -1) + 1
   try {
-    for (;;) {
-      await new Promise((r) => setTimeout(r, 1500))
+    // Probe IMMEDIATELY, then back off. Every millisecond here counts against
+    // the server's detach grace, and the delay used to be paid up front for
+    // nothing: the socket is already closed by the time onClose fires.
+    for (let attempt = 0; ; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 1500))
       try {
         if (!sid) break
         await api.get(`/sessions/${sid}`)
@@ -700,6 +725,13 @@ async function recover() {
         // no response at all: backend still down — keep waiting
       }
     }
+    // The session is gone and we are about to build a new one. SAY SO: this
+    // path silently replaced a run holding computed records with an empty
+    // session, and on screen that was just "0 / [0, 0]" with nothing in the UI
+    // and nothing in the log to explain where the work went.
+    lostSession.value = hadRecords > 1
+      ? `the previous session expired while the connection was down — ${hadRecords} computed records were discarded`
+      : 'the previous session expired while the connection was down'
     await restart()                  // recreate from the current config
   } finally {
     recovering = false
@@ -796,10 +828,10 @@ const hostDeviceTotals = ref<Record<string, number | null> | null>(null)
  * SHOWING — and `dims` is restart-only, so the two disagree for exactly as long
  * as a switch waits for its restart. Taking them off `status` meant a form
  * switched to 2D over a live 1D session offered N up to 4096 against an API
- * ceiling of 128 AND hid the 2D footprint estimate entirely (`bytes_per_cell` is
- * null at ndim=1) — the one number that says whether a 2D session can start, and
- * it was missing precisely before the first 2D restart. In the other direction a
- * form back at 1D over a live 2D session collapsed its N select to one option.
+ * ceiling of 128 AND hid the 2D footprint estimate entirely — the one number
+ * that says whether a session can start, and it was missing precisely before
+ * the first 2D restart. In the other direction a form back at 1D over a live 2D
+ * session collapsed its N select to one option.
  *
  * The literals mirror config.py's defaults and are FALLBACKS only, in the spirit
  * of the precision handling below: a probe that fails costs a ceiling the API
@@ -808,30 +840,36 @@ const hostDeviceTotals = ref<Record<string, number | null> | null>(null)
 const hostLimits = ref({
   maxGrid: { 1: 4096, 2: 128 } as Record<number, number>,
   maxCells: { 1: null, 2: 2 ** 27 } as Record<number, number | null>,
-  // per PRECISION, for the same reason the two above are per ndim: precision is
-  // restart-only too, so a single figure here would make the footprint line
-  // disagree with the server for as long as a switch waits for its restart —
-  // and it disagrees by 1.8x, which at 64^4 is 2.75 GiB/worker against 1.50
-  bytesPerCell2d: { float64: 176, float32: 96 } as Record<string, number>,
+  // per NDIM and per PRECISION, for the same reason: both are restart-only, so
+  // a figure flat on either axis would make the footprint line disagree with
+  // the server for as long as a switch waits for its restart — and precision
+  // disagrees by 1.8x, which at 64^4 is 2.75 GiB/worker against 1.50.
+  bytesPerCell: {
+    1: { float64: 192, float32: 104 },
+    2: { float64: 176, float32: 96 },
+  } as Record<number, Record<string, number>>,
 })
 const historyCapMb = computed(() => {
   const b = session.status.value?.history_cap_bytes
   return b == null ? null : Math.round(b/(1024*1024))
 })
 /**
- * The per-cell footprint the Setup panel's 2D line estimates from: null at
- * ndim=1, which needs no estimate.
+ * The per-cell footprint the Setup panel's line estimates from, at EITHER ndim.
  *
- * Keyed off the FORM's precision, not the session's, exactly as the ndim it
- * indexes by is the form's. Both are restart-only, so the panel's job is to
- * describe what a Restart WOULD create — and the difference is 1.8x, big enough
- * that reading the running session's precision here would put a stale figure
+ * It was 2D-only, because the backend had no 1D figure to give: the device fit
+ * check skipped ndim=1 on the grounds that WIGNERF_MAX_GRID already bounded a
+ * 2D array. It bounds it to ~3 GiB/worker at that var's default and to ~12 GiB
+ * at 8192, and an unaffordable 1D session used to start and then kill a worker
+ * with a cupy OOM. Now the server refuses it, so the panel must be able to say
+ * so BEFORE the restart rather than leave the user to read a 422.
+ *
+ * Keyed off the FORM's precision and the FORM's ndim, never the session's: both
+ * are restart-only, so the panel's job is to describe what a Restart WOULD
+ * create. Reading the running session's precision here would put a stale figure
  * under a form the user had just switched to float32 to make a grid fit.
  */
 const footprintBytesPerCell = computed(() =>
-  cfg.grid.ndim > 1
-    ? (hostLimits.value.bytesPerCell2d[cfg.precision] ?? null)
-    : null)
+  hostLimits.value.bytesPerCell[cfg.grid.ndim]?.[cfg.precision] ?? null)
 
 /**
  * Host facts the form needs before it can create anything: the device
@@ -863,6 +901,8 @@ async function probeHost() {
                                      max_grid?: Record<string, number>
                                      max_cells?: Record<string, number | null>
                                      bytes_per_cell_2d?: Record<string, number>
+                                     bytes_per_cell?: Record<string,
+                                                             Record<string, number>>
                                    }>(
       '/device', { timeout: 5000 })
     deviceOptions.value = data.choices ?? []
@@ -887,10 +927,16 @@ async function probeHost() {
     // Same key-by-key treatment, and for the same reason: a backend from before
     // M1 sends a bare number here, so anything that is not a per-precision
     // figure has to leave the literal fallbacks standing rather than index to
-    // undefined and render the footprint line as NaN.
-    for (const p of ['float64', 'float32']) {
-      const v = data.bytes_per_cell_2d?.[p]
-      if (typeof v === 'number') hostLimits.value.bytesPerCell2d[p] = v
+    // undefined and render the footprint line as NaN. The per-ndim key is newer
+    // still (it only exists since the fit check stopped skipping 1D), so fall
+    // back to the 2D-only spelling before falling back to the literals.
+    for (const nd of [1, 2]) {
+      const row = data.bytes_per_cell?.[String(nd)]
+        ?? (nd === 2 ? data.bytes_per_cell_2d : undefined)
+      for (const p of ['float64', 'float32']) {
+        const v = row?.[p]
+        if (typeof v === 'number') hostLimits.value.bytesPerCell[nd]![p] = v
+      }
     }
     // Install the host's default so "Reset setup to defaults" agrees with the
     // server, and adopt it if this browser has never chosen a precision.
@@ -1040,7 +1086,8 @@ onBeforeUnmount(() => {
            Full width, so no message has to be truncated to fit a header row.
            The float32 badge stays inline on purpose: it is a permanent property
            of the session, set before there is anything to watch. -->
-      <div v-if="restartNeeded || boundaryShown || paramFlash || regridFlash"
+      <div v-if="restartNeeded || boundaryShown || paramFlash || regridFlash
+                 || lostSessionShown"
            class="absolute left-0 right-0 top-full z-30 flex items-center
                   gap-4 flex-wrap px-3 py-1 text-xs
                   bg-panel/95 border-b border-line-soft shadow-sm">
@@ -1055,6 +1102,17 @@ onBeforeUnmount(() => {
         </span>
         <span v-if="paramFlash" class="text-ok">✓ {{ paramFlash }}</span>
         <span v-if="regridFlash" class="text-info">⤢ {{ regridFlash }}</span>
+        <span v-if="lostSessionShown" class="text-warn"
+              title="A session is held only while a client is attached, plus a
+                     grace period after the socket drops. The connection was
+                     down for longer than that, so the server freed its history
+                     and its GPU memory, and a fresh session was created from
+                     the same setup. Nothing is wrong with the setup — press
+                     Solve to compute again.">
+          ⚠ {{ lostSessionShown }}
+          <button class="underline" title="dismiss"
+                  @click="lostSessionSeen = lostSessionShown">×</button>
+        </span>
       </div>
     </header>
 

@@ -65,26 +65,31 @@ def _fit_error(cfg, devices):
     """Whether the devices this session's workers land on actually have room,
     or None when they do / when it cannot be told.
 
-    This is the guard that MEANS something in 2D. WIGNERF_MAX_CELLS_2D is a
-    fixed cell count, i.e. a proxy for "will it fit", and a proxy is wrong in
-    both directions: it refused 128×128×64×64 (11.0 GiB for one worker) on a
-    24 GiB card, and it would have waved through 5.5 GiB × 2 workers onto an
-    11 GiB one. Ask the driver instead — the same question
-    routers/preview.py's _pick_device asks — and let the rail be only a rail.
+    This is the guard that MEANS something. The cell-count rails are proxies for
+    "will it fit", and a proxy is wrong in both directions: WIGNERF_MAX_CELLS_2D
+    refused 128×128×64×64 (11.0 GiB for one worker) on a 24 GiB card, and would
+    have waved through 5.5 GiB × 2 workers onto an 11 GiB one. Ask the driver
+    instead — the same question routers/preview.py's _pick_device asks — and let
+    the rails be only rails.
 
-    Skipped at ndim=1: WIGNERF_MAX_GRID already bounds a 2D array to 4096² =
-    16.8M cells (~3.0 GiB/worker), so 1D cannot reach the sizes that need this.
-    N⁴ can, which is the whole point.
+    IT RUNS AT EVERY ndim. It used to skip ndim=1 "because WIGNERF_MAX_GRID
+    already bounds a 2D array to 4096² = 16.8M cells (~3.0 GiB/worker)" — a
+    reason that was true of the DEFAULT and not of the setting. The var is
+    tunable to 16384, and at the 8192 this repo's own wignerf.env sets, one
+    float64 worker wants ~12 GiB against an 11 GiB card: measured 2026-08-05,
+    a 1D session started unrefused and then killed a worker with a cupy OOM
+    mid-run, which is precisely the outcome this guard exists to replace with a
+    sentence at the door. A gate can carry a stale REASON, so re-measure the
+    claim it rests on and not only the risk it names.
 
-    The footprint is per PRECISION (measured 176 B/cell in float64 against 96
-    in float32), and reading `cfg.precision` here is what makes M1 worth having:
-    with a flat float64 figure this would have refused grids a float32 session
-    holds comfortably — 4 variants at 80⁴ is 13.4 GiB/card at 2+2 in float64 and
-    7.3 in float32 — i.e. it would have blocked exactly the runs single precision
-    is FOR. `_check` resolves precision before this runs, so it is never None.
+    The footprint is per PRECISION and per ndim (measured 192/104 B/cell at
+    ndim=1, 176/96 at ndim=2), and reading `cfg.precision` here is what makes M1
+    worth having: with a flat float64 figure this would have refused grids a
+    float32 session holds comfortably — 4 variants at 80⁴ is 13.4 GiB/card at
+    2+2 in float64 and 7.3 in float32 — i.e. it would have blocked exactly the
+    runs single precision is FOR. `_check` resolves precision before this runs,
+    so it is never None.
     """
-    if cfg.grid.ndim < 2:
-        return None
     per = fit.per_worker(cfg.grid.cells, cfg.grid.ndim, cfg.precision)
     counts = fit.worker_counts(
         sessions.assign_devices(cfg.variants, devices).values())

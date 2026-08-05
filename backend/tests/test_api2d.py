@@ -318,8 +318,8 @@ def test_the_cell_ceiling_is_what_bounds_2d_memory(monkeypatch):
         assert "MAX_CELLS_2D" in r.text and "GiB per variant worker" in r.text
 
 
-def test_the_device_fit_check_is_the_operative_2d_guard(monkeypatch):
-    """WIGNERF_MAX_CELLS_2D is a RAIL; the guard that means something asks the
+def test_the_device_fit_check_is_the_operative_guard(monkeypatch):
+    """The cell-count rails are RAILS; the guard that means something asks the
     driver how much is free on the devices this session's workers land on.
 
     A fixed cell count cannot do that job — it is wrong in both directions. It
@@ -363,6 +363,30 @@ def test_the_device_fit_check_is_the_operative_2d_guard(monkeypatch):
         r = client.post("/api/sessions",
                         json=cfg2(grid=big, variants=["qn", "cn"]))
         assert r.status_code == 422 and "cuda:8" in r.text, r.text
+
+        # ...AND IT ASKS THE SAME QUESTION AT ndim=1, which it used to skip on
+        # the grounds that WIGNERF_MAX_GRID already bounded a 2D array. That
+        # bounds it to ~3.0 GiB/worker at the var's DEFAULT and to ~12 GiB at
+        # the 8192 this repo's own wignerf.env sets, so the exemption let an
+        # unaffordable 1D session start and then killed a worker with a cupy
+        # OOM mid-run — the exact outcome the guard replaces with a sentence.
+        g1 = dict(x1=-6.0, x2=6.0, Nx=1024, p1=-7.0, p2=7.0, Np=1024)
+        cfg1 = {"grid": g1, "potential": "x^2/2", "record_dt": 0.05,
+                "delay": 0.0, "variants": ["qn"],
+                "ic": {"type": "mixture",
+                       "components": [{"x0": 2.0, "p0": 0.0,
+                                       "sigma_x": 0.707, "sigma_p": 0.707}]}}
+        per1 = 1024*1024*config.bytes_per_cell(1, "float64")
+        free.clear()
+        free["cuda:9"] = int(per1*4) + rs.CONTEXT_BYTES
+        r = client.post("/api/sessions", json=cfg1)
+        assert r.status_code == 200, r.text
+        client.delete("/api/sessions/%s" % r.json()["session_id"])
+
+        free["cuda:9"] = int(per1*0.5)
+        r = client.post("/api/sessions", json=cfg1)
+        assert r.status_code == 422, "an unaffordable 1D grid was accepted"
+        assert "cuda:9" in r.text and "GiB free" in r.text, r.text
 
         # unknown free memory (no cupy, unreadable /proc) must not refuse:
         # there the rail is the only guard and guessing would be worse
@@ -565,9 +589,9 @@ def test_the_device_endpoint_carries_the_per_ndim_ceilings(monkeypatch):
     long as a switch waits for its restart. Reading them off `status` measurably
     broke the panel in both directions: over a live 1D session a 2D form offered N
     up to 4096 against an API ceiling of 128 and rendered NO footprint estimate
-    (bytes_per_cell is null at ndim=1 — the one number that says whether a 2D
-    session can start, missing precisely before the first 2D restart), and over a
-    live 2D session a 1D form's N select collapsed to a single option.
+    (the one number that says whether a 2D session can start, missing precisely
+    before the first 2D restart), and over a live 2D session a 1D form's N select
+    collapsed to a single option.
 
     The monkeypatch is the load-bearing half: these keys sit OUTSIDE
     _probe_backend's lru_cache, and a cached copy would freeze the host's limits
@@ -587,6 +611,12 @@ def test_the_device_endpoint_carries_the_per_ndim_ceilings(monkeypatch):
         assert d["bytes_per_cell_2d"]["float64"] == 176
         assert d["bytes_per_cell_2d"]["float32"] == 96
         assert d["bytes_per_cell_2d"] == config.BYTES_PER_CELL_2D
+        # ...and per NDIM as well, since the fit check stopped skipping 1D: a
+        # 1D grid can be unaffordable too (12 GiB/worker at 8192^2), so the form
+        # must be able to say so before the restart rather than after the 422.
+        assert d["bytes_per_cell"]["1"] == config.BYTES_PER_CELL_1D
+        assert d["bytes_per_cell"]["2"] == config.BYTES_PER_CELL_2D
+        assert d["bytes_per_cell"]["1"]["float64"] == 192
         # ...and the probe's cache does not freeze them
         monkeypatch.setattr(config, "MAX_GRID_2D", 64)
         monkeypatch.setattr(config, "MAX_CELLS_2D", 1 << 20)

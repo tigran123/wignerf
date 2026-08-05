@@ -1030,3 +1030,157 @@ def test_loop_replays_the_same_region_instead_of_stopping():
             assert paused["cursor"] == pytest.approx(frontier)
             assert paused["loop"] is False
         client.delete("/api/sessions/%s" % sid)
+
+
+def test_an_unacked_client_stops_the_sender_and_one_ack_restarts_it():
+    """The transport's flow control is OURS, and it engages.
+
+    uvicorn's websockets-sansio impl applies no outbound backpressure at all
+    (it sets its `writable` event once and never clears it), so `send_bytes`
+    only buffers: a replay dumped the whole history into the transport, the
+    keepalive PING went out behind it, could not be answered inside the pong
+    deadline, and the SERVER killed its own socket — every "streamer send
+    failed / disconnected" pair in the 2026-08-05 journal, each at an exact
+    multiple of the ping interval after accept. See protocol.AckCmd.
+
+    Two halves, and the second is the one that catches a cap that never
+    releases: withholding acks must stall the stream, and a single ack must
+    start it again.
+    """
+    import time as _time
+    from routers import stream as stream_mod
+    with TestClient(app) as client:
+        info = _mk(client)
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            ws.send_text(json.dumps({"type": "play"}))
+            # One ack ARMS pacing. Before it the session is unpaced, which is
+            # what keeps ws_smoke and any raw consumer working unchanged.
+            f0 = _recv_frames(ws, 1)[0]
+            ws.send_text(json.dumps({"type": "ack", "record": f0.record}))
+
+            # Now go silent. Status ticks (STATUS_PERIOD) keep receive() moving,
+            # so this terminates whether or not frames are still coming.
+            quiet, deadline = [], _time.monotonic() + 4.0
+            while _time.monotonic() < deadline:
+                m = ws.receive()
+                if m.get("bytes"):
+                    quiet.append(protocol.unpack_frame(m["bytes"]).record)
+            assert len(quiet) <= stream_mod.INFLIGHT_MAX_FRAMES, (
+                "an unacking client kept being sent frames: %r" % quiet)
+
+            # ...and the workers were never throttled by it: computation always
+            # runs at full speed, the display is what slips.
+            r = client.get("/api/sessions/%s" % sid).json()
+            assert r["record_extent"][1] > max(quiet or [f0.record]), \
+                "the credit cap stalled COMPUTATION, not just the display"
+
+            # One ack for the newest thing we were sent releases the credit.
+            ws.send_text(json.dumps({"type": "ack",
+                                     "record": max(quiet or [f0.record])}))
+            more, deadline = [], _time.monotonic() + 4.0
+            while _time.monotonic() < deadline:
+                m = ws.receive()
+                if m.get("bytes"):
+                    more.append(protocol.unpack_frame(m["bytes"]).record)
+                    break
+            assert more, "the sender never resumed after an ack"
+        client.delete("/api/sessions/%s" % sid)
+
+
+def test_loop_wraps_even_when_the_pass_started_at_the_frontier():
+    """An armed `loop` must ALWAYS loop, including when loop_from == frontier.
+
+    A FINISHED BATCH RUN is where this bites, and it is what the 2026-08-05
+    report ("computed 100 records, played back, it stopped at the last record
+    instead of looping") was. There, play at the frontier is playback and not
+    Solve (`_batch_done`), so `stop_at_frontier` is set and set_running
+    captures `loop_from = int(cursor) = frontier`. The old wrap gate tested
+    `loop_from < latest_complete`, so it fell straight through to the pause and
+    the checkbox silently did nothing. It "worked on the second attempt" purely
+    because by then the cursor sat behind the frontier. A socket drop reaches
+    the same state without any user action: detaching pauses the session and
+    recover() re-issues `play` on its own.
+
+    Interactive mode cannot reproduce it — there play at the frontier COMPUTES,
+    which is correct and is why this is a batch test.
+
+    Arrivals are counted at the region START, never at the frontier: the live
+    frame already in flight is itself the frontier, so a dead loop reads as two
+    passes there.
+    """
+    import time as _time
+    with TestClient(app) as client:
+        info = _mk(client, mode="batch", t2=0.5)    # 10 records at 0.05
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            # batch computes flat-out to t2 and auto-pauses there, streaming no
+            # frames on the way — so the cursor ends up AT the frontier.
+            ws.send_text(json.dumps({"type": "play"}))
+            deadline = _time.monotonic() + 20.0
+            while _time.monotonic() < deadline:
+                r = client.get("/api/sessions/%s" % sid).json()
+                if not r["running"] and r["record_extent"][1] >= 10:
+                    break
+                _time.sleep(0.1)
+            first, frontier = r["record_extent"]
+            assert frontier >= 10 and not r["running"], r
+            assert r["cursor"] == pytest.approx(frontier), \
+                "batch did not settle at the frontier: %r" % r["cursor"]
+
+            # Arm loop and play WITHOUT seeking back: loop_from == frontier.
+            ws.send_text(json.dumps({"type": "delay", "seconds": 0}))
+            ws.send_text(json.dumps({"type": "loop", "on": True}))
+            ws.send_text(json.dumps({"type": "play"}))
+
+            seen, deadline = [], _time.monotonic() + 15.0
+            while _time.monotonic() < deadline:
+                m = ws.receive()
+                if m.get("bytes"):
+                    seen.append(protocol.unpack_frame(m["bytes"]).record)
+                    if seen.count(first) >= 2:
+                        break
+            assert seen.count(first) >= 2, (
+                "loop stopped at the frontier instead of wrapping: %r"
+                % seen[-30:])
+            r = client.get("/api/sessions/%s" % sid).json()
+            assert r["running"] and not r["computing"], \
+                "the wrap rolled a playback run into computing"
+            assert r["loop"] is True
+        client.delete("/api/sessions/%s" % sid)
+
+
+def test_a_reattach_waits_for_the_previous_streamer_to_let_go():
+    """A reconnect racing its own predecessor's teardown must ATTACH, not 4409.
+
+    `ws_endpoint`'s finally can take up to ~3 s (it awaits both tasks with a
+    timeout), and a client that dropped is by then already reconnecting. The
+    4409 refusal reads to that client as a plain close, so it re-entered
+    recover(), waited, and tried again — one dropped socket becoming a churn
+    loop, which is what the 2026-08-05 journal shows around each keepalive kill.
+    Each lap also costs the session's detach grace, and losing that race is what
+    ends with the sweeper freeing a session the user is still using.
+
+    The single-attach claim itself is unchanged: a genuinely attached session
+    still refuses, after the wait.
+    """
+    import threading
+    import time as _time
+    from core import session as sessmod
+    with TestClient(app) as client:
+        info = _mk(client)
+        sid = info["session_id"]
+        s = sessmod.SESSIONS[sid]
+
+        # Stand in for a predecessor still unwinding: the flag is set, and
+        # clears shortly after — exactly the window that used to return 4409.
+        s.ws_attached = True
+        threading.Timer(0.6, lambda: setattr(s, "ws_attached", False)).start()
+
+        t0 = _time.monotonic()
+        with client.websocket_connect(info["ws_url"]) as ws:
+            m = ws.receive()
+            assert m.get("text"), "reattach was refused instead of waiting"
+            assert json.loads(m["text"])["type"] == "status"
+        assert _time.monotonic() - t0 >= 0.5, "it did not actually wait"
+        client.delete("/api/sessions/%s" % sid)

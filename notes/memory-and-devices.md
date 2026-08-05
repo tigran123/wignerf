@@ -63,7 +63,7 @@ express (4 variants at 2+2 is refused by the 11 GiB half of the pair, not by the
 24 GiB half); and **unknown free memory does NOT refuse** — there the rail is the
 only guard and guessing would be worse. Skipped at ndim=1, where `WIGNERF_MAX_GRID`
 already bounds a 2D array to 4096² ≈ 2.7 GiB/worker. Pinned by
-`test_the_device_fit_check_is_the_operative_2d_guard`.
+`test_the_device_fit_check_is_the_operative_guard`.
 **The IC preview is BOUNDED the same two ways** — by `protocol.grid_limit_error`
 (the shared rail: a grid a session would refuse is one the preview must not
 allocate either) and, before the CPU fallback, by `preview._cpu_fit_error`, which

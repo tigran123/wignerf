@@ -47,6 +47,22 @@ const fps = computed(() => {
 })
 const dropping = computed(() => rates.value.dropped > 0.5)
 
+/**
+ * What the SERVER is putting on the wire, beside what this browser got.
+ *
+ * A third number, because the two above cannot separate "the server sent less"
+ * from "this client received less" — and that distinction is the whole subject
+ * of both the transport credit and display downsampling. Server-side, so it is
+ * also the one figure still moving when the client has stopped painting.
+ * Quiet when idle, like fps.
+ */
+const wire = computed(() => {
+  const b = props.status?.sent_bytes_per_s
+  if (b == null || b < 64 * 1024) return ''
+  const m = b / 2 ** 20
+  return `${m >= 10 ? m.toFixed(0) : m.toFixed(1)} MiB/s`
+})
+
 const span = computed(() => Math.max(1, extent.value[1] - extent.value[0]))
 const cursorPct = computed(() => {
   if (extent.value[1] < 0) return 0
@@ -84,6 +100,10 @@ function click(ev: MouseEvent) {
          v-if="extent[1] >= 0">
       <!-- fixed width: the rate changes 3x/s and must not shove the record
            counter sideways as digits come and go -->
+      <span v-if="wire" class="inline-block w-[5rem] text-right text-fg-3"
+            title="what the SERVER is putting on the wire for this session. Beside the fps pair because those two cannot tell 'the server sent less' from 'this client received less' — and it keeps moving when the client has stopped painting.">
+        {{ wire }}
+      </span>
       <span v-if="fps" class="inline-block w-[6.5rem] text-right"
             :class="dropping ? 'text-warn-2' : 'text-fg-2'"
             :title="dropping

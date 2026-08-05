@@ -665,8 +665,35 @@ class PingCmd(BaseModel):
     type: Literal["ping"]
 
 
+class AckCmd(BaseModel):
+    """Receipt for a PAINTED record — the transport's only flow control.
+
+    uvicorn's `websockets-sansio` implementation applies NO outbound
+    backpressure: it builds an `asyncio.Event` named `writable`, sets it once
+    in __init__ and never clears it, and has no `pause_writing`/
+    `resume_writing` pair at all (`wsproto_impl` does; that impl is not the
+    one `--ws auto` selects). So `ws.send_bytes` is fire-and-forget — a replay
+    dumps the whole history into an unbounded transport buffer within seconds,
+    the keepalive PING is written at the tail of it, cannot be answered inside
+    `--ws-ping-timeout`, and the server kills its own socket. Every "streamer
+    send failed / disconnected" pair in the journal is that, at an exact
+    multiple of the ping interval after accept.
+
+    So the cap has to be OURS. `start.sh` pinned the ping VALUES against a
+    `--ws` impl swap and that turned out not to be the thing that mattered;
+    an app-level credit cannot be removed by a library swap at all.
+
+    Sent per PAINTED frame, never per decoded one: the point is what the client
+    got through, and the client's own queue drops to newest under burst — so an
+    ack also retires every frame sent before it, painted or dropped.
+    """
+    type: Literal["ack"]
+    record: int = Field(ge=0)
+
+
 ClientMsg = Annotated[
-    Union[PlayCmd, PauseCmd, DelayCmd, SeekCmd, SetParamsCmd, PingCmd, LoopCmd],
+    Union[PlayCmd, PauseCmd, DelayCmd, SeekCmd, SetParamsCmd, PingCmd, LoopCmd,
+          AckCmd],
     Field(discriminator="type"),
 ]
 

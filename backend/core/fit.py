@@ -1,4 +1,12 @@
-"""Per-device memory budgeting for 2D sessions — will this actually fit?
+"""Per-device memory budgeting — will this actually fit?
+
+At EITHER dimensionality since 2026-08-05. This was 2D-only because 1D was
+believed to be bounded already by WIGNERF_MAX_GRID, which bounds it to 3.0
+GiB/worker at that var's DEFAULT and to ~12 GiB at the 8192 this repo's own
+wignerf.env sets — and an unguarded 1D session duly killed a worker with a cupy
+OOM mid-run instead of being refused at the door. The arithmetic never had a
+dimension-aware line in it; only `config.bytes_per_cell` did, and only because
+nobody had measured the 1D figure (it is 192/104 B/cell, against 2D's 176/96).
 
 Two callers ask the same arithmetic a different question:
 
@@ -99,11 +107,13 @@ REGRID_PEAK = 1.10
 
 
 def per_worker(cells, ndim, precision):
-    """Device bytes one variant worker holds at this grid, or None at ndim=1
-    (where WIGNERF_MAX_GRID already bounds a 2D array and no estimate is
-    needed — see config.bytes_per_cell)."""
-    b = config.bytes_per_cell(ndim, precision)
-    return None if b is None else cells*b
+    """Device bytes one variant worker holds at this grid, at either ndim.
+
+    It returned None at ndim=1 until 2026-08-05, on the grounds that
+    WIGNERF_MAX_GRID already bounded a 2D array — true of that var's default and
+    not of the var, which reaches 12 GiB/worker at the 8192 this repo sets. Both
+    figures are measured; see config.bytes_per_cell."""
+    return cells*config.bytes_per_cell(ndim, precision)
 
 
 def worker_counts(devices):
@@ -156,8 +166,6 @@ def regrid_shortfall(cells_old, cells_new, ndim, precision, counts,
     """
     per_new = per_worker(cells_new, ndim, precision)
     per_old = per_worker(cells_old, ndim, precision)
-    if per_new is None:
-        return []                       # ndim=1: not this check's business
     # A WINDOW THAT DOES NOT GROW IS NOT THIS CHECK'S BUSINESS EITHER, and this
     # is not an optimization — the inequality below is simply wrong there. With
     # per_new == per_old it reduces to F >= (REGRID_PEAK/FIT_MARGIN - 1)*n*per_old

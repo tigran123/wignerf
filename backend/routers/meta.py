@@ -67,8 +67,8 @@ def device():
     SHOWING, and `dims` is restart-only, so the two disagree for as long as a
     switch sits ahead of its restart. Reading them off `status` made the Setup
     panel offer N up to 4096 for a 2D grid the API refuses past 128, hide the 2D
-    footprint estimate entirely (its `bytes_per_cell` is 1D-null) and, in the
-    other direction, collapse the 1D N select to a single option.
+    footprint estimate entirely and, in the other direction, collapse the 1D N
+    select to a single option.
 
     Deliberately OUTSIDE `_probe_backend`'s lru_cache: these are cheap env
     reads, they must follow a monkeypatched `config` in the tests, and the
@@ -78,9 +78,17 @@ def device():
     return {**_probe_backend(),
             "max_grid": {str(n): config.max_grid(n) for n in axes_mod.NDIMS},
             "max_cells": {str(n): config.max_cells(n) for n in axes_mod.NDIMS},
-            # keyed by PRECISION for the same reason the two above are keyed by
-            # ndim: the form has to describe what it is showing, and precision is
-            # restart-only too, so a scalar here would make the footprint line
-            # disagree with the server for as long as a switch awaits its restart
+            # keyed by ndim AND by PRECISION, for the same reason: the form has
+            # to describe what it is SHOWING, and both dims and precision are
+            # restart-only, so a scalar on either axis would make the footprint
+            # line disagree with the server for as long as a switch awaits its
+            # restart. It is per-ndim at all only since the fit check stopped
+            # skipping 1D (core/fit.py) — before that there was no 1D figure to
+            # report, which is why the old key said "_2d" in its name.
+            "bytes_per_cell": {str(n): {p: config.bytes_per_cell(n, p)
+                                        for p in config.PRECISIONS}
+                               for n in axes_mod.NDIMS},
+            # the pre-2026-08-05 spelling, kept so a stale bundle in an open tab
+            # keeps rendering its footprint line instead of showing NaN
             "bytes_per_cell_2d": {p: config.bytes_per_cell(2, p)
                                   for p in config.PRECISIONS}}

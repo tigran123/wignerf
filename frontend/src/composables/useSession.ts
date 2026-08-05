@@ -106,6 +106,9 @@ export interface SessionStatus {
   cursor: number
   history_bytes: number
   history_cap_bytes: number
+  // rolling bytes/s this session is putting on the wire. Optional: a backend
+  // from before the transport credit landed does not send it.
+  sent_bytes_per_s?: number
   devices: string[]
   // current physics (reflects live set_params changes)
   potential: string
@@ -233,6 +236,14 @@ export function useSession() {
     })
     perfFrame()
     perfStage('fanout', performance.now() - t0)
+    // Return transport credit for what we just PAINTED (backend
+    // protocol.AckCmd). Here and not in onmessage: uvicorn's WS transport
+    // applies no backpressure of its own, so "decoded" would let the server
+    // keep filling a buffer this client has not caught up with — which is
+    // exactly how the keepalive ping ended up stuck behind a backlog and the
+    // server killed its own socket. An ack retires every frame sent before
+    // this one too, so the queue's drop-to-newest needs no accounting.
+    send({ type: 'ack', record: f.record })
   }
 
   function scheduleDrain() {

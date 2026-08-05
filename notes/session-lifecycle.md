@@ -140,6 +140,83 @@ or anything that claims a memory number.
   `test_detached_session_swept_after_grace_attached_is_shielded`.
 
 
+## The keepalive kill: uvicorn's WS transport has no backpressure (2026-08-05)
+
+**`await ws.send_bytes(...)` does not wait for anything.** uvicorn's
+`websockets-sansio` implementation — what `--ws auto` selects once
+`websockets` >= 14 is installed, and what this host runs (verified:
+`AutoWebSocketsProtocol` is `WebSocketsSansIOProtocol`, websockets 16.1.1) —
+builds an `asyncio.Event` called `writable`, `.set()`s it once in `__init__`
+(`websockets_sansio_impl.py:96-97`), awaits it in `send()` (`:373`), and
+**never clears it**. There is no `pause_writing`/`resume_writing` pair in that
+file at all. `wsproto_impl.py:183-193` has them and `websockets_impl.py` awaits
+the real drain, but neither is what `auto` picks now. So the streamer's
+founding claim — *"Backpressure by design: the sender never queues binary
+frames"* — was true when it was written and silently false afterwards. This is
+the `--ws` impl swap `start.sh`'s comment was worried about; the pins guarded
+the ping VALUES, which turned out not to be the thing that mattered.
+
+**What it does.** A replay pushes the whole history into an unbounded transport
+buffer within seconds. The keepalive PING is written at the TAIL of that
+buffer, so it cannot be answered inside `--ws-ping-timeout`;
+`keepalive_timeout` fires `conn.fail(1011, "keepalive ping timeout")`, sets
+`close_sent`, and the SERVER has killed its own socket. Our next send then
+raises `RuntimeError: Unexpected ASGI message 'websocket.send', after sending
+'websocket.close'`. Two tells that identify this rather than a client
+departure: the kill lands at an exact multiple of the ping interval after
+accept (the 2026-08-05 journal shows 180 s, 40 s, 240 s, 40 s — all multiples
+of 20), and the `code=1006` in the disconnect log was a **hardcoded constant**
+in `_guard_send`, not a wire code. That constant sent a whole investigation
+after a red herring; it is now `None` and the message no longer says "client
+gone".
+
+**Reproduced and fixed, measured on the 3090.** `slowclient.py`-style harness:
+batch-compute 100 records at 4096² (32 MiB each), then replay while draining at
+the measured browser ceiling (110 MiB/s).
+
+| | rec/s | outcome |
+|---|---|---|
+| unpaced (before) | 3.20 | **socket killed at frame 84**, `sent 1011 keepalive ping timeout` |
+| credit, 24 MiB cap | 2.72 | all 100 delivered, −15% (stop-and-wait: the cap was below one frame) |
+| credit, 64 MiB cap | 3.21 | all 100 delivered, **the client's own receive rate** |
+
+So the correctness costs nothing once the window admits two records. The cap is
+`routers/stream.INFLIGHT_MAX_BYTES`; its size is set by what must drain before
+the queued PING (64 MiB is 0.6 s at the browser ceiling, 6.4 s even at a
+pathological 10 MiB/s, against a 20 s deadline). A record LARGER than the cap
+is still sent — the check runs with the queue empty, so it can never block the
+first frame — which just means one frame in flight, the least any transport can
+do. Cutting THAT is display downsampling's job, not the cap's.
+
+**The second half of the data loss: `WS_IDLE_TTL` was measured from the wrong
+instant.** It was 20 s, justified as "well above `recover()`'s ~1.5 s
+reattach" — which silently assumed the client learns of a close as soon as the
+server does. It does not: the close frame goes out at the tail of the same
+backlog, so a client with GiB queued sees it tens of seconds later. The journal
+correlates exactly — reconnects landing 22 s and 18 s after the server gave up
+kept their session; 24 s did not, and was swept, giving a 404, a fresh session
+id, and `0 / [0, 0]` with 100 computed records gone. Now 90 s. The grace must
+not depend on the backlog being small, even though the credit cap now makes it
+so. Three supporting changes: `recover()` probes immediately and backs off
+afterwards (the 1500 ms was paid up front for nothing); a reattach racing its
+predecessor's ~3 s teardown WAITS instead of returning 4409, which the client
+read as a plain close and answered with another reconnect; and the 404 path now
+SAYS a session was lost with how many records went with it, instead of swapping
+in an empty session in silence.
+
+**And `loop` could not loop from a frontier start.** `advance_cursor`'s wrap
+gate tested `loop_from < latest_complete`, but a finished batch run puts
+`loop_from` exactly AT the frontier (`set_running` captures `int(cursor)`), so
+it fell through to the pause and the checkbox silently did nothing — the
+reported "computed 100 records, played back, it stopped at the last record".
+It "worked the second time" only because the cursor then sat behind the
+frontier. A reconnect reaches the same state unattended, since detaching pauses
+the session and `recover()` re-issues `play`. It now falls back to the oldest
+retained record: an armed loop always loops. Pinned by
+`test_loop_wraps_even_when_the_pass_started_at_the_frontier`, which counts
+arrivals at the region START (at the frontier a dead loop reads as two passes).
+
+
 ## The cyclic-garbage bullet, as it stood before the split
 
 - **A closed session's history is CYCLIC garbage — freeing it needs the

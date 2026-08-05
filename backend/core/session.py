@@ -49,14 +49,23 @@ from .xp import resolve_devices
 log = logging.getLogger(__name__)
 
 # Grace before a DETACHED (no client) session is closed and its RAM+VRAM
-# freed. Measured from last_seen, which is stamped only on WS detach (and
-# creation), so this IS the post-departure grace. Kept well above recover()'s
-# ~1.5 s reattach (SimulatorView.vue) so a transient socket drop on a still-open
-# tab re-attaches (ws_attached=True re-shields it) before the sweeper fires; a
-# genuine departure is freed promptly instead — the frontend also sends a
-# keepalive DELETE on pagehide, so this is the fallback for the cases a beacon
-# cannot cover (crash, kill -9, network partition).
-WS_IDLE_TTL = 20.0
+# freed. Measured from last_seen, stamped on WS detach (and creation), so this
+# IS the post-departure grace. A genuine departure does NOT wait for it — the
+# frontend sends a keepalive DELETE on pagehide — so this is only the fallback
+# for what a beacon cannot cover: crash, kill -9, network partition.
+#
+# It was 20 s, and 20 s DESTROYED SESSIONS THAT WERE MERELY RECONNECTING. The
+# reasoning was "well above recover()'s ~1.5 s reattach", which silently
+# assumed the client learns of a close as soon as the server does. It does not:
+# the close frame is written at the TAIL of the transport buffer, so a client
+# with a backlog queued only sees it once that has drained. Measured from the
+# journal on 2026-08-05 at a large 1D grid — reconnects landing 22 s and 18 s
+# after the server gave up kept their session, and 24 s did not: swept, then
+# 404, then a fresh session id and "0 / [0, 0]" with 100 computed records gone.
+# The credit cap (protocol.AckCmd) removes the backlog that made the delay
+# tens of seconds, but the grace must not depend on that being true, so it is
+# now long enough to cover a slow reattach on its own.
+WS_IDLE_TTL = 90.0
 
 # How many records a fast variant worker may run ahead of the lockstep
 # frontier (the newest record ALL variants have landed on). Without a bound
@@ -264,7 +273,7 @@ class SessionClock:
             self._anchor = (len(self._t) - 1, self._t[-1])
             self._cond.notify_all()
 
-    def advance_cursor(self, elapsed, latest_complete, delivered):
+    def advance_cursor(self, elapsed, latest_complete, delivered, first=0):
         """Called by the streamer; returns the updated cursor. `delay`
         (seconds between played-back frames; 0 = as fast as the client
         renders) paces the DISPLAY only. Attached to the frontier while
@@ -274,9 +283,13 @@ class SessionClock:
         per `delay` seconds. A playback-only run (stop_at_frontier)
         auto-pauses at the frontier instead of rolling into computation —
         but only once the streamer has actually DELIVERED the frontier
-        record (`delivered` = newest record index sent): `elapsed` includes
-        time spent blocked in a send to a slow client, so the wall clock
-        alone can lump the cursor past records nobody has seen yet."""
+        record (`delivered` = the newest record the client has PAINTED once it
+        is acking, else the newest sent): `elapsed` includes time the sender
+        spent not getting frames out, so the wall clock alone can lump the
+        cursor past records nobody has seen yet.
+
+        `first` is history's oldest retained record — the loop's fallback
+        origin; see the wrap below."""
         with self._cond:
             if latest_complete >= 0:
                 if self.running and (self.stop_at_frontier or self.browsed):
@@ -286,7 +299,22 @@ class SessionClock:
                                       float(latest_complete))
                     if self.stop_at_frontier and delivered >= latest_complete \
                        and self.cursor >= latest_complete:
-                        if self.loop and self.loop_from < latest_complete:
+                        # WHERE to wrap to. loop_from is where this pass
+                        # started, so "again" means the region you asked to
+                        # watch — but it can EQUAL the frontier, and then the
+                        # old `loop_from < latest_complete` test fell through to
+                        # the pause and the checkbox silently did nothing. That
+                        # is reachable without touching anything: a socket drop
+                        # detaches (set_running(False)), recover() re-issues
+                        # `play` on its own, and set_running captures loop_from
+                        # from a cursor already sitting at the frontier. So fall
+                        # back to the oldest retained record and loop the whole
+                        # history rather than stopping: an armed `loop` must
+                        # always loop. Only a single-record range has nothing
+                        # to replay.
+                        origin = self.loop_from \
+                            if self.loop_from < latest_complete else first
+                        if self.loop and origin < latest_complete:
                             # Rewind instead of stopping. Same delivery gate as
                             # the pause below, so a slow client cannot be
                             # rewound past frames it has not been sent yet; and
@@ -295,7 +323,8 @@ class SessionClock:
                             # next tick re-attach it to the frontier and roll
                             # into computation — the exact confusion this
                             # feature exists to remove.
-                            self.cursor = float(self.loop_from)
+                            self.loop_from = origin
+                            self.cursor = float(origin)
                             self.loop_epoch += 1
                         else:
                             self.running = False
@@ -383,6 +412,23 @@ class SimSession:
         self._no_room_posted = False
         self.frame_evt = asyncio.Event()
         self.msgs = deque(maxlen=64)     # server->client JSON side channel
+        # Transport flow control — see protocol.AckCmd for why it has to be
+        # ours. `inflight` holds (record, nbytes) per frame handed to the
+        # transport but not yet acked; `paced` arms on the FIRST ack, so a
+        # client that never acks (ws_smoke, any raw consumer) streams exactly
+        # as it did before and nothing can deadlock waiting on a credit it
+        # will never get.
+        self.inflight = deque()
+        self.inflight_bytes = 0
+        self.acked = -1
+        self.paced = False
+        # Bytes written to this socket, and a rolling rate for status(). You
+        # cannot tune a transport you cannot see, and the browser-side
+        # __wfPerf figure alone cannot tell "the server sent less" from "the
+        # client received less".
+        self.sent_bytes = 0
+        self.sent_bytes_per_s = 0.0
+        self._sent_mark = (0, time.monotonic())
         # live parameter changes, in record order: an mp4 export prints the
         # ones inside its range, or its "how to reproduce this" block would
         # be a lie about the frames after the change
@@ -409,6 +455,43 @@ class SimSession:
             self.loop.call_soon_threadsafe(self.frame_evt.set)
         except RuntimeError:
             pass   # loop already closed during shutdown
+
+    def note_sent(self, k, nbytes):
+        """A frame bundle was handed to the transport (see protocol.AckCmd)."""
+        self.inflight.append((k, nbytes))
+        self.inflight_bytes += nbytes
+        self.sent_bytes += nbytes
+        n, mark = self._sent_mark
+        now = time.monotonic()
+        if now - mark > 1.0:
+            self.sent_bytes_per_s = (self.sent_bytes - n)/(now - mark)
+            self._sent_mark = (self.sent_bytes, now)
+
+    def note_ack(self, k):
+        """Client painted record k: retire it and everything sent before it.
+
+        Matches the LAST in-flight entry for k rather than the first, because
+        the record index is NOT monotonic across a loop wrap or a seek resend
+        (inflight can read [99, 0, 1]) — and everything ahead of a painted
+        frame has left the wire whether it was painted or dropped to newest,
+        since the client's queue is FIFO. An ack for a record no longer in
+        flight retires nothing, which is the right no-op.
+        """
+        self.paced = True
+        self.acked = max(self.acked, k)
+        hit = -1
+        for i, (rec, _) in enumerate(self.inflight):
+            if rec == k:
+                hit = i
+        for _ in range(hit + 1):
+            self.inflight_bytes -= self.inflight.popleft()[1]
+
+    def reset_inflight(self):
+        """A fresh socket has nothing in flight and has issued no credit."""
+        self.inflight.clear()
+        self.inflight_bytes = 0
+        self.acked = -1
+        self.paced = False
 
     def post_msg(self, d):
         self.msgs.append(d)
@@ -928,6 +1011,11 @@ class SimSession:
             "cursor": self.clock.cursor,
             "history_bytes": self.history.nbytes(),
             "history_cap_bytes": self.history.byte_cap,
+            # What this socket is actually costing. The browser's own
+            # __wfPerf.mib_per_s cannot distinguish "the server sent less"
+            # from "the client received less", and that distinction is the
+            # whole point of both the credit cap and display downsampling.
+            "sent_bytes_per_s": round(self.sent_bytes_per_s, 1),
             "devices": self.devices,
             # the LIVE expression: the setup form greys out "Apply live" when
             # its draft already equals it (a no-op is dropped anyway)

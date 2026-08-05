@@ -156,6 +156,15 @@ MAX_CELLS_2D = int(os.environ.get("WIGNERF_MAX_CELLS_2D", str(2**27)))
 # status() reports it for the Setup panel's footprint line.
 BYTES_PER_CELL_2D = {"float64": 176, "float32": 96}
 
+# The same figure at ndim=1, and it is NOT decorative: MAX_GRID is tunable up
+# to 16384, so a 1D worker can want far more than any card here has (8192^2 is
+# ~12 GiB) and _fit_error used to skip ndim=1 entirely on the grounds that
+# "MAX_GRID already bounds a 2D array to 4096^2 = ~3.0 GiB/worker" — true only
+# at the DEFAULT. Measured 2026-08-05 with `bench.py --ndim 1 --footprint
+# --precision both`: 192.1/104.1 B/cell, flat across 512^2-2048^2 and
+# unchanged by --relativistic, which is why one number per precision is honest.
+BYTES_PER_CELL_1D = {"float64": 192, "float32": 104}
+
 
 def max_grid(ndim):
     """Per-axis ceiling for this dimensionality."""
@@ -170,14 +179,17 @@ def max_cells(ndim):
 
 
 def bytes_per_cell(ndim, precision="float64"):
-    """Per-cell worker footprint, or None where nothing needs one.
+    """Per-cell worker footprint, measured per dimensionality and precision.
 
-    None at ndim=1 on purpose: MAX_GRID already bounds a 2D array to 4096^2, so
-    no 1D session needs a memory estimate to decide whether it can start, and a
-    number offered there would be one nobody had measured."""
-    if ndim == 1:
-        return None
-    return BYTES_PER_CELL_2D.get(precision, BYTES_PER_CELL_2D["float64"])
+    It used to be None at ndim=1, on the grounds that MAX_GRID bounded a 2D
+    array to 4096^2 so no 1D session could reach a size worth checking. That was
+    true of the DEFAULT and not of the setting: at WIGNERF_MAX_GRID=8192 a
+    single float64 worker wants ~12 GiB, and with no estimate here the device
+    fit check skipped 1D and the session started anyway — then a worker died
+    mid-run on a cupy OOM, which is the one outcome that guard exists to
+    replace. Both figures are reproducible from `bench.py --footprint`."""
+    table = BYTES_PER_CELL_1D if ndim == 1 else BYTES_PER_CELL_2D
+    return table.get(precision, table["float64"])
 
 
 EXPORT_DIR = os.environ.get(

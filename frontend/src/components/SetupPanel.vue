@@ -304,11 +304,13 @@ const overCells = computed(() =>
   props.maxCells != null && cells.value > props.maxCells)
 
 /**
- * Estimated device footprint. Shown for 2D ONLY, and not as decoration: at N^4
- * this is the number that decides whether a session starts at all, and finding
- * out by OOM after pressing Restart is the failure this line exists to prevent.
- * The per-card figure assumes the workers spread evenly over the pool, which is
- * what session.assign_devices does.
+ * Estimated device footprint, and not decoration: this is the number that
+ * decides whether a session starts at all, and finding out by OOM after
+ * pressing Restart is the failure this line exists to prevent. At N^4 that is
+ * obvious; at ndim=1 it took a worker dying on a cupy OOM at 8192^2 to notice
+ * that WIGNERF_MAX_GRID bounds a 1D grid to ~12 GiB/worker, not the ~3 its
+ * default suggests. The per-card figure assumes the workers spread over the
+ * pool the way session.assign_devices spreads them.
  */
 // CUDA context + cuFFT plan cache, per process per device. The frontend mirror
 // of routers/sessions.CONTEXT_BYTES — move both together. No FIT_MARGIN mirror
@@ -338,7 +340,7 @@ const CONTEXT_GIB = 300 / 1024
 const deviceLoad = computed(() => {
   const bpc = props.bytesPerCell
   const pool = wantDevices.value
-  if (ndim.value < 2 || !bpc || !pool?.length) return null
+  if (!bpc || !pool?.length) return null
   const per = cells.value * bpc / 1024 ** 3
   const nv = props.cfg.variants.length
   const k = Math.min(pool.length, nv)
@@ -370,10 +372,22 @@ const wontFit = computed(() => {
   })
 })
 
+/**
+ * Below this the 1D line is suppressed. At ndim=2 the estimate is ALWAYS worth
+ * showing — N^4 means a couple of clicks can take a grid from trivial to
+ * unstartable — but a 1D form sits at 64^2 by default, where "≈ 0.00 GiB per
+ * worker" is a line of noise in a 320px column that has to fit four axes. Half
+ * a GiB is where it starts deciding something: 1024^2 is 0.19 GiB and stays
+ * quiet, 2048^2 is 0.75 and speaks up. A grid that will not FIT says so at any
+ * size, which is the case this line exists for.
+ */
+const FOOTPRINT_MIN_GIB_1D = 0.5
+
 const footprint = computed(() => {
   const bpc = props.bytesPerCell
-  if (ndim.value < 2 || !bpc) return ''
+  if (!bpc) return ''
   const per = cells.value * bpc / 1024 ** 3
+  if (ndim.value < 2 && per < FOOTPRINT_MIN_GIB_1D && !wontFit.value) return ''
   const load = deviceLoad.value
   // The per-device figure only says something when more than one device is
   // actually USED. At one variant the split is 1×1, so "11.00 GiB per worker ·
@@ -629,9 +643,12 @@ function adoptLive() {
           <span class="text-fg-3">cells</span>
         </label>
       </div>
-      <!-- 2D only: what this grid will cost a card, BEFORE the restart that
-           would find out by OOM. Red once past the host's cell ceiling, which
-           is the refusal the create call would return. -->
+      <!-- What this grid will cost a card, BEFORE the restart that would find
+           out by OOM. Red once past the host's cell ceiling, which is the
+           refusal the create call would return. At either ndim since the device
+           fit check stopped skipping 1D — a 1D grid can be unaffordable too
+           (~12 GiB/worker at 8192^2) — but quiet below FOOTPRINT_MIN_GIB_1D,
+           where the number decides nothing. -->
       <p v-if="footprint" class="text-xs tabular-nums"
          :class="overCells || wontFit ? 'text-error' : 'text-fg-3'"
          :title="overCells

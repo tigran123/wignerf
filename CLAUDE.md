@@ -144,8 +144,8 @@ source) is what keeps startup fast. See `README.md`.
   lockstep-complete record (live, coalescing — slow clients skip frames) or
   exact sequential records (replay/scrub). Computation ALWAYS runs at full speed
   in both modes — neither the dial nor a slow client ever throttles the workers;
-  `delay` paces only the display. The dial's "0" position (default) means one
-  record per display refresh: the client measures its refresh interval
+  `delay` paces only the display. The dial's "0" (default) means one record per
+  display refresh: the client measures its refresh interval
   (lib/perf.ts) and sends that as the delay, and every dial position is clamped
   to at least it, so delivery never outpaces painting. **At 4096²/8192² that is
   NOT enough and there is deliberately no client-side pacing loop** — an
@@ -155,25 +155,44 @@ source) is what keeps startup fast. See `README.md`.
   browser's per-message receive cost, so the fix is smaller messages (display
   downsampling), not a smarter delay. Replay never skips a record; it slips on
   WS backpressure. The UI dial is "0" plus a log range 20 ms–1.5 s.
-  Client frame fan-out is rAF-timed (decode per message, paint one frame per
-  animation frame; small FIFO with drop-to-newest as a burst safety valve), so
-  texture uploads, uPlot updates and Vue reactivity run per PAINTED frame by
-  construction. That drop-to-newest is why the timeline readout shows painted/s
+  **THAT BACKPRESSURE IS OURS AND MUST STAY OURS** (`protocol.AckCmd`, 2026-08-05).
+  `ws.send_bytes` does NOT wait: uvicorn's `websockets-sansio` impl — what
+  `--ws auto` now picks — sets its `writable` event once and never clears it and
+  has no `pause_writing`/`resume_writing` at all. So a replay buffered the whole
+  history, the keepalive PING went out behind it, could not be answered inside
+  `--ws-ping-timeout`, and **the server killed its own socket** — every "streamer
+  send failed / disconnected" pair in that day's journal, at an exact multiple of
+  the ping interval after accept. The client therefore acks each
+  PAINTED record and the sender stops past `INFLIGHT_MAX_BYTES`, which must admit
+  ≥2 records or it degenerates to stop-and-wait. Pacing arms on the FIRST ack, so
+  a non-acking client (ws_smoke, any raw consumer) is unpaced.
+  `start.sh` pinned the ping VALUES against an impl swap and that was not what
+  mattered; an app-level credit cannot be swapped out. NB `_guard_send`'s old
+  `code=1006` was a HARDCODED CONSTANT, not a wire code, and it cost a whole
+  investigation. Measurements in `notes/session-lifecycle.md`.
+  Client frame fan-out is rAF-timed (decode per message, paint one per animation
+  frame; small FIFO with drop-to-newest as a burst valve), so texture uploads,
+  uPlot updates and Vue reactivity run per PAINTED frame by construction. That drop-to-newest is why the timeline readout shows painted/s
   AND received/s: when they diverge the client is SKIPPING records, which reads
   on screen as fast playback and is really loss — one number alone cannot tell
   the two apart, and the live path makes that worse by design (the `delay` gate
   applies only to replay while live coalesces to the newest record, so computing
-  legitimately animates faster than paced playback). A playback-only run must
+  legitimately animates faster than paced playback). It also shows the SERVER's
+  bytes/s (`status.sent_bytes_per_s`), the only number separating "the server
+  sent less" from "this client received less". A playback-only run must
   never coalesce to the frontier while sequential records are unsent, and its
   auto-pause is delivery-aware — it fires only after the frontier record was
-  SENT.
+  **PAINTED** (the client's newest ack), else the newest sent for a client that
+  does not ack. "Sent" was the honest best available before the credit below,
+  but with no transport backpressure it meant "buffered", so the gate that
+  exists to stop the cursor outrunning unseen records read a number that had.
   **`loop` repeats that pass instead of pausing** (`LoopCmd`, a checkbox beside
   Solve/Play/Pause, echoed in `status`). It exists because the auto-pause is
   correct but easy to walk into: playback stops at the frontier, the button
-  becomes "Solve", and the Space that was replaying a second ago now COMPUTES.
-  It is a DISPLAY policy like `delay` and rewinds to `loop_from`, the cursor
-  captured when the pass STARTED, so "again" means the region you asked to watch
-  rather than all of history. Two things are load-bearing: it reuses the
+  becomes "Solve", and the Space that replayed a second ago now COMPUTES. A
+  DISPLAY policy like `delay`, it rewinds to `loop_from` — the cursor captured
+  when the pass STARTED — so "again" means the region you asked to watch, not
+  all of history. Two things are load-bearing: it reuses the
   auto-pause's delivery gate, so a slow client is never rewound past frames it
   has not been sent; and `browsed` stays True across the wrap, or the next tick
   re-attaches to the frontier and rolls into computation. **Rewinding `cursor`
@@ -184,10 +203,18 @@ source) is what keeps startup fast. See `README.md`.
   failure — the live frame already in flight when the seek was sent is itself
   the frontier, so a dead loop reads as two passes; count arrivals at the START.
   Pinned by `test_loop_replays_the_same_region_instead_of_stopping`.
+  **AN ARMED `loop` ALWAYS LOOPS, including when `loop_from` IS the frontier.**
+  The wrap gate was `loop_from < latest_complete`, which a FINISHED BATCH run
+  fails by construction — there play at the frontier is playback, not Solve, so
+  `set_running` captures `loop_from = int(cursor) = frontier` — and it fell
+  through to the pause, the checkbox silently doing nothing. A reconnect reaches
+  that state unattended: detaching pauses and `recover()` re-issues `play`. It
+  now falls back to the oldest RETAINED record. Pinned by
+  `test_loop_wraps_even_when_the_pass_started_at_the_frontier`.
   The transport must stay responsive under full frame backpressure: control JSON
-  is flushed BEFORE frame sends each tick, play/pause are echoed immediately,
-  replay batches are wall-clock-budgeted (~0.2 s) and preempted by pause/seek,
-  and the client flips the transport button optimistically. The delay dial is
+  is flushed BEFORE frame sends each tick, play/pause are echoed at once, replay
+  batches are wall-clock-budgeted (~0.2 s) and preempted by pause/seek, and the
+  client flips the transport button optimistically. The delay dial is
   settable only while PAUSED and its thumb is local UI state, re-synced from
   status when idle. Binary layout in `core/protocol.py`, mirrored by
   `frontend/src/lib/protocol.ts` and cross-checked via `scripts/gen_fixture.py`
@@ -249,20 +276,19 @@ source) is what keeps startup fast. See `README.md`.
   `WIGNERF_MAX_GRID` (`capped` warning, keep computing; pure moves still work at
   the cap).
   Geometry is a PER-RECORD fact: protocol headers carry the axis counts and
-  extents, history stores geom per record, the streamer packs from the record
-  (never the session), and the frontend follows the PAINTED frame (panels/
-  overlays/marginal axes re-derive per frame; zoom windows remap to the same
-  physical region) — so scrubbing across a regrid boundary just works. Each
+  extents, history keeps geom per record, the streamer packs from the record
+  (never the session), and the frontend follows the PAINTED frame (panels,
+  overlays and marginal axes re-derive per frame; zoom windows remap to the same
+  physical region), so scrubbing across a regrid boundary just works. Each
   doubling ≈ 4× step cost and 4× bytes/record.
 - **Export panel** (header button "⤓ export") carries two things: the mp4
   below, and the run's SETUP — `GET /sessions/{id}/setup` serves
   `describe.setup_document`, the config the session was CREATED with
   (`state_at(cfg, log, -1)` rewinds every live change; live changes are
   deliberately not part of a starting state — the video's metadata block is
-  where they are recorded). Import fills the setup form and marks the
-  session restart-dirty, never restarts by itself (`lib/config.importConfig`,
-  in-place merge on the reactive cfg), and accepts that .json OR an exported
-  .mp4: `lib/mp4meta.ts` scans the file's head for the same document in the
+  where they are recorded). Import fills the setup form and marks the session
+  restart-dirty, never restarts by itself (`lib/config.importConfig`, in-place
+  merge on the reactive cfg), and accepts that .json OR an exported .mp4: `lib/mp4meta.ts` scans the file's head for the same document in the
   `comment` tag (faststart keeps it there — byte ~3.5k), so a kept video is
   self-restoring. Its confirmation line says `press "Restart session" to run
   it` and NOT "or Solve" — an import moves grid/IC/variants, which are
@@ -445,12 +471,12 @@ source) is what keeps startup fast. See `README.md`.
   was just handed and never repoints those (`DEFAULT_IC_EXPR[1].psi` is itself a
   legal 2D expression, so on a page load or an import the proxy discarded text
   the user had typed, or the document had carried).
-  **The BOX follows the same "only if untouched" rule, and for a sharper
-  reason**: a still-default box is replaced by the TARGET ndim's default,
-  because carrying [-6,6] into 2D reproduces exactly what `DEFAULT_AXES[2]` was
-  widened to [-8,8] to avoid — the edge band is max(4, N/32) CELLS, so at N=64
-  the 4-cell floor makes it only 4.60σ from the default packet, and a FRESH 2D
-  default tripped its own boundary warning on the first Restart. A box the user
+  **The BOX follows the same "only if untouched" rule, for a sharper reason**: a
+  still-default box is replaced by the TARGET ndim's default, because carrying
+  [-6,6] into 2D reproduces exactly what `DEFAULT_AXES[2]` was widened to [-8,8]
+  to avoid — the edge band is max(4, N/32) CELLS, so at N=64 the 4-cell floor
+  leaves only 4.60σ from the default packet, and a FRESH 2D default tripped its
+  own boundary warning on the first Restart. A box the user
   CHOSE still carries over untouched: silently widening someone's domain is
   worse than a warning. **N lands inside the TARGET's own select list**: their
   own choice when it is offerable there, capped at that ndim's default, and the
@@ -493,8 +519,7 @@ source) is what keeps startup fast. See `README.md`.
   auto-commits to `cfg.potential` from `compile()`'s success path, gated on the
   server's verdict (a half-typed `x^2/` must never reach `cfg`, which is
   persisted and is what a restart computes from) and on the response still
-  describing the CURRENT text. So U(x) no longer marks the session
-  restart-dirty at all.
+  describing the CURRENT text. So U(x) is not restart-dirtying at all.
   **Solve carries the form's U(x).** `SimulatorView.sendCommand` pushes
   `set_params {U: cfg.potential}` before a `play` whose action is `solve`,
   whenever the form's validated U differs from `status.potential`. Without it
@@ -510,8 +535,8 @@ source) is what keeps startup fast. See `README.md`.
   standing paragraph** (see [no-mystery-disabled-controls]).
   The setup form gates the transport: while the potential draft is invalid for
   the active variant families or the IC preview errors, Solve (button AND Space)
-  is disabled and "Apply live" is greyed — a computation must never run behind a
-  visibly broken form.
+  is disabled and "Apply live" greyed — nothing may compute behind a visibly
+  broken form.
   **Every saturated action button carries `.wf-solid`** (`style.css`): it
   supplies `color: #fff` — those buttons never set a text colour, they INHERITED
   the shell's light text, which went invisible ("black on blue") the moment the
@@ -680,7 +705,7 @@ Throughput, RTX 3090: ~2400 steps/s at 512², ~550 at 1024², ~134 at 2048²;
 4-worker lockstep at 1024² measured 135 steps/s all-on-3090 against 191 split
 2+2 (+41%, and 2+2 beats 3+1's 181 — the even chunk is right).
 
-**WHETHER A 2D SESSION STARTS IS DECIDED BY ASKING THE DRIVER, not by a cell
+**WHETHER A SESSION STARTS IS DECIDED BY ASKING THE DRIVER, not by a cell
 count** (`routers/sessions._fit_error`) — **and since M3 the same question is
 asked again whenever auto-expand wants to DOUBLE the grid.** The arithmetic
 behind both lives in `core/fit.py` so the two cannot drift; the messages do not,
@@ -688,15 +713,24 @@ because the create-time advice ("drop a variant, change device") is unavailable
 mid-run. `WIGNERF_MAX_CELLS_2D` is only a rail: the operative check runs
 `assign_devices` to learn which devices this session's workers land on, counts
 the workers per device, and compares
-`n·cells·BYTES_PER_CELL_2D + CONTEXT_BYTES` (300 MiB of CUDA context + cuFFT
+`n·cells·bytes_per_cell(ndim, precision) + CONTEXT_BYTES` (300 MiB of CUDA context + cuFFT
 plan cache, per process per device) against `xp.device_free_bytes(dev)` ×
 `FIT_MARGIN` (0.9). Free memory comes from the driver (`mem_info`), or from
 `MemAvailable` for `cpu`, so whatever else is on the card is already counted.
 Two properties are load-bearing: **the SMALLER card binds**, which no
 per-session cell count can express; and **unknown free memory does NOT refuse**,
-because there the rail is the only guard and guessing would be worse. Skipped at
-ndim=1, where `WIGNERF_MAX_GRID` already bounds a worker. Pinned by
-`test_the_device_fit_check_is_the_operative_2d_guard`.
+because there the rail is the only guard and guessing would be worse.
+**IT RUNS AT EVERY ndim SINCE 2026-08-05.** It used to skip ndim=1 "because
+`WIGNERF_MAX_GRID` already bounds a worker" — true of that var's DEFAULT (4096²,
+~3.0 GiB) and not of the var, which is tunable to 16384 and which `wignerf.env`
+sets to 8192, i.e. ~12 GiB/worker against an 11 GiB 2080 Ti. An unguarded 1D
+session duly started and then killed a worker with a cupy OOM mid-run, the exact
+outcome this guard replaces with a sentence at the door. Measured 192/104 B/cell
+at ndim=1 (`bench.py --ndim 1 --footprint`, flat across sizes and unchanged by
+`--relativistic`), so `config.bytes_per_cell` is keyed by ndim as well as
+precision and `/api/device` reports both. **A gate can carry a stale REASON:
+re-measure the claim it rests on, not only the risk it names** — the M1–M4 lesson
+firing again. Pinned by `test_the_device_fit_check_is_the_operative_guard`.
 
 **Its refusal describes the POOL, and the ROOMIEST device decides which of two
 stories it tells.** If the per-worker footprint exceeds EVERY device's budget it
@@ -774,7 +808,7 @@ the free/reserved readings behind every claim here — are in
 | `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`); a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
 | `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, and `setNdim` asks the same function). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`): **192 B/cell in float64 and 104 in float32** since M7 — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², plus ~300 MiB of CUDA context per process per device. These are HIGHER than step-loop figures and that is not a regression: a step loop misses `adjust_step`'s transient and the frame build. Workers spread over the pool, so what matters is the per-card share — 4 variants at 8192² is ~24 GiB/card at 2+2, which does **not** fit even the 3090, so cap by variant count and not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
 | `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all. What actually binds is the per-device fit check, `routers/sessions._fit_error` (see the GPU section). **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree until the restart. Reading them off `status` broke the panel in BOTH directions (a 2D form offering N up to 4096 with no footprint line at all, and a 1D form's select collapsing to one option). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted for that reason, since both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling.** **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis, so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API. **`AXIS_N_FLOOR` is shared with `setNdim`, and that is the whole point of it being a constant**: a dims switch lands N *inside the target's list* — their own choice when offerable, else that ndim's DEFAULT, everything clamped by the target's cap. Capping from ABOVE alone was wrong the other way: 1D → 2D → 1D brought the 2D choice back, so the select rendered with a HOLE in it and a 1D session ran at 64². Falling back to the FLOOR is its quieter twin. Pinned in `config.test.ts`. |
-| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values, and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, far past any card here, and a fixed cell count is wrong in both directions (refusing 128×128×64×64 on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one). The real check asks the driver. Measured with `bench.py --ndim 2 --footprint`, which runs a whole worker record rather than a step loop: **176 B/cell in float64 and 96 in float32 (55%)**, both flat across sizes and both identical for the relativistic variants — 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ in float64. So 4 variants at 64⁴ split 2+2 is ~5.5 GiB/card in float64, and **80⁴ is reachable only in float32**. **The STATE is only 5% of that** — W is real, so float64 = 8 B/cell — and the rest is the step's machinery at full shape. `config.BYTES_PER_CELL_2D` carries the stage-by-stage breakdown and is **keyed by precision** (`config.bytes_per_cell(ndim, precision)`) because `_fit_error` reads it: a flat float64 figure there would refuse precisely the grids float32 makes affordable. Throughput on the 3090: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run**. Both the rail's refusal and the fit check quote the estimate, and `/api/device`'s `bytes_per_cell_2d` feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart. |
+| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values, and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, far past any card here, and a fixed cell count is wrong in both directions (refusing 128×128×64×64 on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one). The real check asks the driver. Measured with `bench.py --ndim 2 --footprint`, which runs a whole worker record rather than a step loop: **176 B/cell in float64 and 96 in float32 (55%)**, both flat across sizes and both identical for the relativistic variants — 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ in float64. So 4 variants at 64⁴ split 2+2 is ~5.5 GiB/card in float64, and **80⁴ is reachable only in float32**. **The STATE is only 5% of that** — W is real, so float64 = 8 B/cell — and the rest is the step's machinery at full shape. `config.BYTES_PER_CELL_2D` carries the stage-by-stage breakdown and is **keyed by precision** (`config.bytes_per_cell(ndim, precision)`) because `_fit_error` reads it: a flat float64 figure there would refuse precisely the grids float32 makes affordable. Throughput on the 3090: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run**. Both the rail's refusal and the fit check quote the estimate, and `/api/device`'s `bytes_per_cell` (per ndim, per precision) feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — at either ndim, though the 1D line stays quiet under 0.5 GiB where the number decides nothing. |
 
 ## Commands
 
@@ -1020,7 +1054,7 @@ the claim it rests on and not only the risk it names.
   `$p_x$` is five characters that draw as two glyphs, so which characters land
   on which line has to be decided by the plain text. **And it must not break a
   line MID-FACT**: each group is joined with `_NB` and `_emit` restores real
-  spaces after wrapping, which has to be a character `textwrap` cannot see as
+  spaces after wrapping — it must be a character `textwrap` cannot see as
   whitespace at all (a Unicode NBSP is `\s`, so it does not work). A test for
   this must check **per line**. `_wrap` also passes `break_on_hyphens=False`,
   which is the same rule for a break `_NB` cannot reach: a minus sign is not a
@@ -1040,17 +1074,16 @@ the claim it rests on and not only the risk it names.
   invisible at ndim=1 where the axis names are single letters. `None` is the
   signal `_emit` already had for "there is no typeset twin".
   **The header readout and the block deliberately DISAGREE**: the header's
-  geometry follows the PAINTED record as the SPA does, while the block's is
-  labelled "at record k0" and stays there.
+  geometry follows the PAINTED record as the SPA does; the block's is labelled
+  "at record k0" and stays there.
   **THE BLIT DECIDES WHERE STATIC ART MAY LIVE.** `update()` restores the static
   background and then `draw_artist`s the images on top, so anything static drawn
   INSIDE the axes box is painted over every frame — which is why the panel grid
   lines are in `_dynamic` and ordered after the images, and why the per-panel
-  scale caption (used past `CBAR_MAX_CELLS` = 8 panels) lives in the panel's
+  scale caption (past `CBAR_MAX_CELLS` = 8 panels) lives in the panel's
   `loc="right"` TITLE, outside the axes box. Its first version sat in the corner
   of the heatmap and rendered as NOTHING.
-  **COST: 2D is CHEAPER per frame than 1D**, 6.4 fps for the full 24-panel
-  matrix against 1D's ~9-10 for 4 panels, because a 2D plane is at most 128×128
+  **COST: 2D is CHEAPER per frame than 1D** — a 2D plane is at most 128×128
   where a 1D W is up to 4096².
 - **AUTO-EXPAND IN 2D (M3): the orchestration was free and the GUARD is the
   whole feature.** `core/fit.py` is the create-time check asked again mid-run,
@@ -1313,31 +1346,30 @@ the claim it rests on and not only the risk it names.
   **Adaptive retuning is a NON-COMMITTING boundary probe** — `adjust_step`
   selects the cap before a record and its trial state and pair are DROPPED, so
   the cached pair always belongs to `_substep`'s quotient. Storing the pair, as
-  the old code did for free, is the second slot resurrected once per adjust.
+  the old code did for free, resurrects the second slot once per adjust.
   **`_substep` caches its plan against `t_tgt`, and without it the milestone
   BACKFIRES**: `rem` shrinks as the record is walked, so recomputing `rem/n`
-  returns sizes differing in the last ulps — distinct float keys, so the one
-  slot misses on nearly every step (measured 5 sizes and 22 rebuilds over three
-  records, against one cached pair per record). A stale plan is as wrong as a
-  stale exponent, so `_exp_clear` drops both together; every site that
-  invalidates one must invalidate the other.
+  returns sizes differing in the last ulps — distinct float keys, so the one slot
+  misses on nearly every step (5 sizes and 22 rebuilds over three records,
+  against one cached pair). A stale plan is as wrong as a stale exponent, so
+  `_exp_clear` drops both together; every site invalidating one invalidates the
+  other.
   **Because the size is cached, `_advance` iterates on the substep COUNT and
-  must never go back to summing toward τ_k.** The pre-M7 loop could exit on
+  must never go back to summing toward τ_k.** The pre-M7 loop exited on
   `|τ_k − t| > eps` because its last step was clamped and therefore
   self-correcting; a cached size has no such step, so once n accumulations land
   further than eps from the target the loop takes ANOTHER full substep and
-  marches past τ_k forever — measured 11.5 million substeps for a record wanting
-  50000, an unkillable spin with no error and no emitted record. Pinned by
+  marches past τ_k forever — 11.5 million substeps for a record wanting 50000,
+  an unkillable spin with no error and no emitted record. Pinned by
   `test_a_record_that_needs_many_substeps_still_terminates`.
   **M7 buys MEMORY, not speed** — the production rebuild count is at most one
   per record either way; do not let the halved slot count imply a halved rebuild
   rate.
   **What the physics suite cannot see**: `test_propagator*.py` and
-  `test_precision.py` drive `Propagator` directly through a private fixed-dt
-  `evolve()` helper, so they never enter `_advance` — all 72 items were bitwise
-  unchanged by M7 and would be just as unchanged by a scheduler that never
-  landed on τ_k. `tests/test_substep.py` exists for that gap, and it caught the
-  missing plan cache.
+  `test_precision.py` drive `Propagator` through a private fixed-dt `evolve()`
+  helper, so they never enter `_advance` and would be just as unchanged by a
+  scheduler that never landed on τ_k. `tests/test_substep.py` exists for that
+  gap, and it caught the missing plan cache.
 - **`close()` must tear the streamer down, or the whole FrameHistory leaks.**
   The `ws_endpoint` coroutine holds `s` (hence its entire history) as a local;
   `close()` pops the session from `SESSIONS` and stops its workers but the
@@ -1363,10 +1395,10 @@ the claim it rests on and not only the risk it names.
   A tab close / reload / navigate sends NO `DELETE` (Vue's `onBeforeUnmount`
   does not run on a real unload): the backend learns only via the WS close,
   whose `finally` merely *pauses + detaches* — it never calls `close()`. So the
-  session lingers in `SESSIONS` with alive-but-idle workers holding the full
-  `FrameHistory` (RSS) and each worker's CuPy pool + cuFFT cache + exponent
-  meshes (VRAM) until the sweeper reaps it, and a reload creates a NEW session
-  at once, so it competes with its own just-orphaned twin. THREE-part fix:
+  session lingers with alive-but-idle workers holding the full `FrameHistory`
+  (RSS) and each worker's CuPy pool + cuFFT cache + exponent meshes (VRAM) until
+  the sweeper reaps it, and a reload creates a NEW session at once that competes
+  with its just-orphaned twin. THREE-part fix:
   (1) the frontend fires a `keepalive` `DELETE` on `pagehide`
   (`useSession.beaconDestroy`; skips `event.persisted` bfcache) — safe against
   `recover()`, which is a live-tab `sock.onclose`, never a pagehide. The
@@ -1378,54 +1410,63 @@ the claim it rests on and not only the risk it names.
   client was attached, the `ws_endpoint` streamer coroutine still unwinding.
   So `_collect_closed` keeps `_closed_since_sweep` ARMED while any `weakref` in
   `_closed_refs` is still alive. Clearing it unconditionally meant a collect
-  that ran a beat before the streamer released left the flag down and the
-  multi-GB history sat resident until a chance gen-2 gc (the observed "RSS stuck
-  at 13.2 GB, nothing in the logs"). Pinned by
+  running a beat before the streamer released left the flag down and the multi-GB
+  history sat resident until a chance gen-2 gc ("RSS stuck at 13.2 GB, nothing in
+  the logs"). Pinned by
   `test_collect_stays_armed_while_a_closed_session_is_rooted`. VRAM comes back
   at worker-join inside `close()`.
-  (2) `WS_IDLE_TTL` is 20 s, swept every 5 s, so the crash/kill fallback is
-  bounded at ~20-25 s and still well above `recover()`'s ~1.5 s reattach.
+  (2) `WS_IDLE_TTL` is **90 s**, swept every 5 s. It was 20 s, justified as
+  "well above `recover()`'s ~1.5 s reattach" — which assumed the client learns of
+  a close as soon as the server does. **It does not**: the close frame is written
+  at the TAIL of the transport buffer, so a client with a backlog sees it tens of
+  seconds later, and a reattach that lost that race got a 404, a new session id
+  and `0 / [0, 0]` — 100 computed records gone. The credit cap removes the
+  backlog, but this grace must not DEPEND on that. Three supports: `recover()`
+  probes immediately and backs off after; a reattach racing its predecessor's
+  ~3 s teardown WAITS rather than returning 4409, which the client read as a
+  plain close and answered with another reconnect; and the 404 path SAYS a
+  session was lost, with how many records went with it.
   (3) `start.sh` PINS `--ws-ping-interval/timeout 20` (matching uvicorn's
   current defaults) so a HALF-OPEN drop — kill -9, laptop sleep, network
   partition, no TCP FIN — is detected by the keepalive and closed, running the
-  `finally` instead of `receive_text()` blocking forever; that bounds the case
-  at ~60 s. Explicit only so the keepalive cannot silently regress. The 20 s
-  grace is pinned by
-  `test_detached_session_swept_after_grace_attached_is_shielded`.
+  `finally` instead of `receive_text()` blocking forever; bounded at ~60 s. Explicit so the keepalive cannot silently regress — though it is that
+  same keepalive which killed the socket above when a PING queued behind a
+  backlog, so these pins were necessary and never sufficient. Pinned by
+  `test_detached_session_swept_after_grace_attached_is_shielded` (behaviour, not
+  the number) and `test_a_reattach_waits_for_the_previous_streamer_to_let_go`.
 - **The BROWSER'S WebSocket receive path is the large-grid wall, and it
   degrades with MESSAGE SIZE — not the server, not painting, not pacing.**
-  Measured at 4096² (32 MiB/record): the client reported 3.5 records/s with
-  `queue_drops: 0` and 8.7 ms/frame of fan-out — i.e. it could paint ~115 fps
-  and was idle, waiting on delivery — while the SAME server fed a raw Python
-  client on the same machine at 402 MiB/s. Two runs of different length reported
-  110.91 and 112.77 MiB/s: a hard ceiling, not a loop settling. But it is NOT a
-  fixed bandwidth — at 2048² the same browser sustains ≥480 MiB/s, 4× better —
-  so the cost is per-message and grows sharply with payload size. **This is the
-  measurement that makes display-downsampling the only real fix for interactive
-  4096²/8192², and why no pacing policy can help**: a pacer targets paint time
-  (8.7 ms), 33× off the real constraint. Also measured: a full-speed replay
-  makes server RSS hump ~3 GB and drain back (the sender running ahead into the
-  in-flight send queue — transient, not a leak), and `pack_frame` costs 28 ms/
-  record at 4096² ON THE EVENT LOOP. Numbers in `notes/session-lifecycle.md`.
+  At 4096² (32 MiB/record) the browser tops out at ~112 MiB/s with
+  `queue_drops: 0` and 8.7 ms/frame of fan-out — idle, waiting on delivery —
+  while the same server feeds a raw Python client at 402 MiB/s. It is NOT a
+  fixed bandwidth: at 2048² that browser sustains ≥480 MiB/s, so the cost is
+  per-message and grows sharply with payload size. **This is what makes
+  display-downsampling the only real fix for interactive 4096²/8192², and why no
+  pacing policy can help** — a pacer targets paint time, 33× off the real
+  constraint. Also: `pack_frame` costs 28 ms/record at 4096² ON THE EVENT LOOP.
+  NB the "~3 GB RSS hump on a full-speed replay, transient, not a leak" recorded
+  here in 2026-07-23 was the UNBOUNDED TRANSPORT BUFFER — bounded now by the
+  credit cap, and the same backlog that was killing the socket. Numbers and that
+  correction in `notes/session-lifecycle.md`.
 - **Two more things kept a closed session's RAM resident, both found only by
-  measuring RSS across a Restart.** (1) `ttl_sweeper` iterated `SESSIONS`
-  inline, and a `for` target outlives its loop — so the sweeper held the LAST
-  session it examined across its sweep sleep, and FOREVER once SESSIONS emptied,
-  because an empty loop never rebinds the name. The loop now lives in
-  `_sweep_idle`, whose frame dies on return (pinned structurally by
+  measuring RSS across a Restart.** (1) a `for` target outlives its loop, so
+  `ttl_sweeper` iterating `SESSIONS` inline held the LAST session it examined
+  across its sweep sleep — and FOREVER once SESSIONS emptied, since an empty loop
+  never rebinds the name. The loop lives in `_sweep_idle`, whose frame dies on
+  return (pinned structurally by
   `test_ttl_sweeper_never_binds_a_session_in_its_own_frame`). (2) glibc's mmap
-  threshold is DYNAMIC — 128 KiB initially, ratcheting up to the size of each
-  freed mmap'd block, capped at 32 MiB — so records just under that cap come
-  from the arena and `free()` never lowers RSS; `_collect_closed` calls
-  `malloc_trim(0)`. **Record size decides which of these you see**, so test
-  memory at more than one grid: 4096² looked clean while 2048² sat at ~9.8 GB
-  after two Restarts. Figures in `notes/session-lifecycle.md`.
+  threshold is DYNAMIC (128 KiB, ratcheting up to each freed mmap'd block, capped
+  at 32 MiB), so records just under that cap come from the arena and `free()`
+  never lowers RSS; hence `_collect_closed`'s `malloc_trim(0)`. **Record size
+  decides which of these you see**, so test memory at more than one grid: 4096²
+  looked clean while 2048² sat at ~9.8 GB. Figures in
+  `notes/session-lifecycle.md`.
 - **A closed session's history is CYCLIC garbage — freeing it needs the
   collector, not refcounting.** `SimSession.workers` holds each `SolverWorker`
   and `worker.session` holds the session back, so after `close()` the pair (and
   the whole `FrameHistory` hanging off it) is unreachable but not refcount-free.
-  On an otherwise idle server a gen-2 collection may not run for many minutes,
-  so tens of GB stay resident long after Restart and look EXACTLY like a leak.
+  On an idle server a gen-2 collection may not run for many minutes, so tens of
+  GB stay resident long after Restart and look EXACTLY like a leak.
   `session._collect_closed()` makes it deterministic: `close()` sets
   `_closed_since_sweep` and the TTL sweeper does one `gc.collect()` per sweep
   that had a close (off the event loop; collection cost scales with tracked
@@ -1435,13 +1476,12 @@ the claim it rests on and not only the risk it names.
   if the back-reference is ever removed that test fails loudly rather than
   silently keeping a now-pointless collect.
 - **Do not chase "leaked" objects with `gc.get_referrers` alone — it cannot
-  see frame locals.** A referrer snapshot must exclude its OWN containers, and
-  in CPython 3.12 `gc.get_referrers` does NOT report an object held by a plain
-  local variable (fast locals are invisible unless `f_locals` was materialized)
-  — so "no coroutine frame holds it" is a conclusion that instrument can never
-  support. Use a `weakref` + explicit `gc.collect()` to decide whether something
-  leaked, and thread stacks (`sys._current_frames()`) to find who is still
-  running. The 2026-07-23 hunt that established this is in
+  see frame locals.** In CPython 3.12 it does NOT report an object held by a
+  plain local (fast locals are invisible unless `f_locals` was materialized), so
+  "no coroutine frame holds it" is a conclusion that instrument can never
+  support; a snapshot must also exclude its OWN containers. Use a `weakref` +
+  explicit `gc.collect()` to decide whether something leaked, and
+  `sys._current_frames()` to find who is still running. The hunt is in
   `notes/session-lifecycle.md`; every real lifecycle path leaks nothing once
   collected.
 - **The boundary warning is ONE SHORT LINE, and the cells it names are
@@ -1504,14 +1544,14 @@ the claim it rests on and not only the risk it names.
   it had just declined to repeat. The ψ/φ traces were the casualty. The
   wavefunction call has its own counter AND its own `lastWaveBody`, because it
   depends on `cutAxis` and the W preview does not: sharing one key made the 2D
-  cut selector INERT — the W body was byte-identical, `refresh` returned at the
-  de-dup, and `refreshWave` below it was never reached. **And a de-dup key must
+  cut selector INERT — the W body was byte-identical, so `refresh` returned at
+  the de-dup and `refreshWave` below it was never reached. **And a de-dup key must
   be cleared when the request FAILS**, or a transient error is permanent: the
   identical body de-dups out and nothing can retry it.
   **And a failed ψ sample SAYS SO.** It gates nothing (the W response owns the
-  Solve gate) but it must not blank two charts in silence. Their titles are
-  built from the CUT rather than from the response for the same reason — a title
-  that degrades whenever the data does turns a failed request into apparent rot.
+  Solve gate) but it must not blank two charts in silence. Their titles come from
+  the CUT rather than the response for the same reason — a title that degrades
+  whenever the data does turns a failed request into apparent rot.
   **A failed W preview must also CLEAR what the previous one left**: the
   warnings, the deficit, the norm readout and the emitted edge finding all
   describe a state that no longer exists, and leaving them put a stale ⚠ above
@@ -1556,18 +1596,18 @@ the claim it rests on and not only the risk it names.
   Measurements and the browser reproductions are in `notes/ui-notices.md`.
 - **The header's TRANSIENT notices are an absolute overlay, not flow content —
   the W panels must never move because a message arrived.** `restartNeeded`,
-  `boundaryText`, `paramFlash` and `regridFlash` live in an
-  `absolute left-0 right-0 top-full z-30` strip anchored to the `relative`
-  header, so they are out of the vertical flow in BOTH layouts; as inline
-  children each arrival wrapped the header and moved the panels 32 px. The trade
-  is deliberate: the strip OVERLAYS the top ~24 px of the columns, i.e. briefly
-  hides a panel's label chip and the first plot's title — chrome, never data —
-  which is much cheaper than relaying out the thing being watched, and it is
-  dismissible. Full width so no message has to be truncated to fit.
+  `boundaryText`, `paramFlash`, `regridFlash` and the lost-session notice live in
+  an `absolute left-0 right-0 top-full z-30` strip anchored to the `relative`
+  header, out of the vertical flow in BOTH layouts; as inline children each
+  arrival wrapped the header and moved the panels 32 px. The trade is
+  deliberate: the strip OVERLAYS the top ~24 px of the columns, briefly hiding a
+  panel's label chip and the first plot's title — chrome, never data — far
+  cheaper than relaying out the thing being watched, and dismissible. Full width
+  so no message need be truncated.
   **The float32 badge stays inline on purpose** (a permanent property of the
   session, set before there is anything to watch), and so does `createError` —
   but INSIDE the header; see the failed-restart bullet. Do not "tidy" these back
-  into the header row. Measurements in `notes/ui-notices.md`.
+  in. See `notes/ui-notices.md`.
 - **A FAILED restart leaves the app session-less, and three things used to hide
   that.** `useSession.create` calls `destroy()` BEFORE it posts, so a 422
   deletes the old session and leaves `info`/`status` null with the form intact.

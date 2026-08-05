@@ -45,8 +45,14 @@ _ap.add_argument("--ndim", type=int, default=1, choices=[1, 2],
 _ap.add_argument("--precision", default=None, choices=["float64", "float32"],
                  help="spectral working precision; omitted by default so the "
                       "host's WIGNERF_PRECISION decides, as the SPA does")
+_ap.add_argument("--no-ack", action="store_true",
+                 help="do not return frame credit (core.protocol.AckCmd). The "
+                      "server only paces a client that has acked at least "
+                      "once, so this exercises the UNPACED path a raw consumer "
+                      "gets; the default acks, like the SPA")
 _opts = _ap.parse_args()
 BASE, NDIM, PRECISION = _opts.base, _opts.ndim, _opts.precision
+ACK = not _opts.no_ack
 
 if NDIM == 1:
     CFG = {
@@ -114,6 +120,11 @@ async def main():
                     f = protocol.unpack_frame(m)
                     frames.append(f)
                     by_rec[f.record] = f
+                    if ACK:
+                        # stand in for the SPA's per-painted-frame credit, so
+                        # the paced path is what this smoke test measures
+                        await ws.send(json.dumps({"type": "ack",
+                                                  "record": f.record}))
                 else:
                     d = json.loads(m)
                     if d["type"] == "error":
@@ -154,6 +165,9 @@ async def main():
                 m = await asyncio.wait_for(ws.recv(), timeout=10)
                 if isinstance(m, (bytes, bytearray)):
                     f = protocol.unpack_frame(m)
+                    if ACK:
+                        await ws.send(json.dumps({"type": "ack",
+                                                  "record": f.record}))
                     if f.record == target:
                         ref = by_rec[target]
                         assert f.t == ref.t
