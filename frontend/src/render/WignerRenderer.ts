@@ -5,10 +5,13 @@
  * - R16UI texture + usampler2D + texelFetch: the received Uint16Array view
  *   uploads untouched (zero copies, exact 16-bit fidelity). Integer
  *   textures cannot LINEAR-filter, so bilinear interpolation is done
- *   manually in the shader — which simultaneously gives correct periodic
- *   (wrapped) sampling of the toroidal domain.
- * - The payload is in fftshifted order; the unshift is a free half-period
- *   texture-coordinate offset (fract(uv + 0.5); Nx, Np are even).
+ *   manually in the shader.
+ * - The payload is in NATURAL order and may be a CROP of the plane, decimated
+ *   to about the panel's pixel size (backend display downsampling). The
+ *   texture therefore covers uTex0..uTex1 of the domain rather than all of it,
+ *   and the shader maps the requested view window into that. Both the old
+ *   half-period unshift offset and the old toroidal wrap are gone with the
+ *   full-period assumption they rested on — see the fragment shader.
  * - Diverging colormap centered at W=0 with SYMMETRIC two-sided scaling:
  *   u = 0.5 + 0.5*W/max(Wmax, -Wmin), so color intensity is proportional
  *   to |W| with one shared scale. (The asymmetric MidpointNormalize of
@@ -36,13 +39,15 @@ const FS = `#version 300 es
 precision highp float;
 precision highp int;
 precision highp usampler2D;
-uniform usampler2D uW;    // width = Np (p, fast axis), height = Nx (x)
+uniform usampler2D uW;    // width = n along axis b, height = n along axis a
 uniform sampler2D uLUT;
 uniform vec2 uQ;          // (wmin, wmax) of THIS frame - dequantization
 uniform vec2 uC;          // color scale (min, max); == uQ when autoscaling
-uniform vec2 uSize;       // (Np, Nx)
+uniform vec2 uSize;       // texture (width, height) = (n along b, n along a)
 uniform vec2 uView0;      // view window corners in domain fractions:
-uniform vec2 uView1;      // (x, p-up); (0,0)/(1,1) = full domain
+uniform vec2 uView1;      // (a horizontal, b vertical-up); (0,0)/(1,1) = full
+uniform vec2 uTex0;       // the domain fractions the TEXTURE actually covers,
+uniform vec2 uTex1;       // same (a, b) order. Equals uView0/1 for a full plane.
 in vec2 vUV;
 out vec4 fragColor;
 
@@ -51,14 +56,19 @@ float fetchW(ivec2 ij) {
   return uQ.x + (uQ.y - uQ.x) * (float(q) / 65535.0);
 }
 
-float sampleW(vec2 st) {  // st: (s over Np, t over Nx) in [0,1], periodic
+float sampleW(vec2 st) {  // st in [0,1] over the SERVED window, clamped
   vec2 xy = st * uSize - 0.5;
   vec2 f = fract(xy);
   ivec2 sz = ivec2(uSize);
-  // floor(xy) >= -1 here (st in [0,1)), so one +sz keeps % operands
-  // non-negative — GLSL ES leaves % undefined for negative operands
-  ivec2 a = (ivec2(floor(xy)) + sz) % sz;
-  ivec2 b = ivec2((a.x + 1) % sz.x, (a.y + 1) % sz.y);
+  ivec2 hi = sz - 1;
+  // CLAMP, not the modulo wrap this had while every texture was a full
+  // period. A served window is a CROP: wrapping it would fold the far edge of
+  // a zoomed tile onto its near edge, which is not the torus and not anything.
+  // The cost at the full view is half a texel of interpolation at the domain
+  // seam, and viewWindow clamps inside [0,1] so the wrapped continuation is
+  // never on screen anyway.
+  ivec2 a = clamp(ivec2(floor(xy)), ivec2(0), hi);
+  ivec2 b = min(a + 1, hi);
   float w00 = fetchW(a);
   float w10 = fetchW(ivec2(b.x, a.y));
   float w01 = fetchW(ivec2(a.x, b.y));
@@ -67,11 +77,13 @@ float sampleW(vec2 st) {  // st: (s over Np, t over Nx) in [0,1], periodic
 }
 
 void main() {
-  // screen: x horizontal (texture row t), p vertical up (texture col s);
-  // uView* windows the domain (zoom/pan); +0.5 = ifftshift as a
-  // half-period offset on the periodic domain
+  // screen: axis a horizontal (texture HEIGHT t), axis b vertical up (texture
+  // WIDTH s) — hence the .yx swap. Records arrive in NATURAL order now
+  // (frame.build unshifts on the device), so the half-period +0.5 offset this
+  // used to carry is gone with the shift it undid.
   vec2 dom = mix(uView0, uView1, vUV);
-  vec2 st = fract(vec2(dom.y, dom.x) + 0.5);
+  vec2 rel = (dom - uTex0) / max(uTex1 - uTex0, vec2(1e-9));
+  vec2 st = clamp(vec2(rel.y, rel.x), 0.0, 1.0);
   float w = sampleW(st);
   // symmetric diverging scale: W=0 -> LUT center (white), intensity
   // proportional to |W| on both sides
@@ -100,13 +112,21 @@ export class WignerRenderer {
   private uSize: WebGLUniformLocation | null = null
   private uView0: WebGLUniformLocation | null = null
   private uView1: WebGLUniformLocation | null = null
+  private uTex0: WebGLUniformLocation | null = null
+  private uTex1: WebGLUniformLocation | null = null
   private nx = 0
   private np = 0
-  // view window in domain fractions (x, p-up); defaults = full domain
+  // view window in domain fractions (a horizontal, b vertical-up); full domain
   private vx0 = 0
   private vx1 = 1
   private vy0 = 0
   private vy1 = 1
+  // the domain fractions the uploaded texture covers. Equal to the full domain
+  // for a whole plane; a sub-window when the server served a crop.
+  private tx0 = 0
+  private tx1 = 1
+  private ty0 = 0
+  private ty1 = 1
   private q: [number, number] = [0, 1]
   /** When set, the color scale is locked to this (min, max); otherwise
    *  every frame autoscales to its own range. */
@@ -150,6 +170,8 @@ export class WignerRenderer {
     this.uSize = gl.getUniformLocation(prog, 'uSize')
     this.uView0 = gl.getUniformLocation(prog, 'uView0')
     this.uView1 = gl.getUniformLocation(prog, 'uView1')
+    this.uTex0 = gl.getUniformLocation(prog, 'uTex0')
+    this.uTex1 = gl.getUniformLocation(prog, 'uTex1')
 
     // LUT: 256x1 RGBA8, LINEAR (it is a float texture, filtering is fine)
     this.texLUT = gl.createTexture()
@@ -185,11 +207,13 @@ export class WignerRenderer {
   /** Upload one quantized 2D plane. Its data is (na, nb) row-major, i.e. the
    *  texture is nb wide (the plane's second axis) and na tall (its first).
    *
+   *  `fullA`/`fullB` are the RECORD's axis counts for that pair — the plane may
+   *  be a decimated crop, and they are what its off/step are measured against.
+   *
    *  This is why a 4D phase space needs no renderer change at all: a plane
-   *  reduction is exactly the 2D array a 1D W was, still fftshifted in both of
-   *  its own axes, so the shader's half-period unshift, the manual bilinear
-   *  and the periodic wrap all apply unaltered. */
-  upload(p: PlaneFrame) {
+   *  reduction is exactly the 2D array a 1D W was, so the manual bilinear and
+   *  the window mapping apply unaltered. */
+  upload(p: PlaneFrame, fullA: number, fullB: number) {
     const gl = this.gl
     if (!gl) return
     const t0 = performance.now()
@@ -198,11 +222,30 @@ export class WignerRenderer {
     gl.bindTexture(gl.TEXTURE_2D, this.texW)
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, p.nb, p.na,
       gl.RED_INTEGER, gl.UNSIGNED_SHORT, p.data)
+    // Which slice of the domain this texture covers. The crop is expressed in
+    // BASE cells (off + n*step against the record's own N), so this is exact
+    // integer arithmetic — a full plane gives 0..1 and the shader degenerates
+    // to what it did before.
+    this.tx0 = p.off[0] / fullA
+    this.tx1 = (p.off[0] + p.na * p.step[0]) / fullA
+    this.ty0 = p.off[1] / fullB
+    this.ty1 = (p.off[1] + p.nb * p.step[1]) / fullB
     this.q = [p.wmin, p.wmax]
     perfStage('upload', performance.now() - t0)
   }
 
-  /** Set the zoom/pan view window in domain fractions (x, p-up).
+  /** Drawing-buffer size in device pixels — what the panel asks the server to
+   *  match. Reads the canvas rather than any cached value, so it is honest
+   *  immediately after a resize and before the next render(). */
+  pixelSize(): [number, number] {
+    const c = this.gl?.canvas as HTMLCanvasElement | undefined
+    if (!c) return [0, 0]
+    const dpr = window.devicePixelRatio || 1
+    return [Math.max(1, Math.round(c.clientWidth * dpr)),
+            Math.max(1, Math.round(c.clientHeight * dpr))]
+  }
+
+  /** Set the zoom/pan view window in domain fractions (a horizontal, b up).
    *  Takes effect on the next render(). */
   setView(x0: number, x1: number, y0: number, y1: number) {
     this.vx0 = x0
@@ -231,6 +274,8 @@ export class WignerRenderer {
     gl.uniform2f(this.uSize, this.np, this.nx)
     gl.uniform2f(this.uView0, this.vx0, this.vy0)
     gl.uniform2f(this.uView1, this.vx1, this.vy1)
+    gl.uniform2f(this.uTex0, this.tx0, this.ty0)
+    gl.uniform2f(this.uTex1, this.tx1, this.ty1)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
     perfStage('draw', performance.now() - t0)
   }

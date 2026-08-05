@@ -6,6 +6,7 @@ import type { ProgressEvent } from '../composables/useSession'
 import { VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
 import { createViewWindow, remapView, type Domain } from '../lib/viewWindow'
 import { planeLabel, planeLabelHtml, planes as planesOf } from '../lib/axes'
+import { viewChanged, viewKey, type PlaneViewReq } from '../lib/planeView'
 import { panelMode, panelPlaneIdx, panelVariantIdx } from '../lib/panelView'
 import { AU_TIME_FS } from '../lib/units'
 import WignerPanel from './WignerPanel.vue'
@@ -23,6 +24,8 @@ const props = defineProps<{
   batchOverlay?: 'computing' | 'review' | null
   progress?: ProgressEvent | null
 }>()
+
+const emit = defineEmits<{ view: [PlaneViewReq[]] }>()
 
 const throughput = computed(() =>
   (props.progress?.per_variant ?? [])
@@ -92,6 +95,57 @@ watch(linked, (v) => localStorage.setItem(LINK_KEY, v ? '1' : '0'))
 const canLink = computed(() => ndim.value === 1 || mode.value === 'variants')
 const linkedNow = computed(() => linked.value && canLink.value)
 
+/**
+ * Batched viewport reporting for backend display downsampling.
+ *
+ * Every mounted panel emits what it shows; this collects them and sends ONE
+ * `view` message describing the whole screen. It has to be batched: the server
+ * treats the message as the complete picture (a plane it does not mention is
+ * one this client is not showing, and is not sent at all), so four panels each
+ * posting their own would leave three of them dark.
+ *
+ * Coalesced on a microtask rather than debounced by a timer. The events that
+ * produce these already arrive in bursts of one-per-panel — a frame paint, a
+ * resize, a link-zoom toggle — and they are all in the same tick, so a timer
+ * would only add latency to a zoom. `viewChanged` is what stops a pan's
+ * pointermove stream becoming a request stream.
+ */
+const pending = new Map<string, PlaneViewReq>()
+const sentViews = new Map<string, PlaneViewReq>()
+let flushQueued = false
+
+function onPanelView(v: PlaneViewReq) {
+  pending.set(viewKey(v), v)
+  if (flushQueued) return
+  flushQueued = true
+  queueMicrotask(flushViews)
+}
+
+function flushViews() {
+  flushQueued = false
+  // The live set of panels, so a panel that has just unmounted stops being
+  // reported — otherwise the server keeps cropping and sending a plane nothing
+  // is drawing.
+  const live = new Set(cells.value.map((c) => c.key))
+  let changed = pending.size > 0 && sentViews.size !== pending.size
+  for (const [k, v] of pending) {
+    if (viewChanged(sentViews.get(k), v)) changed = true
+  }
+  // Drop entries for panels that went away; that is a change too.
+  for (const k of sentViews.keys()) if (!pending.has(k)) changed = true
+  if (!changed) return
+  sentViews.clear()
+  for (const [k, v] of pending) sentViews.set(k, v)
+  pending.clear()
+  void live
+  emit('view', [...sentViews.values()])
+}
+
+// A remount (plotsKey) or a mode switch replaces the panel set wholesale, and
+// the panels re-emit on mount — but the STALE entries have to go, or the
+// server keeps sending the six planes of a portrait we have left.
+watch(cells, () => { sentViews.clear() })
+
 const views = new Map<string, ReturnType<typeof createViewWindow>>()
 const shared = createViewWindow()
 // coupling adopts the window of the panel the user last zoomed/panned
@@ -152,7 +206,8 @@ const gridClass = computed(() => {
         <WignerPanel :frame-source="frameSource" :variant-index="c.variantIndex"
                      :plane="c.plane" :label="c.label" :show-grid="showGrid"
                      :show-cells="showCells"
-                     :view="linkedNow ? shared : viewFor(c.key)" />
+                     :view="linkedNow ? shared : viewFor(c.key)"
+                     @view="onPanelView" />
       </div>
     </div>
     <div class="absolute top-1 right-2 z-10 flex items-center gap-2 text-xs

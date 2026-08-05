@@ -1184,3 +1184,79 @@ def test_a_reattach_waits_for_the_previous_streamer_to_let_go():
             assert json.loads(m["text"])["type"] == "status"
         assert _time.monotonic() - t0 >= 0.5, "it did not actually wait"
         client.delete("/api/sessions/%s" % sid)
+
+
+def _view(vid, a, b, a1, a2, b1, b2, na, nb):
+    return {"vid": vid, "a": a, "b": b, "a1": a1, "a2": a2,
+            "b1": b1, "b2": b2, "na": na, "nb": nb}
+
+
+def test_a_view_request_shrinks_the_wire_and_still_shows_the_same_region():
+    """Display downsampling: the payload follows the PANEL, not the grid.
+
+    A panel is ~600x400 device pixels and a 1D plane at 4096^2 is 32 MiB, which
+    is past the browser's per-message receive ceiling — so the server sends a
+    crop of the zoom window decimated to about the pixel count, and full detail
+    comes back by zooming in.
+
+    Three things have to hold together, and the first two alone would let a
+    plausible-but-wrong implementation through: the bundle gets much smaller;
+    the window that comes back COVERS the region asked for (an off/step that
+    snapped the wrong way still shrinks the payload perfectly); and the samples
+    are the same numbers the full plane has there, so it is a decimation of this
+    state and not of something else.
+    """
+    import numpy as _np
+    with TestClient(app) as client:
+        # 512^2 so there is a pyramid to choose from (PYRAMID_FLOOR is 256)
+        big = dict(x1=-6.0, x2=6.0, Nx=512, p1=-7.0, p2=7.0, Np=512)
+        info = _mk(client, grid=big)
+        sid = info["session_id"]
+        with client.websocket_connect(info["ws_url"]) as ws:
+            (whole,) = _recv_frames(ws, 1)
+            full = whole.variants[0].planes[0]
+            assert full.wq.shape == (512, 512)
+            assert full.off == (0, 0) and full.step == (1, 1), \
+                "a client that asked for nothing must get the whole plane"
+
+            # ask for the whole domain at 128x128: a pure decimation by 4
+            ws.send_text(json.dumps({"type": "view", "planes": [
+                _view(1, 0, 1, -6.0, 6.0, -7.0, 7.0, 128, 128)]}))
+            small = _recv_frames(ws, 1)[0].variants[0].planes[0]
+            assert small.wq.shape == (128, 128), small.wq.shape
+            assert small.step == (4, 4) and small.off == (0, 0)
+            # the reason for the whole feature: 16x fewer bytes
+            assert small.wq.nbytes*16 == full.wq.nbytes
+
+            # and it is an AREA MEAN of the full plane, not a subsample: rebuild
+            # it host-side from the full plane and compare in physical units.
+            ref = dequantize(full.wq, full.wmin, full.wmax) \
+                .reshape(128, 4, 128, 4).mean(axis=(1, 3))
+            got = dequantize(small.wq, small.wmin, small.wmax)
+            span = full.wmax - full.wmin
+            assert _np.abs(got - ref).max() < 2e-4*span, \
+                "coarse level is not the area mean of the full plane"
+            # quantized against the FULL plane's range, so the colorbar cannot
+            # move when the server changes level under a zoom
+            assert (small.wmin, small.wmax) == (full.wmin, full.wmax)
+
+            # zoom in: same pixel count, finer step, and the window must COVER
+            # what was asked for
+            ws.send_text(json.dumps({"type": "view", "planes": [
+                _view(1, 0, 1, 0.0, 3.0, -1.0, 1.0, 128, 128)]}))
+            z = _recv_frames(ws, 1)[0].variants[0].planes[0]
+            dx, dp = 12.0/512, 14.0/512
+            lo_x = -6.0 + z.off[0]*dx
+            hi_x = lo_x + z.wq.shape[0]*z.step[0]*dx
+            assert lo_x <= 0.0 and hi_x >= 3.0, (lo_x, hi_x)
+            lo_p = -7.0 + z.off[1]*dp
+            hi_p = lo_p + z.wq.shape[1]*z.step[1]*dp
+            assert lo_p <= -1.0 and hi_p >= 1.0, (lo_p, hi_p)
+            assert z.step[0] < 4, "zooming in must not stay at the coarse level"
+
+            # a plane the client did not mention is not sent at all
+            ws.send_text(json.dumps({"type": "view", "planes": []}))
+            none_ = _recv_frames(ws, 1)[0].variants[0].planes[0]
+            assert none_.wq.shape == (0, 0), \
+                "an unrequested plane still carried its payload"
+        client.delete("/api/sessions/%s" % sid)

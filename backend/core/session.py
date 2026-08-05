@@ -422,6 +422,11 @@ class SimSession:
         self.inflight_bytes = 0
         self.acked = -1
         self.paced = False
+        # What the attached client is showing, {(vid, a, b): PlaneView}, for
+        # display downsampling (protocol.ViewCmd). A DISPLAY policy like
+        # `delay`: None means "no preference, send whole planes", which is what
+        # a raw consumer and every pre-v5 client get.
+        self.views = None
         # Bytes written to this socket, and a rolling rate for status(). You
         # cannot tune a transport you cannot see, and the browser-side
         # __wfPerf figure alone cannot tell "the server sent less" from "the
@@ -487,11 +492,17 @@ class SimSession:
             self.inflight_bytes -= self.inflight.popleft()[1]
 
     def reset_inflight(self):
-        """A fresh socket has nothing in flight and has issued no credit."""
+        """A fresh socket has nothing in flight, no credit, and no viewport.
+
+        The viewport goes too: a new client has not said what it is showing, and
+        inheriting the last one would send it crops of somebody else's zoom. It
+        re-sends on connect.
+        """
         self.inflight.clear()
         self.inflight_bytes = 0
         self.acked = -1
         self.paced = False
+        self.views = None
 
     def post_msg(self, d):
         self.msgs.append(d)

@@ -6,8 +6,11 @@ import type { Frame } from '../lib/protocol'
 import { variantName } from '../lib/protocol'
 import { label as axisLabel, planeIndex, planeTitle } from '../lib/axes'
 import { isZoomed, panBy, resetView, zoomAt, type ViewWindow } from '../lib/viewWindow'
+import type { PlaneViewReq } from '../lib/planeView'
 import type { AxisLattice } from '../lib/cells'
 import { WignerRenderer } from '../render/WignerRenderer'
+
+const emit = defineEmits<{ view: [PlaneViewReq] }>()
 
 const props = defineProps<{
   /** Register a frame handler with the session; returns unsubscribe. */
@@ -29,6 +32,9 @@ const props = defineProps<{
 }>()
 
 const canvas = ref<HTMLCanvasElement | null>(null)
+let ro: ResizeObserver | null = null
+/** Decimation of the plane last painted; 1 = every computed cell. */
+const reduction = ref(1)
 // The variant name from the last painted frame, used only when the parent gives
 // no label. A plain ref seeded from props.label was a reactivity bug: PanelGrid
 // REUSES a panel instance across a view-mode switch (the cell key is the same,
@@ -36,6 +42,9 @@ const canvas = ref<HTMLCanvasElement | null>(null)
 // labelled "Quantum, non-relativistic" kept that text after the label prop
 // became "x,y".
 const vidName = ref('')
+/** This panel's variant id, from the painted frame — the server keys views by
+ *  it, and the panel's own `variantIndex` is a position in the bundle. */
+const vidOf = ref<number | null>(null)
 const title = computed(() => props.label ?? vidName.value)
 const subtitle = ref('')
 // This panel's OWN colour range, for its overlaid colorbar. Per panel because
@@ -85,6 +94,28 @@ const viewDomain = computed(() => {
 
 const labels = ref<[string, string]>(['x', 'p'])
 
+/**
+ * Tell the parent what this panel is showing, so the server can send that and
+ * nothing else. PHYSICAL extents, because they survive an auto-expand regrid
+ * with no bookkeeping — the same region keeps meaning the same thing when the
+ * domain doubles under it, where a fraction quietly comes to mean somewhere
+ * else.
+ *
+ * Emitted rather than sent: the request has to be BATCHED with every other
+ * panel's (see PanelGrid), or four panels would each overwrite the others'
+ * entries in a map the server keys by panel.
+ */
+function requestView() {
+  const d = viewDomain.value
+  const vid = vidOf.value
+  if (!d || vid == null) return
+  const [pw, ph] = renderer.pixelSize()
+  if (!pw || !ph) return
+  const [a, b] = pair.value
+  emit('view', { vid, a, b, a1: d.a1, a2: d.a2, b1: d.b1, b2: d.b2,
+                 na: pw, nb: ph })
+}
+
 function onWheel(e: WheelEvent) {
   if (!props.view) return
   const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
@@ -130,18 +161,28 @@ onMounted(() => {
     const v = f.variants[props.variantIndex]
     if (!v) return
     const [a, b] = pair.value
-    const i = planeIndex(f.ndim, [a, b])
-    const p = i >= 0 ? v.planes[i] : undefined
+    // BY PAIR, not by index: the server omits planes this client is not
+    // showing, and a positional lookup into a list with holes silently draws
+    // the wrong plane. (It is still the canonical order — but nothing here
+    // needs to depend on that.)
+    const p = v.planes.find((q) => q.a === a && q.b === b)
     if (!p) return
     vidName.value = variantName(v.vid)
+    vidOf.value = v.vid
     subtitle.value = planeTitle(f.ndim, [a, b], true)
     labels.value = [axisLabel(f.ndim, a), axisLabel(f.ndim, b)]
     full.value = { a1: f.lo[a]!, a2: f.hi[a]!, b1: f.lo[b]!, b2: f.hi[b]!,
                    na: f.N[a]!, nb: f.N[b]! }
+    // na === 0 is "not sent" — keep the last texture rather than blanking the
+    // panel, which is what a frame arriving between a request and its answer
+    // would otherwise do.
+    if (p.na === 0) return
     wmin.value = p.wmin
     wmax.value = p.wmax
-    renderer.upload(p)
+    reduction.value = Math.max(p.step[0], p.step[1])
+    renderer.upload(p, f.N[a]!, f.N[b]!)
     renderer.render()
+    requestView()
   })
   // zoom/pan repaint: this is what redraws while PAUSED; the getter tracks
   // both the window's fields AND its identity (own <-> shared on "link
@@ -152,12 +193,20 @@ onMounted(() => {
       if (!v) return
       renderer.setView(v[0]!, v[1]!, v[2]!, v[3]!)
       renderer.render()
+      requestView()
     },
   )
+  // A panel's pixel size is a request input, and nothing else notices it
+  // changing: the canvas is CSS-sized, so a window resize or a layout toggle
+  // moves it with no Vue reactivity at all.
+  ro = new ResizeObserver(() => { renderer.render(); requestView() })
+  ro.observe(canvas.value!)
+  requestView()
 })
 
 onBeforeUnmount(() => {
   unsub?.()
+  ro?.disconnect()
   renderer.dispose()
 })
 </script>
@@ -183,6 +232,17 @@ onBeforeUnmount(() => {
       <!-- at ndim=2 the panel must say WHICH reduction it is; at 1D subtitle
            is empty, because the single plane is the state itself -->
       <span v-if="subtitle" class="opacity-75">· <span v-html="subtitle"></span></span>
+      <!-- Reduced panels SAY SO. Area-averaging is honest but invisible: the
+           image looks like a smooth W rather than an under-resolved one, so
+           fringes finer than a pixel are gone with nothing on screen to
+           suggest it. Costs no line — it rides the label chip already there. -->
+      <span v-if="reduction > 1" class="opacity-75"
+            :title="`This panel is drawn from every ${reduction}th computed cell along each axis — `
+              + `each pixel is the average of ${reduction * reduction} of them, which is what W on a `
+              + `coarser grid looks like. Interference finer than one pixel is averaged away; zoom in `
+              + `to get the computed resolution back. The server sends only this, which is what keeps `
+              + `a large grid interactive.`">
+        · ↓{{ reduction }}×</span>
     </div>
     <!-- this panel's own colour scale; overlaid, so it costs no drawing area -->
     <Colorbar :min="wmin" :max="wmax" />

@@ -60,9 +60,17 @@ describe.each([['frame', 1], ['frame2d', 2]])(
           expect([p.a, p.b, p.mode]).toEqual([pm.a, pm.b, MODE_PROJECTION])
           expect(p.wmin).toBeCloseTo(pm.wmin, 6)
           expect(p.wmax).toBeCloseTo(pm.wmax, 6)
-          expect([p.na, p.nb]).toEqual([meta.N[pm.a], meta.N[pm.b]])
-          expect(p.data.length).toBe(meta.N[pm.a] * meta.N[pm.b])
+          // Sizes come off the WIRE, never from the header's N — a plane may
+          // be a decimated crop (the 1D fixture is one, with a different
+          // off/step on each axis so a swapped pair cannot pass).
+          expect([p.na, p.nb]).toEqual([pm.na, pm.nb])
+          expect(p.off).toEqual(pm.off)
+          expect(p.step).toEqual(pm.step)
+          expect(p.data.length).toBe(pm.na * pm.nb)
           expect(Array.from(p.data)).toEqual(pm.wq)
+          // the window has to stay inside the axis it is a window of
+          expect(p.off[0] + p.na * p.step[0]).toBeLessThanOrEqual(meta.N[pm.a])
+          expect(p.off[1] + p.nb * p.step[1]).toBeLessThanOrEqual(meta.N[pm.b])
         }
 
         expect(v.marg.length).toBe(2 * ndim)

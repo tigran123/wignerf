@@ -32,15 +32,34 @@ Per variant (contiguous, n_variants times):
   f32 mean[a], f32 std[a]     for each of the 2*ndim axes
   per plane:
     u8 axis_a | u8 axis_b | u8 mode | u8 pad | f32 Wmin | f32 Wmax
-    u16[N[a]*N[b]] quantized plane, row-major [ia][ib], fftshifted order
+    u32 na | u32 nb             samples sent along axis_a, axis_b
+    u32 off_a | u32 off_b       first BASE cell of the window
+    u32 step_a | u32 step_b     base cells averaged per sample (power of two)
+    u16[na*nb] quantized plane, row-major [ia][ib], NATURAL order
   per axis:
     f32[N[a]] marginal density                               (natural order)
 
-The plane dimensions are implied by (axis_a, axis_b) and the header's N, so
-they are not repeated. `mode` is the reduction kind — only projection (0) is
-defined; cuts are milestone M5 and need no version bump. `lz` is <x*py - y*px>,
-present always and 0.0 at ndim=1, because one fixed layout per ndim is easier
-to keep right on both sides than a conditional field.
+A PLANE IS A WINDOW, NOT THE WHOLE AXIS PAIR (v5). Sample (i, j) is the mean of
+the base cells [off_a + i*step_a, off_a + (i+1)*step_a) x (same for b): the
+client asks for the zoom window it is showing at about its own pixel size, and
+a 4096^2 panel then stops shipping 32 MiB to fill 600x400 pixels. The default
+(nothing requested) is off=0, step=1, na/nb = N[a]/N[b] — byte-for-byte the v4
+plane. `na = 0` means THIS PLANE WAS NOT SENT: the 36-byte header is still
+written, so the plane list keeps its canonical order and a client can tell
+"omitted" from "changed" without guessing.
+
+Sizes are on the wire rather than implied by the header's N (as in v4), because
+that is exactly what a crop breaks. `mode` remains the reduction KIND — only
+projection (0) is defined; cuts are milestone M5 and still need no version
+bump. `lz` is <x*py - y*px>, present always and 0.0 at ndim=1, because one
+fixed layout per ndim is easier to keep right on both sides than a conditional
+field.
+
+PLANES ARE NATURAL ORDER since v5 (`core/frame.build` unshifts on the device,
+which is free there). A crop of an fftshifted array straddles the seam, so
+cropping and the old shifted convention could not coexist without a third
+convention or two client paths; the marginals were already natural, so now
+nothing outside the propagator is shifted.
 
 This module also holds the pydantic JSON schemas: grid/IC/session-config
 (shared by the REST routers) and the client->server WebSocket control
@@ -58,11 +77,14 @@ from pydantic import BaseModel, Field, model_validator
 
 import config
 from . import axes as axes_mod
+from . import planeview
+from . import pyramid
 from .xp import C_AU
 
 MAGIC = 0x57
-VERSION = 4          # v4: per-record ndim, a list of 2D planes and 2*ndim
-                     # marginals (1D is one plane = W); v3 was 2 fixed axes
+VERSION = 5          # v5: per-plane window (size/offset/step) + natural
+                     # order, so a plane can be a decimated crop; v4 added
+                     # per-record ndim and the plane list (1D is one plane = W)
 MSG_FRAME = 1
 
 FLAG_LIVE_PREVIEW = 1 << 0
@@ -70,7 +92,7 @@ FLAG_REPLAY = 1 << 1
 
 _HDR = struct.Struct("<BBBBIdIBBBB")     # 24 bytes, then N[] then lo/hi[]
 _VHDR = struct.Struct("<BBH4f")          # 20 bytes, then mean/std[]
-_PHDR = struct.Struct("<BBBB2f")         # 12 bytes, then the u16 plane
+_PHDR = struct.Struct("<BBBB2f6I")       # 36 bytes, then the u16 plane
 
 
 def variant_id(quantum, relativistic):
@@ -665,6 +687,41 @@ class PingCmd(BaseModel):
     type: Literal["ping"]
 
 
+class PlaneView(BaseModel):
+    """One panel: which physical region it shows, and how many pixels it has."""
+    vid: int = Field(ge=0, le=3)
+    a: int = Field(ge=0)
+    b: int = Field(ge=0)
+    a1: float
+    a2: float
+    b1: float
+    b2: float
+    na: int = Field(ge=1)     # pixels along axis a; snapped server-side
+    nb: int = Field(ge=1)
+
+
+class ViewCmd(BaseModel):
+    """What the client is actually showing, so the server can send only that.
+
+    A DISPLAY policy like `delay` and `loop` — it changes nothing computed, only
+    which samples of an already-computed record go on the wire. Live-settable,
+    because zooming DURING a computation is the point of an interactive
+    simulator.
+
+    The window is PHYSICAL, not fractional, and that is what makes it survive an
+    auto-expand regrid: "this region of phase space" keeps its meaning when the
+    domain doubles under it, where a fraction silently comes to mean somewhere
+    else. It is also what lets a scrub across a regrid boundary serve each
+    record against its own geometry with no per-record bookkeeping.
+
+    A plane absent from `planes` is NOT SENT. That is how the phase portrait
+    stops paying for the five planes it is not displaying, and it is why the
+    empty list is meaningful rather than a no-op.
+    """
+    type: Literal["view"]
+    planes: list[PlaneView] = Field(default_factory=list, max_length=64)
+
+
 class AckCmd(BaseModel):
     """Receipt for a PAINTED record — the transport's only flow control.
 
@@ -693,7 +750,7 @@ class AckCmd(BaseModel):
 
 ClientMsg = Annotated[
     Union[PlayCmd, PauseCmd, DelayCmd, SeekCmd, SetParamsCmd, PingCmd, LoopCmd,
-          AckCmd],
+          AckCmd, ViewCmd],
     Field(discriminator="type"),
 ]
 
@@ -750,15 +807,43 @@ class RecordGeom:
 @dataclass
 class PlaneFrame:
     """One quantized 2D reduction of a state: the (a, b) plane, in the surviving
-    axes' fftshifted order, with its OWN range — the reductions of one state
-    differ in scale by orders of magnitude, so one shared colour range would
-    render most panels blank."""
+    axes' NATURAL order, with its OWN range — the reductions of one state differ
+    in scale by orders of magnitude, so one shared colour range would render
+    most panels blank.
+
+    `wq` is the full plane and `mips` its successive 2x2 area means (see
+    core/pyramid), coarsest last. Both are built once per record; the SEND path
+    picks a level and slices a window out of it, which is why serving a zoomed
+    panel costs a contiguous copy rather than a reduction.
+
+    EVERY LEVEL IS QUANTIZED AGAINST (wmin, wmax) OF THE FULL PLANE. The server
+    changes level whenever the panel resizes or the zoom crosses a power of two,
+    and a range that moved with it would repaint the colorbar underneath a user
+    who only scrolled — the same reason each plane keeps its own range rather
+    than sharing one.
+    """
     a: int
     b: int
     mode: int              # axes.MODE_PROJECTION (cuts are milestone M5)
     wq: numpy.ndarray      # uint16 (N[a], N[b])
     wmin: float
     wmax: float
+    mips: tuple = ()       # uint16 levels, decimation 2, 4, 8, ...
+    # Window this plane covers, in BASE cells of the record's own axes. Set on
+    # DECODE (and left at the whole-axis default on build, where `wq` is the
+    # full plane and the send path chooses the window per client).
+    off: tuple = (0, 0)
+    step: tuple = (1, 1)
+
+    def level(self, step):
+        """The array decimated by `step` (a power of two)."""
+        j = pyramid.level_for(step)
+        return self.wq if j < 0 else self.mips[j]
+
+    @property
+    def max_step(self):
+        """Coarsest decimation this plane can serve."""
+        return 1 << len(self.mips)
 
 
 @dataclass
@@ -835,7 +920,14 @@ class DecodedFrame:
     variants: list
 
 
-def pack_frame(record, t, geom, variants, flags=0):
+def pack_frame(record, t, geom, variants, flags=0, views=None):
+    """Serialize one lockstep record.
+
+    `views` maps (vid, a, b) -> (Window, Window) for the panels a client is
+    actually showing (see core/planeview); a pair of None means that panel is
+    not on screen and the plane is written as a header with no payload. Omitted
+    entirely, every plane goes out whole — the pre-v5 bytes.
+    """
     nax = 2*geom.ndim
     nplanes = len(variants[0].planes) if variants else 0
     parts = [_HDR.pack(MAGIC, VERSION, MSG_FRAME, len(variants),
@@ -851,11 +943,57 @@ def pack_frame(record, t, geom, variants, flags=0):
             [x for a in range(nax) for x in (v.mean[a], v.std[a])],
             dtype="<f4").tobytes())
         for pl in v.planes:
-            parts.append(_PHDR.pack(pl.a, pl.b, pl.mode, 0, pl.wmin, pl.wmax))
-            parts.append(numpy.ascontiguousarray(pl.wq, dtype="<u2").tobytes())
+            # `views is None` means the client stated no preference at all and
+            # gets whole planes (a raw consumer, any pre-v5 client). Once it HAS
+            # stated one it is authoritative: a panel missing from the map is a
+            # panel it is not showing, and sending that anyway is exactly the
+            # waste this exists to remove — six planes where a portrait shows
+            # one, four variants where the grid shows one.
+            win = _NOT_REQUESTED if views is None \
+                else views.get((v.vid, pl.a, pl.b))
+            if win is _NOT_REQUESTED:
+                wa, wb = planeview.full(geom.N[pl.a]), planeview.full(geom.N[pl.b])
+            elif win is None:
+                # not on screen: header only, so the plane list keeps its
+                # canonical order and the client can tell omitted from changed
+                parts.append(_PHDR.pack(pl.a, pl.b, pl.mode, 0,
+                                        pl.wmin, pl.wmax, 0, 0, 0, 0, 1, 1))
+                continue
+            else:
+                wa, wb = win
+            parts.append(_PHDR.pack(pl.a, pl.b, pl.mode, 0, pl.wmin, pl.wmax,
+                                    wa.n, wb.n, wa.off, wb.off,
+                                    wa.step, wb.step))
+            parts.append(numpy.ascontiguousarray(
+                _crop(pl, wa, wb), dtype="<u2").tobytes())
         for m in v.marg:
             parts.append(numpy.ascontiguousarray(m, dtype="<f4").tobytes())
     return b"".join(parts)
+
+
+# Distinguishes "this client sent no view for that panel" (send it whole, the
+# pre-v5 default) from an explicit None ("that panel is not on screen").
+_NOT_REQUESTED = object()
+
+
+def _crop(pl, wa, wb):
+    """The requested window out of the right pyramid level.
+
+    Both steps are powers of two and so are the axis counts, so this is a
+    CONTIGUOUS slice of a pre-reduced level — measured 0.07 ms at 8192^2 against
+    1.1 ms for a strided gather off the base plane. That is the whole reason the
+    pyramid is built once per record rather than reduced per send.
+    """
+    step = max(wa.step, wb.step)
+    if wa.step != wb.step:
+        # The two axes want different levels. Take the finer one (a level is
+        # shared by both axes) and stride the coarser axis off it; the anchors
+        # still land on the level's lattice because every step is a power of two.
+        step = min(wa.step, wb.step)
+    lv = pl.level(step)
+    i0, j0 = wa.off//step, wb.off//step
+    sa, sb = wa.step//step, wb.step//step
+    return lv[i0:i0 + wa.n*sa:sa, j0:j0 + wb.n*sb:sb]
 
 
 def unpack_frame(buf):
@@ -888,13 +1026,17 @@ def unpack_frame(buf):
         off += 4*2*nax
         planes = []
         for _ in range(npl):
-            a, b, mode, _p, wmin, wmax = _PHDR.unpack_from(buf, off)
+            (a, b, mode, _p, wmin, wmax,
+             na, nb, offa, offb, sa, sb) = _PHDR.unpack_from(buf, off)
             off += _PHDR.size
-            n = N[a]*N[b]
+            # na == 0: the plane was not sent (the client is not showing it).
+            # The header is still here, so the list keeps its canonical order.
+            n = na*nb
             wq = numpy.frombuffer(buf, dtype="<u2", count=n,
-                                  offset=off).reshape(N[a], N[b])
+                                  offset=off).reshape(na, nb)
             off += 2*n
-            planes.append(PlaneFrame(a, b, mode, wq, wmin, wmax))
+            planes.append(PlaneFrame(a, b, mode, wq, wmin, wmax,
+                                     off=(offa, offb), step=(sa, sb)))
         marg = []
         for a in range(nax):
             marg.append(numpy.frombuffer(buf, dtype="<f4", count=N[a],

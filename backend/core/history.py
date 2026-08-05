@@ -30,7 +30,11 @@ class FrameHistory:
 
     @staticmethod
     def _frame_bytes(vf):
-        return (sum(p.wq.nbytes for p in vf.planes)
+        # The pyramid counts: it is +33% of a plane and it is retained for the
+        # life of the record, so a cap that ignored it would hold a third more
+        # than it was told to.
+        return (sum(p.wq.nbytes + sum(m.nbytes for m in p.mips)
+                    for p in vf.planes)
                 + sum(m.nbytes for m in vf.marg) + 96)
 
     def put(self, n, t, slot, vframe, geom):

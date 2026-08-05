@@ -24,6 +24,7 @@ from fastapi import APIRouter
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter, ValidationError
 
+from core import planeview
 from core import protocol
 from core import session as sessions
 from routers.sessions import compile_for
@@ -95,6 +96,18 @@ async def _handle(msg, s, ws):
             s.frame_evt.set()
     elif msg.type == "ping":
         s.post_msg({"type": "pong"})
+    elif msg.type == "view":
+        # What the client is showing, so the sender can crop to it. Not a
+        # `set_params`: nothing computed changes, only which samples of an
+        # already-computed record go on the wire.
+        s.views = {(v.vid, v.a, v.b): v for v in msg.planes}
+        # Re-send the current record at the new resolution instead of waiting
+        # for the next one — while paused there may not BE a next one, and a
+        # zoom that sharpens only after you press play is not a zoom.
+        first, last = s.history.extent()
+        if last >= 0:
+            s.pending_seek = min(max(int(s.clock.cursor), first), last)
+        s.frame_evt.set()
     elif msg.type == "ack":
         # Frame credit returned. Wake the sender NOW rather than letting it
         # wait out its frame-event timeout: at 60 fps a 50 ms tick is three
@@ -139,6 +152,41 @@ async def _receiver(ws, s):
         await _handle(msg, s, ws)
 
 
+def _views_for(s, geom):
+    """{(vid, a, b): (Window, Window) | None} for this record's geometry.
+
+    Resolved per RECORD, not per request: a scrub can land on a record computed
+    before an auto-expand regrid, and the physical window the client asked for
+    has to be answered against the geometry that record actually has. A panel
+    the client did not mention maps to None — not sent at all.
+    """
+    if s.views is None:
+        return None
+    out = {}
+    for (vid, a, b), v in s.views.items():
+        if a >= len(geom.N) or b >= len(geom.N):
+            continue           # a stale view from before an ndim change
+        out[(vid, a, b)] = (
+            planeview.select(geom.N[a], geom.lo[a], geom.hi[a], v.a1, v.a2,
+                             v.na, _max_step(s, a, b)),
+            planeview.select(geom.N[b], geom.lo[b], geom.hi[b], v.b1, v.b2,
+                             v.nb, _max_step(s, a, b)))
+    return out
+
+
+def _max_step(s, a, b):
+    """Coarsest decimation the retained planes can serve. Read off a record
+    rather than recomputed, since the pyramid depth is a property of the grid
+    the record was BUILT on."""
+    rec = s.history.get(s.history.latest_complete())
+    if rec is None:
+        return 1
+    for pl in rec[2][0].planes:
+        if (pl.a, pl.b) == (a, b):
+            return pl.max_step
+    return 1
+
+
 def _pack_record(s, k, live):
     rec = s.history.get(k)
     if rec is None:
@@ -150,7 +198,8 @@ def _pack_record(s, k, live):
     flags = 0 if live else protocol.FLAG_REPLAY
     # geometry comes from the RECORD, never the session's current grid —
     # replay across a regrid boundary must decode with the old geometry
-    return protocol.pack_frame(k, t, geom, variants, flags=flags)
+    return protocol.pack_frame(k, t, geom, variants, flags=flags,
+                               views=_views_for(s, geom))
 
 
 def _progress_msg(s, lc):

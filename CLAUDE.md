@@ -63,6 +63,8 @@ labels only (`frontend/src/lib/units.ts`).
     tables and the IC preview's VRAM release.
   - `expression-ics.md` — the `wexpr`/`psi` transform verification and the
     potential validity model.
+  - `downsampling.md` — the pyramid/crop benchmarks, the browser A/B that
+    justifies protocol v5, and the two traps in reproducing it.
 
 Dependency workflow (same as urantia-library): edit `requirements*.in`,
 then `uv pip compile requirements[-x].in -o requirements[-x].txt` and
@@ -152,9 +154,29 @@ source) is what keeps startup fast. See `README.md`.
   adaptive pacer keyed on paint time was built and REMOVED on 2026-07-23,
   because paint time is not the binding constraint there; see the
   browser-receive-ceiling gotcha. Don't rebuild it: the constraint is the
-  browser's per-message receive cost, so the fix is smaller messages (display
-  downsampling), not a smarter delay. Replay never skips a record; it slips on
-  WS backpressure. The UI dial is "0" plus a log range 20 ms–1.5 s.
+  browser's per-message receive cost, so the fix is smaller messages, and that
+  fix is now BUILT: **the client sends a `view` (physical window + pixel size
+  per panel) and the server ships only that** — a decimated crop out of a
+  per-record mip pyramid (`core/pyramid.py`, `core/planeview.py`, protocol v5).
+  Measured at 4096²: 3.1 rec/s at 99 MiB/s before (i.e. AT the ceiling), 8.0 at
+  4.2 after; at 8192² the before case is not slow but ZERO — no 128 MiB record
+  arrives at all. Four rules: the area mean happens ON THE DEVICE once per
+  record (250 ms/plane on the host); the send-time crop is a CONTIGUOUS slice
+  of a pre-reduced level (0.07 ms against 1.1 for a strided gather), which is
+  the only reason a pyramid is built; every level is quantized against the FULL
+  plane's range, so a level change cannot repaint the colorbar under someone
+  who only scrolled; and the window is PHYSICAL, which is what survives
+  auto-expand — `_views_for` resolves per RECORD, so a scrub across a regrid
+  needs no bookkeeping. A plane absent from the request is NOT SENT (`na = 0`,
+  header only), so the phase portrait stops paying for planes it is not
+  showing — which also means **the client must pick a plane by PAIR, not by
+  list position**. A reduced panel says so (`↓8×` with the reason in its
+  title): area-averaging is honest but invisible, and fringes below one pixel
+  vanish with nothing on screen to suggest it. The viewport is re-sent on
+  reconnect, because `send` no-ops on a closed socket and the server drops a
+  departing client's. Numbers in `notes/downsampling.md`.
+  Replay never skips a record; it slips on WS
+  backpressure. The UI dial is "0" plus a log range 20 ms–1.5 s.
   **THAT BACKPRESSURE IS OURS AND MUST STAY OURS** (`protocol.AckCmd`, 2026-08-05).
   `ws.send_bytes` does NOT wait: uvicorn's `websockets-sansio` impl — what
   `--ws auto` now picks — sets its `writable` event once and never clears it and
@@ -171,8 +193,8 @@ source) is what keeps startup fast. See `README.md`.
   `code=1006` was a HARDCODED CONSTANT, not a wire code, and it cost a whole
   investigation. Measurements in `notes/session-lifecycle.md`.
   Client frame fan-out is rAF-timed (decode per message, paint one per animation
-  frame; small FIFO with drop-to-newest as a burst valve), so texture uploads,
-  uPlot updates and Vue reactivity run per PAINTED frame by construction. That drop-to-newest is why the timeline readout shows painted/s
+  frame; small FIFO, drop-to-newest as a burst valve), so texture uploads, uPlot
+  updates and Vue reactivity run per PAINTED frame by construction. That drop-to-newest is why the timeline readout shows painted/s
   AND received/s: when they diverge the client is SKIPPING records, which reads
   on screen as fast playback and is really loss — one number alone cannot tell
   the two apart, and the live path makes that worse by design (the `delay` gate
@@ -223,10 +245,16 @@ source) is what keeps startup fast. See `README.md`.
   threads: quantum/classical × rel/non-rel) integrates with its own
   adaptive dt (`adjust_step`, every 20 steps) but lands exactly on each τ_k
   by clamping the final substep. Same k ⇒ same physical t across variants.
-- **State convention**: W is float64, fftshifted along both axes on the
-  backend; frames stream in shifted order and the *shader* unshifts via a
-  half-period texture offset (`render/WignerRenderer.ts`, R16UI texture,
-  manual bilinear with periodic wrap, diverging LUT centered at W=0).
+- **State convention**: W is float64 and fftshifted INSIDE the propagator, and
+  **natural (unshifted) order everywhere outside it** — `frame.build` unshifts
+  on the device, which is free there. That is a precondition for cropping, not
+  a tidy-up: a crop of a shifted array straddles the seam, so the old
+  convention and display downsampling could not coexist without a third
+  convention or two client paths. The shader's half-period offset and its
+  toroidal `%` wrap went with the shift they undid (it clamps now; `viewWindow`
+  never shows past the seam anyway), and so did `render_mpl`'s unshift.
+  (`render/WignerRenderer.ts`: R16UI texture, manual bilinear, diverging LUT
+  centered at W=0.)
   **Every W plot autoscales to its OWN range and therefore carries its OWN
   colorbar**, overlaid in its corner (`Colorbar.vue`, taking an explicit
   min/max). `WignerPanel` uploads `f.variants[variantIndex]` and the renderer
@@ -300,13 +328,12 @@ source) is what keeps startup fast. See `README.md`.
   it" stood over a session already running the imported setup. It survives a
   panel close/reopen on purpose — an import you have not acted on yet is still
   actionable.
-  A render is destroyed by anything that moves the session on — Restart
-  deletes the session (`close` → `videoexport.close_session`, file unlinked
-  mid-write) and computing new records evicts the ones behind the renderer
-  (`record N is no longer retained`). Both used to happen SILENTLY, so
+  A render is destroyed by anything that moves the session on — Restart deletes
+  the session (file unlinked mid-write) and computing new records evicts the
+  ones behind the renderer. Both used to happen SILENTLY, so
   `SimulatorView.mayDiscardExport` confirms first (Restart, and a transport
   command whose action is `solve` — playback adds no records and is never
-  gated) and cancels the job outright on "yes", instead of leaving it to die
+  gated) and cancels the job outright on "yes" rather than leaving it to die
   mid-file. The automatic restarts (first mount, backend recovery) never
   prompt.
 - **mp4 export** (`core/videoexport.py` + `core/render_mpl.py` +
@@ -323,7 +350,7 @@ source) is what keeps startup fast. See `README.md`.
   which makes `PanelGrid`'s two readings the two EDGES of one control rather
   than modes the renderer has to know about — "compare variants" is one plane ×
   every variant, "phase portrait" is every plane × one variant, and the Export
-  panel offers both as one-click presets that just set the checkboxes.
+  panel offers both as one-click presets that set the checkboxes.
   `render_mpl.panel_grid` REFLOWS by count when one dimension is 1 and otherwise
   lays out the matrix itself, rows = planes. Diagnostics are plot ids shared
   VERBATIM with `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`,
@@ -334,17 +361,16 @@ source) is what keeps startup fast. See `README.md`.
   already ARE the spatial and momentum densities. Past `DIAG_ROWS_MAX` = 7 the
   column splits in two and the panels pay for it in width (`diag_layout`); the
   panel states the resulting count and pixel size and warns about thumbnails.
-  Both refusals live in `routers/export.py` and not in the schema, because what
-  is available depends on the session's ndim, which the request body does not
-  carry — and both name what IS available.
+  Both refusals live in `routers/export.py`, not the schema: what is available
+  depends on the session's ndim, which the request body does not carry — and
+  both name what IS available.
   **The frame RENDER, not the encode, is the bottleneck**, so export renders
   frames across a **spawn** `ProcessPoolExecutor` (`WIGNERF_EXPORT_WORKERS`,
   auto = min(cpu, 8)) while this thread feeds ORDERED frames to one ffmpeg —
   a sliding window of ≤w+2 futures consumed FIFO, so workers run ahead with
   memory bounded. Spawn, NOT fork: the backend initializes CUDA and forking
-  after that inherits a broken context; spawn workers only touch
-  matplotlib/numpy. A small job (`< max(2·w, POOL_MIN_FRAMES=16)`) renders
-  serially in-process to skip the ~1-2 s warmup. Encoder via
+  after that inherits a broken context. A small job
+  (`< max(2·w, POOL_MIN_FRAMES=16)`) renders serially to skip the warmup. Encoder via
   `choose_encoder`/`WIGNERF_EXPORT_ENCODER`: auto uses the GPU **`h264_nvenc`
   ENCODER** if a one-shot runtime probe passes (`_nvenc_ok`, cached — it can be
   built-in yet fail with no driver), else `libx264 -preset veryfast -crf 18`.
@@ -362,9 +388,9 @@ source) is what keeps startup fast. See `README.md`.
   Sizes offered: FHD / QHD / 4K UHD. The figure is always 19.2×10.8 in and
   the RESOLUTION RIDES ON THE DPI (`FrameFigure.REF_WIDTH`) — font sizes are in
   points, so a fixed dpi would render every label at half its relative size at
-  4K. The downloaded name is descriptive (via `Content-Disposition`) while the
-  on-disk path keeps session+job ids: two exports of the same range in one
-  minute must not collide, least of all while one is being downloaded.
+  4K. The downloaded name is descriptive (`Content-Disposition`) while the
+  on-disk path keeps session+job ids, so two exports of one range cannot
+  collide while one is downloading.
   **The video must READ like the screen**: every plot title comes from
   `core/axes.py`, the same source `lib/axes.ts` mirrors (γ keeps the UI's
   "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²), field labels
@@ -383,17 +409,16 @@ source) is what keeps startup fast. See `README.md`.
   go into the mp4 `comment` tag as JSON. It is anchored at `FrameFigure.META_TOP`
   with `va="top"` and grows DOWNWARD, and **11 lines fit at 8 pt**; a realistic
   4-variant run sits at the edge, so `_meta_fontsize` shrinks to fit (one size
-  for BOTH columns, derived from `get_figheight()`) and past a 5 pt floor
-  `_meta_fit` elides with a pointer to the comment tag, an honest one because
-  `describe.config_json` really does carry all of it. `describe.IC_SRC_MAX`
-  caps an IC expression against the same budget, in PHYSICAL lines and measured
-  — see its comment. Static art, baked into the blit background: no per-frame
+  for BOTH columns) and past a 5 pt floor `_meta_fit` elides with a pointer to
+  the comment tag — honest, because `describe.config_json` really carries it.
+  `describe.IC_SRC_MAX` caps an IC expression against the same budget, in
+  PHYSICAL lines. Static art, baked into the blit background: no per-frame
   cost.
   Progress: `export` events on the session WS plus a REST poll; the file lives
   in `WIGNERF_EXPORT_DIR` until downloaded, TTL (30 min), session close or
   shutdown. The header button stays ENABLED while computing (a disabled button
   explained only by a tooltip is how this feature first read as broken): the
-  panel states the gate and "Pause & render" pauses, waits for the server to
+  panel states the gate, and "Pause & render" pauses, waits for the server to
   confirm and re-seeds an untouched range before posting. Rendering continues
   while the popover is CLOSED, so the button IS the notification — "⤓ export
   42%" while running, emerald "⤓ export ready" (red "failed") when finished. The
@@ -502,12 +527,11 @@ source) is what keeps startup fast. See `README.md`.
   (1 s), so a field the form marks amber could stay amber for a second after the
   "✓ applied" flash had confirmed the change. Pinned by
   `test_params_applied_is_followed_by_a_fresh_status`.
-  `apply_params` compares against what is LIVE and drops the fields that did not
-  change — no worker command, no `param_log` entry, no `params_applied`, and
-  nothing at all if the whole message is a no-op (the UI sends complete fields;
-  "Apply live" always carries the U(x) draft, so the log used to fill with U
-  changes that never happened and an export's "how to reproduce this" block lied
-  about its own frames). Entries carry `before` as well as `applied`, so the
+  `apply_params` compares against what is LIVE and drops fields that did not
+  change — no worker command, no `param_log` entry, no `params_applied`, nothing
+  at all if the message is a no-op ("Apply live" always carries the U(x) draft,
+  so the log used to fill with U changes that never happened and an export's
+  "how to reproduce this" block lied about its own frames). Entries carry `before` as well as `applied`, so the
   block renders "ℏ 1 → 2" and `describe.state_at` rewinds the header physics to
   the FIRST exported record. Live changes are visible in the UI: the header
   flashes "✓ applied …", and any live-appliable field whose form value differs
@@ -523,10 +547,9 @@ source) is what keeps startup fast. See `README.md`.
   **Solve carries the form's U(x).** `SimulatorView.sendCommand` pushes
   `set_params {U: cfg.potential}` before a `play` whose action is `solve`,
   whenever the form's validated U differs from `status.potential`. Without it
-  the form was authoritative for nothing: measured 369 records computed under
-  `x^2/2` behind a form reading `x^2/2 + 5*x^4`, the only signal being an amber
-  input in a panel that can be hidden. Playback is excluded — it computes
-  nothing. So "Apply live" is gated on `status.computing`, NOT on `live` and NOT
+  the form was authoritative for nothing: 369 records computed under `x^2/2`
+  behind a form reading `x^2/2 + 5*x^4`, the only signal an amber input in a
+  panel that can be hidden. Playback is excluded — it computes nothing. So "Apply live" is gated on `status.computing`, NOT on `live` and NOT
   on `running`: while nothing computes there is no live run to reach and Solve
   does the job. `computing`, because `running` is true during pure PLAYBACK too,
   where the button's own tooltip would be false. What is left is one emerald
@@ -640,12 +663,11 @@ source) is what keeps startup fast. See `README.md`.
   `x1/x2` (and `y1/y2`) as what to SAMPLE — the editor zooms them, and zooming
   out past the domain is how the interesting part of U is found — while both
   validity boxes come from `req.grid`: `spatial_ranges()` for the classical
-  gradient probe and `spatial_extended()` for the quantum one. That is the same
-  pair `routers/sessions.compile_for` uses at create time, which is the point:
-  tie the classical probe to the zoom instead and the panel stops predicting the
-  API. Measured symptom — `1/x` on a grid of [-6, 6], zoomed to [1, 6]: the
-  badge reads `classical ✓`, the Solve gate opens, and `POST /sessions` 422s on
-  the potential the editor had just approved. Pinned by
+  gradient probe and `spatial_extended()` for the quantum one, the same pair
+  `routers/sessions.compile_for` uses at create time. Tie the classical probe to
+  the zoom instead and the panel stops predicting the API: `1/x` on [-6, 6]
+  zoomed to [1, 6] reads `classical ✓`, opens the Solve gate, and 422s on the
+  potential the editor had just approved. Pinned by
   `test_the_validity_probe_follows_the_GRID_not_the_zoom`.
   **At ndim=2 the editor draws the two axis cuts on TWO charts, not two traces**
   (`PotentialEditor.vue`): uPlot's `AlignedData` has ONE shared abscissa and
@@ -710,16 +732,16 @@ count** (`routers/sessions._fit_error`) — **and since M3 the same question is
 asked again whenever auto-expand wants to DOUBLE the grid.** The arithmetic
 behind both lives in `core/fit.py` so the two cannot drift; the messages do not,
 because the create-time advice ("drop a variant, change device") is unavailable
-mid-run. `WIGNERF_MAX_CELLS_2D` is only a rail: the operative check runs
-`assign_devices` to learn which devices this session's workers land on, counts
-the workers per device, and compares
+mid-run. The cell rails are only rails: the operative check runs `assign_devices` to
+learn which devices this session's workers land on, counts them per device, and
+compares
 `n·cells·bytes_per_cell(ndim, precision) + CONTEXT_BYTES` (300 MiB of CUDA context + cuFFT
 plan cache, per process per device) against `xp.device_free_bytes(dev)` ×
-`FIT_MARGIN` (0.9). Free memory comes from the driver (`mem_info`), or from
-`MemAvailable` for `cpu`, so whatever else is on the card is already counted.
-Two properties are load-bearing: **the SMALLER card binds**, which no
-per-session cell count can express; and **unknown free memory does NOT refuse**,
-because there the rail is the only guard and guessing would be worse.
+`FIT_MARGIN` (0.9). Free memory comes from the driver (`mem_info`), or `MemAvailable` for `cpu`, so
+whatever else is on the card is already counted. Two load-bearing properties:
+**the SMALLER card binds**, which no per-session cell count can express; and
+**unknown free memory does NOT refuse**, because there the rail is the only
+guard and guessing would be worse.
 **IT RUNS AT EVERY ndim SINCE 2026-08-05.** It used to skip ndim=1 "because
 `WIGNERF_MAX_GRID` already bounds a worker" — true of that var's DEFAULT (4096²,
 ~3.0 GiB) and not of the var, which is tunable to 16384 and which `wignerf.env`
@@ -735,61 +757,55 @@ firing again. Pinned by `test_the_device_fit_check_is_the_operative_guard`.
 **Its refusal describes the POOL, and the ROOMIEST device decides which of two
 stories it tells.** If the per-worker footprint exceeds EVERY device's budget it
 says *no device in the pool can hold even one*, names the roomiest with its
-free/installed figures, and states that dropping a variant or changing device
-will not help — because neither will, and only the grid is left. Otherwise a
-worker does fit somewhere, which makes it a DISTRIBUTION problem: it names the
-over-subscribed device and points at the one with room, with a count. It used to
-name whichever assigned device sorted first and always close with "pick a device
-with more room", which on the real pair implied a roomier card that could not
-hold one worker either. Pinned by
+free/installed figures, and says dropping a variant or changing device will not
+help — because neither will, and only the grid is left. Otherwise a worker does
+fit somewhere, making it a DISTRIBUTION problem: it names the over-subscribed
+device and points at the one with room, with a count. It used to name whichever
+assigned device sorted first and close with "pick a device with more room",
+which on the real pair implied a roomier card that could not hold one either. Pinned by
 `test_the_fit_refusal_describes_the_POOL_not_the_first_device`.
 
 **The IC preview is BOUNDED the same two ways** — by `protocol.grid_limit_error`
 (the shared rail: a grid a session would refuse is one the preview must not
 allocate either) and, before the CPU fallback, by `preview._cpu_fit_error`,
-which asks `xp.device_free_bytes("cpu")` the question `_fit_error` asks of a
-card. Both are needed, because the preview builds the FULL state at the
-requested grid and fires on every form change, long before anyone presses
-Restart — while `_fit_error` runs only at session creation. The GPU path was
-never the hazard (`_pick_device` simply declines); the CPU fallback is the one
-that needed the check, which is why the rail has to be at the door AND the
-fallback has to measure. **`/preview/wavefunction` is behind the same rail**,
+which asks `xp.device_free_bytes("cpu")` what `_fit_error` asks of a card. Both
+are needed: the preview builds the FULL state at the requested grid and fires on
+every form change, long before anyone presses Restart, while `_fit_error` runs
+only at creation. The GPU path was never the hazard (`_pick_device` declines);
+the CPU fallback is what needed the check. **`/preview/wavefunction` is behind the same rail**,
 and its φ quadrature is chunked (`initial._phi_along`, `PHI_KERNEL_BYTES`)
 because an (N_k × N_q) kernel written in one piece is quadratic in the grid.
 
 **The IC preview runs on a GPU too, and hands the VRAM straight back**
 (`routers/preview.py`). CPU-only was the right instinct and the wrong trade: the
 preview is built at the SESSION's grid, so at 8192² it is the same 67M-cell
-array the solver evolves — measured **25.9 s on the CPU against 0.50 s on the
-3090**, paid on every page reload AND every IC edit. (That asymmetry is the tell
-if it regresses: big panel instant, small IC panel slow.) What matters is the
+array the solver evolves — **25.9 s on the CPU against 0.50 s on the 3090**,
+paid on every page reload AND every IC edit. (That asymmetry is the tell if it
+regresses: big panel instant, small IC panel slow.) What matters is the
 transient PEAK, so `_pick_device` takes the CUDA device with the most FREE VRAM
 and only if the build fits with 1.4× headroom, GPU previews are serialized
 (`_gpu_lock`) so two peaks cannot stack, and ANY failure falls back to the CPU.
 The release works only because `_build_frame` keeps every device array in its
 own frame, so they die on return before `free_all_blocks()`.
 
-**Two things about that release are load-bearing and both were wrong until
-2026-07-25.** **The preview allocates from its OWN pool** (`_pool`, installed
-with `cupy.cuda.using_allocator`, which is thread-local — previews run in
-starlette's threadpool, workers own their own threads). `free_all_blocks()` acts
-on whichever pool it is handed and there is no per-backend allocator, so
+**Two things about that release are load-bearing.** **The preview allocates
+from its OWN pool** (`_pool`, via `cupy.cuda.using_allocator`, which is
+thread-local — previews run in starlette's threadpool). `free_all_blocks()`
+acts on whichever pool it is handed and there is no per-backend allocator, so
 releasing the process DEFAULT pool also returned the running workers' cached
-blocks to the driver — on every IC keystroke, the exact opposite of what the
-free-VRAM check is for. Isolation is free (measured 3.1 ms cold against 2.6 ms
-pool-warm, and the release empties the pool after every preview anyway).
+blocks to the driver, on every IC keystroke — the exact opposite of what the
+free-VRAM check is for. Isolation is free.
 **And the failure path needs a SECOND release, after the `except` handler has
 exited.** While an exception propagates, its traceback still references
 `_build_frame`'s frame and every device array in it, so the `finally`'s
 `free_all_blocks()` frees nothing — and a release *inside* the handler is no
-better, the exception is live for the whole handler. That is why a client error
-caught there (`initial.ICError`) records `failed` and re-raises AFTER the
-release rather than raising from inside the handler. Untreated, a preview that
-OOMs at 8192² parks GiB on the card until the next SUCCESSFUL preview.
-Related: that handler logs `traceback.format_exc()` and deliberately NOT
-`exc_info=True`, because a LogRecord built with `exc_info` stores the traceback,
-and any handler that retains records (pytest's log capture does) then pins the
-frame past the release.
+better, the exception being live for the whole handler. Hence a client error
+(`initial.ICError`) records `failed` and re-raises AFTER the release. Untreated,
+a preview that OOMs at 8192² parks GiB on the card until the next SUCCESSFUL
+one. Related: that handler logs `traceback.format_exc()` and deliberately NOT
+`exc_info=True` — a LogRecord built with `exc_info` stores the traceback, and
+any handler that retains records (pytest's log capture) then pins the frame
+past the release.
 
 Measurements — the per-cell footprint tables, the 88 B/cell preview figure and
 the free/reserved readings behind every claim here — are in
@@ -806,9 +822,9 @@ the free/reserved readings behind every claim here — are in
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
 | `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` ENCODER if a runtime probe succeeds, else `libx264 -preset veryfast`. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to rawvideo input). The host default; `ExportSpec.encoder` overrides it per JOB, which is the right granularity — the best choice depends on what else is competing for cores at that moment. |
 | `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`); a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
-| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, and `setNdim` asks the same function). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`): **192 B/cell in float64 and 104 in float32** since M7 — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², plus ~300 MiB of CUDA context per process per device. These are HIGHER than step-loop figures and that is not a regression: a step loop misses `adjust_step`'s transient and the frame build. Workers spread over the pool, so what matters is the per-card share — 4 variants at 8192² is ~24 GiB/card at 2+2, which does **not** fit even the 3090, so cap by variant count and not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
-| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all. What actually binds is the per-device fit check, `routers/sessions._fit_error` (see the GPU section). **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree until the restart. Reading them off `status` broke the panel in BOTH directions (a 2D form offering N up to 4096 with no footprint line at all, and a 1D form's select collapsing to one option). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted for that reason, since both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling.** **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis, so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API. **`AXIS_N_FLOOR` is shared with `setNdim`, and that is the whole point of it being a constant**: a dims switch lands N *inside the target's list* — their own choice when offerable, else that ndim's DEFAULT, everything clamped by the target's cap. Capping from ABOVE alone was wrong the other way: 1D → 2D → 1D brought the 2D choice back, so the select rendered with a HOLE in it and a 1D session ran at 64². Falling back to the FLOOR is its quieter twin. Pinned in `config.test.ts`. |
-| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values, and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, far past any card here, and a fixed cell count is wrong in both directions (refusing 128×128×64×64 on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one). The real check asks the driver. Measured with `bench.py --ndim 2 --footprint`, which runs a whole worker record rather than a step loop: **176 B/cell in float64 and 96 in float32 (55%)**, both flat across sizes and both identical for the relativistic variants — 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ in float64. So 4 variants at 64⁴ split 2+2 is ~5.5 GiB/card in float64, and **80⁴ is reachable only in float32**. **The STATE is only 5% of that** — W is real, so float64 = 8 B/cell — and the rest is the step's machinery at full shape. `config.BYTES_PER_CELL_2D` carries the stage-by-stage breakdown and is **keyed by precision** (`config.bytes_per_cell(ndim, precision)`) because `_fit_error` reads it: a flat float64 figure there would refuse precisely the grids float32 makes affordable. Throughput on the 3090: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run**. Both the rail's refusal and the fit check quote the estimate, and `/api/device`'s `bytes_per_cell` (per ndim, per precision) feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — at either ndim, though the 1D line stays quiet under 0.5 GiB where the number decides nothing. |
+| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, and `setNdim` asks the same function). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`): **192 B/cell in float64 and 104 in float32** — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², plus ~300 MiB of CUDA context per process per device. HIGHER than step-loop figures, and not a regression: a step loop misses `adjust_step`'s transient and the frame build. Workers spread over the pool, so what binds is the per-card share — 4 variants at 8192² is ~24 GiB/card at 2+2, which does **not** fit even the 3090, so cap by variant count and not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
+| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all. What actually binds is the per-device fit check, `routers/sessions._fit_error` (see the GPU section). **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree until the restart. Reading them off `status` broke the panel in BOTH directions (a 2D form offering N up to 4096 with no footprint line at all, and a 1D form's select collapsing to one option). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted because both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling.** **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis, so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API. **`AXIS_N_FLOOR` is shared with `setNdim`**: a dims switch lands N *inside the target's list* — their own choice when offerable, else that ndim's DEFAULT, clamped by the target's cap. Capping from ABOVE alone left a HOLE in the select (1D → 2D → 1D ran a 1D session at 64²); falling back to the FLOOR is its quieter twin. Pinned in `config.test.ts`. |
+| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values, and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, and a fixed cell count is wrong in both directions (refusing 128×128×64×64 on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one). The real check asks the driver. Measured with `bench.py --ndim 2 --footprint`, which runs a whole worker record rather than a step loop: **176 B/cell in float64 and 96 in float32**, flat across sizes and identical for the relativistic variants — 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ in float64, so **80⁴ is reachable only in float32**. **The STATE is only 5% of that** (W is real: 8 B/cell); the rest is the step's machinery at full shape. `config.BYTES_PER_CELL_2D` carries the breakdown and is **keyed by precision** because `_fit_error` reads it: a flat float64 figure would refuse precisely the grids float32 makes affordable. Throughput on the 3090: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — **32⁴ is for exploration and 64⁴ is a serious run**. Both the rail's refusal and the fit check quote the estimate, and `/api/device`'s `bytes_per_cell` (per ndim, per precision) feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — at either ndim, though the 1D line stays quiet under 0.5 GiB where the number decides nothing. |
 
 ## Commands
 
@@ -860,10 +876,12 @@ counts so a transposed index cannot pass), and update the vitest, which runs
 
 UI debugging without touching the real display: drive the BUILT SPA with
 headless Chrome via `puppeteer-core` (frontend devDep; system Chrome at
-/usr/bin/google-chrome, flags `--no-sandbox --disable-gpu`). The series
-plots expose `window.__wfSeries.<which>()` (poller state) and element
-screenshots of `.wf-plot` reveal what uPlot actually painted — this is how
-the "flat purity line camouflaged on a gridline" bug was found.
+/usr/bin/google-chrome, flags `--no-sandbox --disable-gpu`). Seed
+`localStorage['wignerf.cfg']` BEFORE the first navigation to choose the grid —
+the wrong key looks like it worked and silently measures the default. The
+series plots expose `window.__wfSeries.<which>()` and element screenshots of
+`.wf-plot` reveal what uPlot painted — how the "flat purity line camouflaged on
+a gridline" bug was found.
 `window.__wfPerf.snapshot()/reset()` (lib/perf.ts) exposes frame-pipeline
 counters: received/painted rates, MiB/s, queue drops, per-stage avg ms
 (decode/upload/draw/plots/fanout), the GL renderer string (SwiftShader
@@ -879,27 +897,27 @@ Grid section became a four-axis table.
 **Do NOT trust a headless SCREENSHOT of a WebGL canvas, and never conclude
 anything from one alone.** Under SwiftShader a canvas that redraws every frame
 screenshots correctly while one that painted once comes out blank — measured
-side by side on the same page, and the blank one's drawing buffer read back 8%
-coloured pixels, i.e. the content was there the whole time. A whole "the IC
-preview is broken" reproduction was that artifact. The reliable oracle is
-`gl.readPixels` into a counter, and the reliable context probe holds the context
-object **captured at getContext time**: re-querying `canvas.getContext('webgl2')`
-later returned null on a live context and made two separate probes disagree.
+side by side, and the blank one's drawing buffer read back 8% coloured pixels,
+i.e. the content was there all along. A whole "the IC preview is broken"
+reproduction was that artifact. The reliable oracle is `gl.readPixels` into a
+counter, and the reliable context probe holds the object **captured at
+getContext time**: re-querying `canvas.getContext('webgl2')` later returns null
+on a live context — which also means readback is UNAVAILABLE from outside the
+renderer, so verify a panel through what it reports (see
+`notes/downsampling.md`) rather than through its pixels.
 
-**And the real bug that hunt uncovered, which IS worth knowing: a remounted
-WebGL canvas leaks its context until GC, and browsers cap live contexts (16 in
-Chrome) by silently killing the OLDEST.** `WignerRenderer.dispose()` therefore
-calls `WEBGL_lose_context.loseContext()`; deleting the textures and program is
-not a substitute, the same way `gc.collect()` rather than refcounting is what
-frees a closed session on the backend. Restart bumps `plotsKey` and remounts
-PanelGrid, so every Restart built a fresh context per panel — SIX at ndim=2
-against 1D's one — and after two or three of them Chrome reclaimed the page's
-oldest context, which is the IC editor's, created at first mount. Nothing
-reported it: `webglcontextlost` fired on a component that never listened, and
-every later GL call succeeded as a no-op, so the IC preview was simply blank for
-the rest of the page's life and a reload "fixed" it. Measured across six
-Restarts in a two-panel layout: detached-but-alive contexts 2, 4, 6, 8, 10, 12
-without the release and 0 with it.
+**And the real bug that hunt uncovered: a remounted WebGL canvas leaks its
+context until GC, and browsers cap live contexts (16 in Chrome) by silently
+killing the OLDEST.** `WignerRenderer.dispose()` therefore calls
+`WEBGL_lose_context.loseContext()`; deleting the textures and program is not a
+substitute, the same way `gc.collect()` rather than refcounting is what frees a
+closed session. Restart bumps `plotsKey` and remounts PanelGrid, so every
+Restart built a fresh context per panel — SIX at ndim=2 against 1D's one — and
+after two or three Chrome reclaimed the page's oldest, the IC editor's. Nothing
+reported it: `webglcontextlost` fired on a component that never listened and
+every later GL call succeeded as a no-op, so the IC preview was blank for the
+rest of the page's life and a reload "fixed" it. Measured across six Restarts:
+detached-but-alive contexts 2, 4, 6, 8, 10, 12 without the release, 0 with.
 
 ## Roadmap (v2, agreed 2026-07-19)
 
@@ -943,12 +961,13 @@ be a constant nobody had listed (`BYTES_PER_CELL_2D`, `RangeStats.scale`,
 the worker got smaller) — but expect false positives there too, and settle them
 by measuring at the point the code actually runs, not by reasoning from two
 documented measurements; and **a gate can carry a stale REASON**, so re-measure
-the claim it rests on and not only the risk it names.
+the claim it rests on and not only the risk it names (the 1D fit check, below,
+is that lesson firing a second time).
 
 | # | Milestone | What it needs |
 |---|---|---|
-| M5 | **Cuts / slices** | The wire already reserves a per-plane `mode` byte and only `mode=0` (projection) is defined. Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime; a cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
-| M6 | **FFT fusion** | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, which changes numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass in both 1D and 2D. |
+| M5 | **Cuts / slices** | The wire reserves a per-plane `mode` byte and only `mode=0` (projection) is defined. Projections are EXACT for separable states but average away fringe contrast for entangled ones, precisely the interesting 2D regime; a cut at fixed (y, py) keeps the interference. Purely additive — a new `mode` value, no version bump, no new reduction cost (a cut is cheaper than a projection). |
+| M6 | **FFT fusion** | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, changing numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass at both ndim. |
 ## Conventions / gotchas
 
 - Do not reference the old project website domain anywhere in wignerf —
@@ -989,12 +1008,11 @@ the claim it rests on and not only the risk it names.
   `test_matches_an_independent_schroedinger_run`: evolve ψ(x,y) with an
   ordinary split-operator TDSE — a different method sharing nothing but
   numpy's FFT — under a COUPLED potential (Hénon–Heiles), and compare the
-  streamed (x,y) plane against |ψ|² cell by cell. Measured 2026-07-26, relative
-  error at t = 1: correct shift **1.45e-4 at dt = 0.02 and 3.43e-5 at 0.01
-  (ratio 4.22, i.e. O(dt²))**; independent shift **7.83e-3 and 7.81e-3 (ratio
-  1.003, FLAT)**. 228× worse and dt-independent, because a wrong shift is a
-  different evolution OPERATOR, not a smaller time step away from the right
-  one. So the assertion that matters is the dt RATIO, not a tolerance — do not
+  streamed (x,y) plane against |ψ|² cell by cell. Relative error at t = 1:
+  correct shift **1.45e-4 at dt = 0.02 and 3.43e-5 at 0.01 (ratio 4.22,
+  O(dt²))**; independent shift **7.83e-3 and 7.81e-3 (ratio 1.003, FLAT)**.
+  228× worse and dt-independent, because a wrong shift is a different evolution
+  OPERATOR, not a smaller time step away from the right one. So the assertion that matters is the dt RATIO, not a tolerance — do not
   "simplify" it to a single run. And do not extend the sweep to dt = 0.005:
   the ratio falls to 1.9 there because the residual has reached a
   dt-independent ~1.5e-5 floor set by the GRID (the Bopp shift samples U
@@ -1004,13 +1022,12 @@ the claim it rests on and not only the risk it names.
 - **The other 2D anchors, and what each is for.** Separability: for
   U = Ux(x) + Uy(y) and a product IC, W_2D(t) must equal the outer product of
   two 1D runs — a separable U makes dU a SUM, so the exponent factorises
-  exactly, which validates the whole 4D pipeline against code the 1D suite
-  already trusts (measured 5.9e-11 of the peak after 150 steps, pure
-  `exp(a+b)` vs `exp(a)exp(b)` roundoff). ⟨Lz⟩: conserved by a central U to
-  5.65e-6 over 300 steps and off by 3.05 (150%) for an anisotropic one — a
-  5e5 separation, and the drift is IDENTICAL for the quantum and classical
-  variants, which is the tell that it is the square lattice breaking
-  rotational symmetry rather than physics. And a reductions-vs-naive test
+  exactly, validating the whole 4D pipeline against code the 1D suite already
+  trusts (5.9e-11 of the peak after 150 steps, pure `exp(a+b)` vs
+  `exp(a)exp(b)` roundoff). ⟨Lz⟩: conserved by a central U to 5.65e-6 over 300
+  steps and off by 3.05 (150%) for an anisotropic one — a 5e5 separation, and
+  the drift is IDENTICAL for the quantum and classical variants, the tell that
+  it is the square lattice breaking rotational symmetry rather than physics. And a reductions-vs-naive test
   over all six planes and four marginals, which is what catches 4-axis
   fftshift bookkeeping — the likeliest porting error after the shift pairing.
 - **RELATIVISTIC 2D (`qr`/`cr`, M2)**: the physics core was already generic —
@@ -1041,14 +1058,14 @@ the claim it rests on and not only the risk it names.
 - **2D mp4 EXPORT (M4): the frame is a SELECTION, real subscripts are FREE, and
   the blit decides where static art may live.** **Read `notes/export.md` before
   editing `core/render_mpl.py`** — it carries the measurements. The rules:
-  **MATHTEXT IS USED**, because the figure BLITS, so every title and axis label
-  is a STATIC artist baked into the background once and costs nothing in situ.
+  **MATHTEXT IS USED**, because the figure BLITS: every title and axis label is
+  a STATIC artist baked into the background once and costs nothing in situ.
   `axes.sub_math` typesets the two-letter axis names as `$p_x$` and everything
-  else — ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ — stays the same Unicode the screen uses, so the
-  two cannot drift and 1D is untouched at the byte level. **usetex is NOT used**
+  else — ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ — stays the Unicode the screen uses, so the two
+  cannot drift and 1D is untouched at the byte level. **usetex is NOT used**
   (12×, needs a LaTeX install the VPS lacks, cannot render our Unicode, and is
-  global — the user's own U(x) would go through it). **And it has to be the
-  WHOLE frame**, because half the job reads worse than none: the same axis would
+  global — the user's own U(x) would go through it). **And it must be the WHOLE
+  frame**: half the job reads worse than none, since the same axis would
   otherwise appear twice on one screen in two spellings.
   **The metadata block is WRAPPED PLAIN and typeset afterwards** (`_emit`) —
   `$p_x$` is five characters that draw as two glyphs, so which characters land
@@ -1068,10 +1085,9 @@ the claim it rests on and not only the risk it names.
   **AN IC EXPRESSION IS NEVER TYPESET AT ALL**, and says so by returning `None`
   from `describe.ic_expression(math=True)` rather than a copy of the plain line.
   `_emit` only skips substitution on its single-fragment branch, so identical
-  strings looked equivalent and were not: the moment the line wrapped it ran
-  `sub_math_text` on every fragment and a user's literal `px` became `$p_x$`
-  after all — measured on a 126-character 2D wexpr, well inside every cap, and
-  invisible at ndim=1 where the axis names are single letters. `None` is the
+  strings looked equivalent and were not: once the line wrapped it ran
+  `sub_math_text` on every fragment and a user's literal `px` became `$p_x$` —
+  invisible at ndim=1, where the axis names are single letters. `None` is the
   signal `_emit` already had for "there is no typeset twin".
   **The header readout and the block deliberately DISAGREE**: the header's
   geometry follows the PAINTED record as the SPA does; the block's is labelled
@@ -1098,24 +1114,24 @@ the claim it rests on and not only the risk it names.
   ALREADY holding the worker wanting to grow, which `F` alone refuses (the
   figures moved with M7 and the shape did not; recompute them, do not carry
   them);
-  **it is asked of a DOUBLING and of nothing else** — for a pure window shift
+  **it is asked of a DOUBLING and nothing else** — for a pure window shift
   `per_new == per_old` and the same expression would demand free memory to slide
   a window that allocates nothing, so `fit.regrid_shortfall` returns `[]` for
-  any non-growing window BEFORE it reads the driver, and the reading is taken
-  ONCE per attempt because a re-read between candidates could accept a plan
-  neither reading allows;
+  any non-growing window BEFORE it reads the driver; the reading is taken ONCE
+  per attempt, since a re-read between candidates could accept a plan neither
+  reading allows;
   **release before allocate** in `worker._apply_regrid` (exponent slots first,
   then the state through a one-element box so `_run`'s local does not pin it,
-  then `set_grid` dropping meshes, FFT plans and this thread's cuFFT plan cache)
-  — this is what makes `REGRID_PEAK` = 1.10 honest, and it is ALLOCATION ORDER
-  ONLY, so ndim=1 stays bitwise unaffected;
+  then `set_grid` dropping meshes, FFT plans and this thread's cuFFT cache) —
+  what makes `REGRID_PEAK` = 1.10 honest, and ALLOCATION ORDER ONLY, so ndim=1
+  stays bitwise unaffected;
   **what the guard cannot see is ACCEPTED** — another process, a sibling session
   whose committed plan has not landed, the bigger unguarded transients
   elsewhere; `FIT_MARGIN` does not cover them and must not be read as if it did.
   What makes that acceptable is the failure mode: a lost race is a cupy OOM
-  inside `_apply_regrid`, fatal by design, so the session pauses LOUDLY with a
-  traceback (pinned by `test_a_failed_regrid_stops_the_run_instead_of_going_
-  quiet` — the day that goes silent the limitation stops being acceptable);
+  inside `_apply_regrid`, fatal by design, so the session pauses LOUDLY (pinned
+  by `test_a_failed_regrid_stops_the_run_instead_of_going_quiet` — the day that
+  goes silent the limitation stops being acceptable);
   and **`no_room` is its own boundary ACTION with a `limit` FIELD**, not a
   flavour of `capped`. `capped` = the per-axis `WIGNERF_MAX_GRID` ceiling,
   `no_room` = the guard made us give a doubling up, and their remedies are
@@ -1142,10 +1158,10 @@ the claim it rests on and not only the risk it names.
   **At 32⁴ it puts REAL mass in the edge band and latches the boundary warning
   within ~7 s** — 1.0e-3 of the integral against 3.1e-5 for the IDENTICAL state
   in float64; 48⁴ stays clear and 64⁴ flickers, so it is the COARSE grid that
-  cannot carry single precision, not 2D as such. **No threshold was moved for
-  this**, deliberately: the mass is genuinely there, it GROWS with step count so
-  any fixed threshold is outrun by a long enough run, and one high enough to be
-  safe would sit past the point where real wrap does damage. What changed is the
+  cannot carry single precision, not 2D as such. **No threshold was moved**,
+  deliberately: the mass is genuinely there, it GROWS with step count so any
+  fixed threshold is outrun by a long enough run, and one high enough to be safe
+  would sit past the point where real wrap does damage. What changed is the
   WORDS — `SimulatorView.boundaryTitle` names single precision as a cause in a
   float32 2D session, because the standing remedy ("restart with a larger
   domain") is the one thing that cannot help here. Pinned by
@@ -1167,11 +1183,11 @@ the claim it rests on and not only the risk it names.
   **THE MOMENTUM BOX CANNOT PRODUCE A NORM DEFICIT, AND NOTHING ELSE SEES IT
   EITHER.** The transform is exactly N_k-periodic in the momentum index, so
   content outside the box ALIASES back in rather than being lost. Measured on a
-  packet at p₀ = +2 with the momentum box [−10, −2], which excludes its mean
-  momentum entirely: norm 1.0000000000, purity 1.000000, edge band 6.5e-06 —
-  every scalar diagnostic perfect on a completely wrong state, while
-  `_psi_lattice`'s direct-quadrature **momentum mass** reads 4.8e-16. It is the
-  only detector there is; do not remove it because "the edge band covers that".
+  packet at p₀ = +2 with a momentum box excluding its mean momentum entirely:
+  norm 1.0000000000, purity 1.000000, edge band 6.5e-06 — every scalar
+  diagnostic perfect on a completely wrong state, while `_psi_lattice`'s
+  direct-quadrature **momentum mass** reads 4.8e-16. It is the only detector
+  there is; do not remove it because "the edge band covers that".
   **ψ IS NORMALISED OVER THE EXTENDED SPATIAL BOX**, so ∫W dμ is the in-box mass
   fraction and the norm deficit keeps the meaning it has for the Gaussian kinds;
   normalising over the visible box makes it a structural zero. The extension is
@@ -1181,14 +1197,12 @@ the claim it rests on and not only the risk it names.
   **THE NORMALIZER IS BOUNDED FROM BOTH SIDES, AND THE UPPER BOUND IS THE ONE
   THAT IS EASY TO FORGET.** Every sample can be finite while the total is not —
   `exp(-x^2/2)*exp(360)` overflows only when SQUARED — and dividing by inf was
-  silent in both directions: a `wexpr` came out identically ZERO (blank panel,
-  ∫W = 0, no warning) and a `psi` came out all-NaN, which **no diagnostic can
-  see either, because every one of them is a `>` comparison and NaN fails all of
-  them** (measured: an all-NaN state produces `warnings: []`). Reachable in
-  eighteen characters, precisely because these kinds auto-normalise. The lower
-  test is RELATIVE for the same reason — an absolute floor refused
-  `1e-15*exp(-x^2-p^2)`, a perfectly good state, with a sentence claiming it had
-  no positive total. `psi_wigner` also checks `isfinite(W)` as `wexpr_wigner`
+  silent both ways: a `wexpr` came out identically ZERO (blank panel, ∫W = 0, no
+  warning) and a `psi` all-NaN, which **no diagnostic sees either, because every
+  one is a `>` comparison and NaN fails all of them**. Reachable in eighteen
+  characters, precisely because these kinds auto-normalise. The lower test is
+  RELATIVE for the same reason — an absolute floor refused
+  `1e-15*exp(-x^2-p^2)`, a perfectly good state. `psi_wigner` also checks `isfinite(W)` as `wexpr_wigner`
   does: `_psi_lattice` validates ψ only on the CAPPED lattice while the build
   evaluates it over the full extended reach.
   **THE PROBE DTYPE MUST BE THE ONE THE BUILD USES, and the two kinds differ.**
@@ -1222,20 +1236,18 @@ the claim it rests on and not only the risk it names.
   `grid_limit_error`'s docstring is about) and an over-the-rail grid does not
   pay for a sympy parse and a 33⁴ probe first.
   **CARRYING BOTH SHAPES IS LEGAL, AND THE FOREIGN ONE IS NORMALISED AWAY
-  RATHER THAN REFUSED.** The editor holds a default for every tab at once —
-  that is what makes switching tabs non-destructive — so a form on the `wexpr`
-  tab genuinely has Gaussian components behind it, and so does every stored
-  config, setup document and mp4 comment tag written before `expr` existed.
-  `ICSpec._check` therefore requires the kind's own field and DROPS the other,
-  which keeps the dead one out of `describe.setup_document` and off
-  `SessionCreate`'s per-component ndim loop with one rule in one place.
-  `lib/config.icPayload` sends only the active kind's shape too; that is belt
-  and braces, and the schema is the belt. **Refusing the foreign field instead
-  was shipped and immediately broke a cold start** — with local data cleared,
-  selecting the W(x,p) or ψ(x) tab answered *"an IC of type 'wexpr' is one
-  expression and carries no Gaussian components (got 1)"*, a schema telling a
-  client its own defaults were invalid. A rule that only holds once every client
-  has been rewritten is not a schema rule; normalise at the door instead.
+  RATHER THAN REFUSED.** The editor holds a default for every tab at once — that
+  is what makes switching tabs non-destructive — so a form on the `wexpr` tab
+  genuinely has Gaussian components behind it, as does every stored config and
+  setup document written before `expr` existed. `ICSpec._check` requires the
+  kind's own field and DROPS the other, keeping the dead one out of
+  `describe.setup_document` and off `SessionCreate`'s per-component ndim loop.
+  `lib/config.icPayload` sends only the active kind's shape too — belt, and the
+  schema is the braces. **Refusing the foreign field was shipped and instantly
+  broke a cold start**: with local data cleared, selecting the W(x,p) tab
+  answered *"an IC of type 'wexpr' … carries no Gaussian components (got 1)"* —
+  a schema telling a client its own defaults were invalid. A rule that only
+  holds once every client has been rewritten is not a schema rule.
 - **MASSLESS (m = 0) relativistic runs lose purity to the |k| KINK, and it is
   the GRID not the step.** m = 0 became reachable in 2D only with M2 (the schema
   requires exclusively relativistic variants there, since non-relativistic
@@ -1245,16 +1257,15 @@ the claim it rests on and not only the risk it names.
   `c·sign(p)` BITWISE, because `sqrt(k*k) == |k|` exactly for every finite
   lattice value and `sign(0)` was already 0. Pinned by
   `test_the_massless_gradient_reduces_to_the_1d_convention`.
-  What massless does cost is purity, because T = c|k| is not smooth at the origin
-  and its Bopp difference has slowly-decaying Fourier content in λ that a finite
-  lattice truncates. Measured over 100 steps at 32⁴: **m=0 quantum −7.19e-6 at
-  dt = 0.01 and −6.99e-6 at dt = 0.005 (dt-INDEPENDENT)**, m=0 classical −4.66e-5
-  / −3.43e-5, against m=1 c=1 at −3.27e-9 and m=1 c=137.036 at −4.62e-12. Halving
-  dt does not help; refining the MOMENTUM grid does — **7.19e-6 at N=32 falls to
-  7.16e-7 at N=48**, ~10× for a 1.5× refinement. So the remedy for a user who
-  needs a clean massless run is a finer momentum axis, never a smaller dt. Norm
-  stays at machine precision throughout, which is what says the map is still
-  exactly unitary and it is the RESOLUTION of the kink that is lossy. Only the
+  What massless costs is purity, because T = c|k| is not smooth at the origin and
+  its Bopp difference has slowly-decaying Fourier content in λ that a finite
+  lattice truncates. Over 100 steps at 32⁴: **m=0 quantum −7.19e-6 at dt = 0.01
+  and −6.99e-6 at dt = 0.005 (dt-INDEPENDENT)**, against m=1 c=1 at −3.27e-9.
+  Halving dt does not help; refining the MOMENTUM grid does — **7.19e-6 at N=32
+  falls to 7.16e-7 at N=48**, ~10× for a 1.5× refinement. So the remedy for a
+  clean massless run is a finer momentum axis, never a smaller dt. Norm stays at
+  machine precision throughout, which says the map is still exactly unitary and
+  it is the RESOLUTION of the kink that is lossy. Only the
   CLASSICAL variant reaches the gradient at all; the quantum one differentiates
   T through `qd()`.
 - **Always run uvicorn with `--ws-per-message-deflate false`** (start.sh
@@ -1435,18 +1446,16 @@ the claim it rests on and not only the risk it names.
   `test_detached_session_swept_after_grace_attached_is_shielded` (behaviour, not
   the number) and `test_a_reattach_waits_for_the_previous_streamer_to_let_go`.
 - **The BROWSER'S WebSocket receive path is the large-grid wall, and it
-  degrades with MESSAGE SIZE — not the server, not painting, not pacing.**
-  At 4096² (32 MiB/record) the browser tops out at ~112 MiB/s with
-  `queue_drops: 0` and 8.7 ms/frame of fan-out — idle, waiting on delivery —
-  while the same server feeds a raw Python client at 402 MiB/s. It is NOT a
-  fixed bandwidth: at 2048² that browser sustains ≥480 MiB/s, so the cost is
-  per-message and grows sharply with payload size. **This is what makes
-  display-downsampling the only real fix for interactive 4096²/8192², and why no
-  pacing policy can help** — a pacer targets paint time, 33× off the real
-  constraint. Also: `pack_frame` costs 28 ms/record at 4096² ON THE EVENT LOOP.
-  NB the "~3 GB RSS hump on a full-speed replay, transient, not a leak" recorded
-  here in 2026-07-23 was the UNBOUNDED TRANSPORT BUFFER — bounded now by the
-  credit cap, and the same backlog that was killing the socket. Numbers and that
+  degrades with MESSAGE SIZE — not the server, not painting, not pacing.** At
+  4096² it tops out at ~112 MiB/s with `queue_drops: 0` and the client IDLE,
+  waiting on delivery, while the same server feeds a raw Python client at 402
+  MiB/s; at 2048² the same browser sustains ≥480 MiB/s, so the cost is
+  per-message. **This is what made display downsampling the only real fix, and
+  why no pacing policy can help** — a pacer targets paint time, 33× off the
+  real constraint. Also: `pack_frame` costs 28 ms/record at 4096² ON THE EVENT
+  LOOP. NB the "~3 GB RSS hump, transient, not a leak" recorded here in
+  2026-07-23 was the UNBOUNDED TRANSPORT BUFFER — bounded now by the credit
+  cap, and the same backlog that was killing the socket. Numbers and that
   correction in `notes/session-lifecycle.md`.
 - **Two more things kept a closed session's RAM resident, both found only by
   measuring RSS across a Restart.** (1) a `for` target outlives its loop, so
@@ -1501,7 +1510,9 @@ the claim it rests on and not only the risk it names.
   and the IC preview with the edge-band cells brighter, so the number in that
   warning points at something visible. The mirror exists because the overlay
   follows the PAINTED frame, which during a scrub across an auto-expand boundary
-  is not the live window the server's `band` describes. Ticks and cells are
+  is not the live window the server's `band` describes. NB it draws the COMPUTED
+  lattice from the record's `N`, not the samples actually sent, so it stays
+  right under display downsampling — the panel says its own reduction. Ticks and cells are
   INDEPENDENT layers, and the lattice is dropped when more than ~200 of its
   lines would land in the visible window — a COUNT not a pixel test, so zooming
   in brings it back. **The three toggles share ONE row** (`flex`, natural
@@ -1512,16 +1523,14 @@ the claim it rests on and not only the risk it names.
   **The edge finding is stated ONCE, IN ONE PLACE, AND THE TIME ARGUMENT SAYS
   WHICH STATE IT IS ABOUT.** The detector runs on the IC preview and on the live
   record, and at record 0 those are the SAME state, so the fact was genuinely
-  duplicated. Reporting it twice in two sentences and suppressing one by
-  DIFFERENCING the axis sets was worse than the duplication it fixed: the
-  survivor flickered between two places as the live axes changed and read as two
-  problems. Now the header says it, once, and `wOf` writes **`W(x,p,0)`** while
-  nothing has been computed past the Cauchy data and `W(x,p,t)` after — one
-  sentence whose argument distinguishes the initial condition from the evolved
-  state. `preview_warnings`'s `edge_axes` out-list and the `X-Wignerf-Edge:
-  axis:mass,…` header still exist and are still the right shape (structured, so
-  the client never pattern-matches a sentence); `ICEditor` EMITS the finding
-  upward instead of rendering it. The one case the session cannot cover — an IC
+  duplicated. Reporting it twice and suppressing one by DIFFERENCING the axis
+  sets was worse than the duplication: the survivor flickered between two places
+  as the live axes changed and read as two problems. Now the header says it once
+  and `wOf` writes **`W(x,p,0)`** while nothing has been computed past the
+  Cauchy data, `W(x,p,t)` after — one sentence whose argument distinguishes the
+  initial condition from the evolved state. `preview_warnings`'s `edge_axes` and
+  the `X-Wignerf-Edge` header stay (structured, so the client never
+  pattern-matches a sentence); `ICEditor` EMITS the finding upward. The one case the session cannot cover — an IC
   you have edited but not restarted into — is `SimulatorView.icEdgeText`, gated
   on `restartNeeded` so it can never compete with the session's own reading.
   **The × dismisses BY TEXT.** Clearing `session.boundary` cannot dismiss this:
@@ -1540,8 +1549,8 @@ the claim it rests on and not only the risk it names.
   EVERY INDEPENDENT REQUEST NEEDS ITS OWN KEY AS WELL AS ITS OWN COUNTER.**
   `ICEditor.refresh` incremented `seq` before the body de-dup could return, so
   every successful commit re-fired the deep watch, declined to repeat the
-  request, and silently invalidated the responses still in flight from the one
-  it had just declined to repeat. The ψ/φ traces were the casualty. The
+  request, and invalidated the responses still in flight from the one it had
+  just declined to repeat. The ψ/φ traces were the casualty. The
   wavefunction call has its own counter AND its own `lastWaveBody`, because it
   depends on `cutAxis` and the W preview does not: sharing one key made the 2D
   cut selector INERT — the W body was byte-identical, so `refresh` returned at
@@ -1578,22 +1587,20 @@ the claim it rests on and not only the risk it names.
   **An `overflow-hidden` ancestor deletes the strip from the screen and leaves
   it in the DOM.** The IC preview needs that class to keep the heatmap inside
   its rounded border, and it also clips any absolutely-positioned child hanging
-  BELOW the box — which is where `top-full` puts one. Hence two nested boxes: an
-  outer `relative` anchor and an inner clipping one. Do not merge them.
+  BELOW the box — where `top-full` puts one. Hence two nested boxes: an outer
+  `relative` anchor and an inner clipping one. Do not merge them.
   **"Nothing moved" and "the text is in the DOM" together do NOT prove the
-  message is still visible.** Assert that it is PAINTED:
-  `document.elementFromPoint` inside the notice's own rect must land on the
-  notice. Same discipline as the WebGL-canvas rule above, in the other
-  direction: there a screenshot lies, here the DOM does.
+  message is visible.** Assert it is PAINTED: `document.elementFromPoint` inside
+  the notice's own rect must land on the notice. Same discipline as the
+  WebGL-canvas rule, in the other direction — there a screenshot lies, here the
+  DOM does.
   **When several lines share one strip, the flickering one gets its OWN timer.**
-  `sticky(() => a || b)` over two independent sources is not a dwell: losing `a`
-  still leaves a non-empty value, which `sticky` correctly reads as a
-  REPLACEMENT and applies at once — so the two sentences alternate at the rate
-  the flickering one changes, and the × looks inert because dismissing one
-  substitutes the other in the same flush. One `sticky` per source, combined
-  afterwards. This shipped in `SimulatorView`'s header and is now pinned by
-  `sticky.test.ts` ("ONE sticky over two joined sources has no dwell at all").
-  Measurements and the browser reproductions are in `notes/ui-notices.md`.
+  `sticky(() => a || b)` over two sources is not a dwell: losing `a` still
+  leaves a non-empty value, which `sticky` correctly reads as a REPLACEMENT and
+  applies at once — so the two sentences alternate at the rate the flickering
+  one changes, and the × looks inert because dismissing one substitutes the
+  other in the same flush. One `sticky` per source, combined afterwards. Pinned
+  by `sticky.test.ts`. Reproductions in `notes/ui-notices.md`.
 - **The header's TRANSIENT notices are an absolute overlay, not flow content —
   the W panels must never move because a message arrived.** `restartNeeded`,
   `boundaryText`, `paramFlash`, `regridFlash` and the lost-session notice live in
@@ -1650,26 +1657,26 @@ the claim it rests on and not only the risk it names.
   is 8 and not 12); and the **first reading per slot is exempt**, or an IC that
   starts at the edge — a paused session with exactly one record — would never
   warn. Sweep in `boundary.py`; measurements in `notes/ui-notices.md`.
-- **Secular E drift + slow purity decay = boundary wrap, not a solver
-  bug.** The spectral domain is a torus: when a state's orbit + ~5σ tails
-  reach the x or p edge, mass wraps through the seam and the run faithfully
-  evolves the WRONG (torus) problem. Tells: IC norm deficit >> 1e-6, the
-  4σ edge warning, secular (not oscillatory-bounded) drifts. Fix: enlarge
-  the domain — or enable auto-expand, which detects the approach (edge-band
-  mass of the total sampled W, also checked at IC-preview time — the
-  per-component 4σ boxes alone miss interference terms) and regrids
-  exactly before mass wraps. Verified: same cat state, [-6,6]x[-7,7] gives E drift 2e-3;
-  [-12,12]² gives 4e-6 with purity conserved to 5e-12 — the discrete map
-  is exactly unitary for contained states (healthy E behavior is a BOUNDED
-  O(dt²) oscillation from Strang splitting, never a drift).
+- **Secular E drift + slow purity decay = boundary wrap, not a solver bug.**
+  The spectral domain is a torus: when a state's orbit + ~5σ tails reach the x
+  or p edge, mass wraps through the seam and the run faithfully evolves the
+  WRONG (torus) problem. Tells: IC norm deficit >> 1e-6, the 4σ edge warning,
+  secular (not oscillatory-bounded) drifts. Fix: enlarge the domain — or enable
+  auto-expand, which detects the approach (edge-band mass of the total sampled
+  W, also checked at IC-preview time — the per-component 4σ boxes alone miss
+  interference terms) and regrids before mass wraps. Verified: same cat state,
+  [-6,6]x[-7,7] gives E drift 2e-3; [-12,12]² gives 4e-6 with purity conserved
+  to 5e-12 — the discrete map is exactly unitary for contained states (healthy E
+  behavior is a BOUNDED O(dt²) oscillation from Strang splitting, never a
+  drift).
 - **Growing ΔX·ΔP in the RELATIVISTIC variants only = anharmonic shear, not
   a bug.** T = c√(p²+m²c²) carries a −p⁴/(8m³c²) term, so ω depends on E
   (δω = −3E/(8c²)) and the ensemble shears at k = t·r²·3/(8c²). The shear is
   symplectic: purity and det C are conserved and the LOWER envelope of ΔX·ΔP
-  stays exactly at ħ/2, while the upper one grows ∝ t² (modulated at 2ω).
-  Tells that it is physics: halving dt leaves it identical while the E(t)
-  splitting oscillation drops 4×, it scales as 1/c⁴, purity stays flat.
-  Non-relativistic harmonic H is exactly quadratic ⇒ no shear ⇒ flat.
+  stays exactly at ħ/2 while the upper grows ∝ t² (modulated at 2ω). Tells that
+  it is physics: halving dt leaves it identical while the E(t) splitting
+  oscillation drops 4×, it scales as 1/c⁴, purity stays flat. Non-relativistic
+  harmonic H is exactly quadratic ⇒ no shear.
   Measured: coherent state at (2,0) in x²/2 with c = 137.036 → 2e-5 at
   t = 100 (analytic σ²k²/2 = 1.6e-5). Pinned by
   `test_relativistic_uncertainty_shear` — and since M2 there is a 2D one of the

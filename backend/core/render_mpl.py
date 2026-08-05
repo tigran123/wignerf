@@ -32,8 +32,8 @@ had.
 
 Conventions taken from the live renderer (frontend/src/render/
 WignerRenderer.ts) so the video and the screen read the same:
-- W is dequantized as wmin + q*(wmax-wmin)/65535 and unshifted (records are
-  fftshifted along both of a plane's axes),
+- W is dequantized as wmin + q*(wmax-wmin)/65535; records arrive in NATURAL
+  order (frame.build unshifts on the device), so nothing shifts here,
 - the colour scale is the SYMMETRIC diverging one, W=0 at the centre of
   "bwr": vmin = -s, vmax = +s with s = max(Wmax, -Wmin) — here taken over
   the WHOLE exported range PER (variant, plane), so the video does not
@@ -138,10 +138,14 @@ def dequantize_plane(pf):
     The transpose puts the plane's FIRST axis horizontal and its second
     vertical, which is the same rule WignerRenderer.ts follows on screen — at
     ndim=1 that is (x, p) exactly as before, and it generalizes to any (a, b)
-    with no special case."""
+    with no special case.
+
+    No unshift here: `frame.build` hands out natural order (it has to, so a crop
+    cannot straddle the fftshift seam), so this used to unshift an already
+    unshifted plane and put every export's W back on the torus's far side."""
     W = pf.wmin + pf.wq.astype(numpy.float32)*(
         numpy.float32((pf.wmax - pf.wmin)/65535.0))
-    return numpy.fft.ifftshift(W, axes=(0, 1)).T
+    return W.T
 
 
 def axis_of(a1, a2, n):

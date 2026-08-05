@@ -18,12 +18,16 @@ Every plane keeps its own quantization range, hence its own colorbar. That is
 not laziness: the reductions of one state differ in scale by orders of
 magnitude (a spatial density against a signed reduced Wigner function), and one
 shared range would render most panels blank.
+
+Planes leave here in NATURAL (unshifted) order, as the marginals always have.
+See the ifftshift below for why that is a precondition for cropping.
 """
 
 from . import axes as ax
 from . import observables
+from . import pyramid
 from .protocol import PlaneFrame, VariantFrame
-from .quantize import quantize
+from .quantize import quantize, requantize
 
 
 def build(W, grid, hbar_eff=1.0, prop=None, dt=0.0, vid=0):
@@ -37,10 +41,25 @@ def build(W, grid, hbar_eff=1.0, prop=None, dt=0.0, vid=0):
     obs = (observables.compute(W, prop, planes) if prop is not None
            else observables.compute_basic(W, grid, hbar_eff, planes))
     pf = []
+    b = grid.backend
     for plane in ax.planes(grid.ndim):
-        wq, wmin, wmax = quantize(planes[plane], grid.backend)
+        # NATURAL ORDER LEAVES THIS FUNCTION. The propagator works fftshifted
+        # and so do the reductions, but a CROP of a shifted array straddles the
+        # seam — the low and high halves are at opposite ends — so cropping
+        # would need either a third convention or two client paths. Unshifting
+        # once here is measured free on the device (it rides the quantize's
+        # copy) and it is what lets the shader drop its half-period offset and
+        # its modulo wrap. The marginals were already natural order, so after
+        # this NOTHING outside the propagator is shifted.
+        nat = b.ifftshift(planes[plane], axes=(0, 1))
+        wq, wmin, wmax = quantize(nat, b)
+        # Coarser levels for the display downsampler, quantized against the
+        # FULL plane's range so a level change never repaints the colorbar.
+        # `quantize` recomputes min/max per array, so pass them in.
+        mips = tuple(requantize(lv, b, wmin, wmax)
+                     for lv in pyramid.levels(nat, b))
         pf.append(PlaneFrame(a=plane[0], b=plane[1], mode=ax.MODE_PROJECTION,
-                             wq=wq, wmin=wmin, wmax=wmax))
+                             wq=wq, wmin=wmin, wmax=wmax, mips=mips))
     vf = VariantFrame(vid=vid, dt=float(dt), E=obs.E, purity=obs.purity,
                       lz=obs.lz, mean=obs.mean, std=obs.std,
                       planes=tuple(pf), marg=obs.marg)

@@ -239,7 +239,7 @@ function repaintPlane() {
   if (!pl) return
   wmin.value = pl.wmin
   wmax.value = pl.wmax
-  renderer.upload(pl)
+  renderer.upload(pl, f.N[a]!, f.N[b]!)
   renderer.render()
 }
 
@@ -313,7 +313,7 @@ async function refresh() {
     wmin.value = pl.wmin
     wmax.value = pl.wmax
     lastFrame = f
-    renderer.upload(pl)
+    renderer.upload(pl, f.N[pl.a]!, f.N[pl.b]!)
     renderer.render()
     deficit.value = String(headers['x-wignerf-norm-deficit'] ?? '')
     // percent-encoded server-side: HTTP headers are latin-1, the messages

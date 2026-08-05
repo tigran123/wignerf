@@ -9,14 +9,21 @@
  * projections. At ndim=1 the list holds exactly one plane whose complement is
  * empty — W itself — so 1D is the general case here, not a special one.
  *
+ * Since v5 a plane is a WINDOW: the client tells the server which physical
+ * region each panel shows and at what pixel size, and gets back a crop
+ * decimated to match. So the plane's dimensions are on the wire and must NOT
+ * be re-derived from the header's N (which stays the computed grid, and is
+ * still what the marginals and the axis overlays are indexed by).
+ *
  * Every section length is a multiple of 4, so every TypedArray below is a
  * zero-copy view into the received ArrayBuffer.
  */
 
 export const MAGIC = 0x57
-// v4: per-record ndim, a list of 2D planes and 2*ndim marginals (1D is one
-// plane = W); v3 had two fixed axes and one W array
-export const VERSION = 4
+// v5: per-plane window (size/offset/step) + natural order, so a plane can be a
+// decimated crop of the zoom window rather than the whole axis pair; v4 added
+// per-record ndim and the plane list (1D is one plane = W)
+export const VERSION = 5
 export const MSG_FRAME = 1
 
 export const FLAG_LIVE_PREVIEW = 1 << 0
@@ -32,9 +39,18 @@ export interface PlaneFrame {
   mode: number // MODE_PROJECTION
   wmin: number
   wmax: number
-  na: number // = N[a] — rows
-  nb: number // = N[b] — columns
-  data: Uint16Array // (na, nb) row-major, fftshifted in BOTH axes
+  na: number // rows SENT along axis a (not N[a] — this may be a crop)
+  nb: number // columns sent along axis b
+  /**
+   * The window this plane covers, in BASE cells of the record's own axes:
+   * sample (i, j) is the mean of base cells [off[0] + i*step[0], +step[0]) x
+   * [off[1] + j*step[1], +step[1]). A whole plane is off 0, step 1.
+   */
+  off: [number, number]
+  step: [number, number]
+  /** (na, nb) row-major, NATURAL order. Empty when na === 0 — that plane was
+   *  not requested and carries no payload. */
+  data: Uint16Array
 }
 
 export interface VariantFrame {
@@ -113,12 +129,21 @@ export function decodeFrame(buf: ArrayBuffer): Frame {
       const mode = dv.getUint8(off + 2)
       const wmin = dv.getFloat32(off + 4, true)
       const wmax = dv.getFloat32(off + 8, true)
-      off += 12
-      const na = N[a]!
-      const nb = N[b]!
+      // The sizes come off the WIRE, not from the header's N: a plane may be a
+      // decimated crop of the zoom window, and na === 0 means it was not
+      // requested at all (header present, no payload, so the plane list keeps
+      // its canonical order).
+      const na = dv.getUint32(off + 12, true)
+      const nb = dv.getUint32(off + 16, true)
+      const off0 = dv.getUint32(off + 20, true)
+      const off1 = dv.getUint32(off + 24, true)
+      const step0 = dv.getUint32(off + 28, true)
+      const step1 = dv.getUint32(off + 32, true)
+      off += 36
       const data = new Uint16Array(buf, off, na * nb)
       off += 2 * na * nb
-      planes.push({ a, b, mode, wmin, wmax, na, nb, data })
+      planes.push({ a, b, mode, wmin, wmax, na, nb,
+                    off: [off0, off1], step: [step0, step1], data })
     }
     const marg: Float32Array[] = []
     for (let a = 0; a < nax; a++) {

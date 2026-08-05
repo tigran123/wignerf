@@ -259,6 +259,27 @@ function applyLive(params: Record<string, unknown>) {
   session.send({ type: 'set_params', params })
 }
 
+/**
+ * Tell the server what the panels are showing, so it sends that and nothing
+ * else (backend display downsampling). A DISPLAY policy like `delay`, so it
+ * goes on its own command rather than through set_params.
+ *
+ * Kept here rather than in PanelGrid because it has to be RE-SENT on every
+ * reconnect: `session.send` silently no-ops on a closed socket, and the server
+ * drops a departing client's viewport (a new one has not said what it shows).
+ * Without the resend a recovered session would go back to full planes and the
+ * large-grid session would be right back where it started, with nothing on
+ * screen to explain it.
+ */
+let lastView: unknown[] = []
+function sendView(planes: unknown[]) {
+  lastView = planes
+  session.send({ type: 'view', planes })
+}
+watch(() => session.connected.value, (on) => {
+  if (on && lastView.length) session.send({ type: 'view', planes: lastView })
+})
+
 // What the SESSION is actually evolving (status echoes every live change):
 // the setup form marks fields that differ from it as edited-but-unapplied,
 // and greys out an "Apply live" that would be a no-op.
@@ -1149,7 +1170,8 @@ onBeforeUnmount(() => {
         <PanelGrid :key="plotsKey" :frame-source="session.onFrame"
                    :variants="activeVariants" :geom="activeGeom"
                    :batch-overlay="batchOverlay" :progress="session.progress.value"
-                   :show-grid="showGrid" :show-cells="showCells" />
+                   :show-grid="showGrid" :show-cells="showCells"
+                   @view="sendView" />
       </div>
 
       <aside class="w-[380px] shrink-0 overflow-y-auto">
@@ -1205,7 +1227,8 @@ onBeforeUnmount(() => {
         <PanelGrid :key="plotsKey" :frame-source="session.onFrame"
                    :variants="activeVariants" :geom="activeGeom"
                    :batch-overlay="batchOverlay" :progress="session.progress.value"
-                   :show-grid="showGrid" :show-cells="showCells" />
+                   :show-grid="showGrid" :show-cells="showCells"
+                   @view="sendView" />
       </div>
     </main>
 
