@@ -414,7 +414,8 @@ const emit = defineEmits<{
  *  variants) to defaults; display prefs (layout, grid lines) are separate
  *  localStorage keys and stay untouched. */
 function resetSetup() {
-  if (!confirm('Reset the ENTIRE setup (grid, potential, physics, run mode, IC, variants) to defaults?')) return
+  if (!confirm('Reset the ENTIRE setup (grid, potential, physics, run mode, IC, '
+               + 'variants) to defaults and restart the session?')) return
   // A reset that changed NOTHING is not a change. Emitting `dirty`
   // unconditionally put "setup changed — restart to apply" over a form that
   // was already at the defaults — most visibly right after clearing local
@@ -423,7 +424,17 @@ function resetSetup() {
   // follows: compare, and say nothing when the whole message is a no-op.
   const before = JSON.stringify(props.cfg)
   resetToDefaults(props.cfg)
-  if (JSON.stringify(props.cfg) !== before) emit('dirty')
+  if (JSON.stringify(props.cfg) === before) return
+  // A reset RESTARTS. Most of what it restores is SessionCreate-only (grid, IC,
+  // variants), so marking the form dirty and stopping there left the one button
+  // whose whole job is "put everything back to a state ready to compute"
+  // needing a second click before it meant anything — reported from a session
+  // at 8192×4096, where the reset form read 1024² and Solve would still have
+  // computed the old grid. `dirty` goes out FIRST all the same: the restart can
+  // be declined (an mp4 render in flight) or refused by the server, and then
+  // the form really does disagree with the session and must say so.
+  emit('dirty')
+  emit('restart')
 }
 
 // Auto-expand can move the SESSION's domain away from the form's grid;

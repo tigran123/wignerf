@@ -101,7 +101,7 @@ function payload() {
   // The form must be self-consistent BEFORE it is serialized, and this is the
   // last place that can be guaranteed. The invariants are normally applied at
   // the point of change, but a restart can happen in the SAME flush as the
-  // change that triggered it (the watcher below calls syncFreshSessionToForm,
+  // change that triggered it (the watcher below calls restartLoop,
   // and it runs before the Setup panel's own watchers — a child's setup runs
   // during the parent's render, so the parent's watchers flush first). A
   // payload built from a half-fixed config asked for float32 + auto-expand and
@@ -136,8 +136,13 @@ function payload() {
   return p
 }
 
+// Restarts STARTED, bumped before the POST. `requestRestart` samples it to tell
+// whether the form it is about has already been sent (see there).
+let restartsStarted = 0
+
 async function restart() {
   createError.value = ''
+  restartsStarted++
   try {
     unsub?.()
     await session.create(payload())
@@ -186,10 +191,26 @@ async function mayDiscardExport(what: string): Promise<boolean> {
   return true
 }
 
-/** The user-initiated restart (the automatic ones — first mount, backend
- *  recovery — must never prompt). */
+/**
+ * The user-initiated restart (the automatic ones — first mount, backend
+ * recovery — must never prompt). Goes through `restartLoop` rather than calling
+ * restart() itself; see the flag it sets.
+ *
+ * `at` is sampled SYNCHRONOUSLY, at the click, and is what keeps "Reset setup to
+ * defaults" to ONE session: the reset mutates the form and then asks for this
+ * restart, so the run-key watcher's flush — queued by the mutation and
+ * therefore running before this function resumes from its first await — may
+ * already have created a session from the very form this request is about.
+ * Requesting another would compute the same thing twice, at whatever the grid
+ * costs. A create that started BEFORE the click is not counted: it cannot have
+ * carried a change made after it began.
+ */
 async function requestRestart() {
-  if (await mayDiscardExport('Restarting the session')) await restart()
+  const at = restartsStarted
+  if (!(await mayDiscardExport('Restarting the session'))) return
+  if (restartsStarted > at) return
+  restartRequested = true
+  await restartLoop()
 }
 
 /** Transport commands, gated the same way: only a command that will COMPUTE
@@ -290,17 +311,30 @@ const formRunKey = () =>
 // warning, because a fresh session shows none. Instead, once we start managing
 // an idle session we loop until what we created matches the current form.
 let autoRestarting = false
-async function syncFreshSessionToForm() {
+// An EXPLICIT restart waiting on the loop — the header/panel buttons and "Reset
+// setup to defaults". It is served BY the loop instead of calling restart()
+// itself because both requests can arrive in ONE flush: a reset moves the grid
+// and the run fields together, so the watcher below fires alongside the panel's
+// own request, and two overlapping create()s each destroy the other's session —
+// leaving an orphan holding its workers' VRAM until the idle sweeper reaps it,
+// and whichever POST happened to finish last as the survivor.
+let restartRequested = false
+/** The one path a restart may be started from, except the automatic ones
+ *  (first mount, backend recovery) which have no form change to coalesce. */
+async function restartLoop() {
   if (autoRestarting) return              // a loop is already running; it re-reads
                                           // the form each pass and will catch this edit
   const st = session.status.value
-  if (!session.connected.value || !st || st.running
-      || (st.record_extent?.[1] ?? -1) > 0) return   // a real run exists: don't touch
+  // A real run exists: don't touch it — unless the restart was ASKED for, which
+  // is the user accepting exactly that.
+  if (!restartRequested && (!session.connected.value || !st || st.running
+      || (st.record_extent?.[1] ?? -1) > 0)) return
   autoRestarting = true
   try {
-    let sent = runKeyOf(st.mode, st.t2, st.record_dt,  // the live session's config
-                        st.precision)
-    while (sent !== formRunKey()) {
+    let sent = st ? runKeyOf(st.mode, st.t2, st.record_dt,  // the live session's
+                             st.precision) : ''            // config
+    while (restartRequested || sent !== formRunKey()) {
+      restartRequested = false
       sent = formRunKey()
       await restart()                     // restart() reads cfg as it stands NOW
     }
@@ -309,7 +343,7 @@ async function syncFreshSessionToForm() {
   }
 }
 watch(() => [cfg.mode, cfg.t2, cfg.record_dt, cfg.precision],
-      () => { void syncFreshSessionToForm() })
+      () => { void restartLoop() })
 
 // Boundary watch surfacing: a dismissible amber warning while W sits in
 // the edge band (the server posts an all-clear that removes it), and a

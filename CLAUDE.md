@@ -554,9 +554,24 @@ source) is what keeps startup fast. See `README.md`.
   already idle there, and leaving `running` set froze the transport on "Pause"
   forever and locked out every paused-only action (pinned by
   `test_batch_starts_paused_and_stops_at_t2`).
-  Setup persists in browser localStorage; "↺ defaults" (IC editor) and
-  "Reset setup to defaults" (Setup panel) restore defaults in the form and
-  mark the session restart-dirty.
+  Setup persists in browser localStorage; "↺ defaults" (IC editor) restores the
+  IC in the form and marks the session restart-dirty, but **"Reset setup to
+  defaults" (Setup panel) RESTARTS** — nearly all it restores is SessionCreate-only
+  (grid, IC, variants), so marking the form dirty and stopping there left the one
+  button whose job is "put everything back, ready to compute" needing a second
+  click to mean anything: reported from a session at 8192×4096 under a form
+  reading 1024², where Solve would still have computed the old grid. It emits
+  `dirty` FIRST all the same, because the restart can be declined (mp4 render in
+  flight) or refused (422), and then the form really does disagree.
+  **EVERY form-driven restart goes through ONE serialized loop**
+  (`SimulatorView.restartLoop`, once `syncFreshSessionToForm`): a reset moves the
+  grid AND the run fields, so the fresh-session watcher fires in the same flush
+  as the panel's own request, and two overlapping `create()`s each destroy the
+  other's session, orphaning one that holds its workers' VRAM until the idle
+  sweeper reaps it. Serializing alone is NOT enough — `requestRestart` samples
+  `restartsStarted` SYNCHRONOUSLY at the click and drops its request if a create
+  started after it, or the reset computes the same session twice in a row
+  (measured: 3 creates for one click, the third redundant).
 - **Potentials** (`core/potential.py`, on `core/expr.py`): tokenize-screen
   (THE security boundary, shared with the two expression IC kinds — one screen,
   three kinds of user expression; `potential.py` keeps the per-family VALIDITY
