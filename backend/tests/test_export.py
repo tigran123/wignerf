@@ -753,3 +753,83 @@ def test_the_export_draws_a_plane_at_the_panel_s_own_resolution():
     assert R.dequantize_plane(p).shape == (4096, 4096)
     # and the decimated draw really is smaller
     assert R.dequantize_plane(p, 400).shape == (512, 512)
+
+
+def test_only_the_levels_a_worker_can_draw_cross_the_process_boundary():
+    """The render pool is fed by PICKLE, and at a large grid that was the whole
+    frame budget.
+
+    Measured at 8192^2: one record is 170.8 MiB and takes 70 ms just to
+    serialize, before a byte moves through the pipe — the parent's feed thread
+    became the bottleneck at ~312 ms/frame, which is the 3.2 fps a 1D 8192^2
+    export sat at whether the video was FHD or 4K (reproduced exactly with this
+    trim disabled: 3.23 fps FHD, 3.53 4K; with it, 35.65 and 8.89). The
+    renderer only ever draws ~767 px per panel, i.e. 2 MiB.
+
+    Two properties, and the SECOND is the one that makes it safe rather than
+    merely fast: the payload shrinks, and the frame that gets DRAWN is
+    bit-identical, because the bound is the figure's own width and a panel
+    cannot be wider than its figure.
+    """
+    import pickle
+    import numpy as _np
+    from core import pyramid, render_mpl as R
+
+    N = 2048
+    x = _np.linspace(-6, 6, N)[:, None]
+    p = _np.linspace(-7, 7, N)[None, :]
+    # fringes, not noise: an aliasing subsample or an off-by-one level destroys
+    # interference and leaves smooth blobs looking perfectly plausible
+    W = (_np.exp(-((x - 2)**2 + p**2)) + _np.exp(-((x + 2)**2 + p**2))
+         + 2*_np.exp(-(x**2 + p**2))*_np.cos(4*p))
+    lo, hi = float(W.min()), float(W.max())
+    wq = _np.clip(_np.rint((W - lo)*(65535.0/(hi - lo))), 0,
+                  65535).astype(_np.uint16)
+    mips, a = [], wq
+    while a.shape[0] >= 2*pyramid.PYRAMID_FLOOR and a.shape[0] % 2 == 0:
+        a = a.reshape(a.shape[0]//2, 2, a.shape[1]//2, 2) \
+             .mean(axis=(1, 3)).astype(_np.uint16)
+        mips.append(a)
+    assert mips, "no pyramid to trim — the fixture stopped exercising this"
+
+    # Six planes so the unselected ones can be checked too (the 2D shape), and
+    # every array its OWN copy: a real record's planes are six different
+    # reductions, and sharing one buffer would let pickle memoize it and report
+    # a sixth of the true payload.
+    planes = tuple(protocol.PlaneFrame(a=q[0], b=q[1], mode=0, wq=wq.copy(),
+                                       wmin=lo, wmax=hi,
+                                       mips=tuple(m.copy() for m in mips))
+                   for q in ((0, 1), (2, 3), (0, 2), (1, 3), (0, 3), (1, 2)))
+    vf = protocol.VariantFrame(vid=1, dt=.01, E=1., purity=1., lz=0.,
+                               mean=(0.,)*4, std=(1.,)*4, planes=planes,
+                               marg=tuple(_np.zeros(N) for _ in range(4)))
+
+    # 480 rather than a real figure width so this fixture stays small AND the
+    # selected plane is genuinely decimated (at 2048^2 a 1920 px bound trims no
+    # levels at all, so the interesting half would not run).
+    bound = 480
+
+    class _Job:
+        ndim = 2
+        planes = [(0, 1)]              # a phase portrait showing ONE plane
+        _px_bound = bound
+        _trim = videoexport.ExportJob._trim
+
+    trimmed = _Job()._trim([vf])
+    before = len(pickle.dumps([vf], protocol=5))
+    after = len(pickle.dumps(trimmed, protocol=5))
+    assert after*20 < before, (before, after)
+
+    tp = trimmed[0].planes
+    # the five planes this job does not show keep their POSITION (render_mpl
+    # indexes planes canonically) and lose their bytes
+    for i in (1, 2, 3, 4, 5):
+        assert tp[i].wq.size == 0 and tp[i].mips == (), i
+        assert (tp[i].a, tp[i].b) == (planes[i].a, planes[i].b)
+    # ...and the one it does show draws EXACTLY what the full pyramid would,
+    # at every panel width the bound admits — including the bound itself, which
+    # is the case that would break if the trim went one level too far
+    assert tp[0].wq.shape < planes[0].wq.shape, "nothing was decimated"
+    for px in (100, 300, bound):
+        assert _np.array_equal(R.dequantize_plane(planes[0], px),
+                               R.dequantize_plane(tp[0], px)), px

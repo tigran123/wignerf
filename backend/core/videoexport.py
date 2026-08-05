@@ -40,12 +40,15 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import replace
 from time import monotonic
+
+import numpy
 
 import config
 
 from . import axes as ax
-from . import describe, render_mpl
+from . import describe, pyramid, render_mpl
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +159,10 @@ def export_workers():
 
 _WORKER = {}
 
+# Stands in for a plane this job does not show. Its POSITION has to survive
+# (render_mpl._cells indexes planes canonically); its bytes do not.
+_EMPTY = numpy.zeros((0, 0), dtype=numpy.uint16)
+
 
 def _worker_init(variants, stats, meta, width, height, show_grid, theme,
                  planes, diagnostics):
@@ -224,6 +231,10 @@ class ExportJob(threading.Thread):
         self.render_fps = 0.0
         self._render_t0 = None
         self._rate_mark = (0, 0.0)
+        # Detail bound for what crosses to a render worker (see _trim). The
+        # figure's own width: a panel cannot be wider than its figure, so this
+        # can never trim below what the renderer draws.
+        self._px_bound = int(spec.width)
         self.error = None
         self.finished_at = None
         self.cancel_evt = threading.Event()
@@ -391,6 +402,48 @@ class ExportJob(threading.Thread):
             self._emit(proc, fig.update(k, t, geom, vframes, self.k0, self.k1))
         return fig
 
+    def _trim(self, vframes):
+        """Strip what a render worker cannot draw, BEFORE it is pickled.
+
+        A record crossing a process boundary is copied twice (pickle here,
+        unpickle there) and that cost is the whole frame budget at a large
+        grid: measured at 8192^2 one record is 170.8 MiB and takes 70 ms just
+        to SERIALIZE, before a byte moves through the pipe — ~312 ms/frame all
+        told, which is the 3.2 fps a 1D 8192^2 export was stuck at whatever the
+        video size. The renderer only ever draws ~767 px per panel, i.e. 2 MiB.
+
+        Two cuts, both of which leave the drawn frame BIT-IDENTICAL:
+
+        - planes this job does not show lose their payload entirely (a phase
+          portrait of one plane shipped all six), and
+        - the rest keep only the pyramid levels at or under `_px_bound`.
+
+        The bound is the FIGURE's full width, not the panel's. A panel cannot
+        be wider than the figure it is in, so the bound can never trim below
+        what the worker needs — no layout arithmetic is mirrored here, and
+        nothing silently under-resolves if the layout changes. The worker then
+        picks its own exact level out of what survives, exactly as it would
+        have from the full pyramid, because every retained level keeps its
+        absolute decimation.
+
+        Positions are preserved: `render_mpl._cells` indexes planes by their
+        CANONICAL index, so a dropped plane has to stay in the list.
+        """
+        keep = {ax.plane_index(self.ndim, pl) for pl in self.planes}
+        out = []
+        for vf in vframes:
+            planes = []
+            for i, pf in enumerate(vf.planes):
+                if i not in keep:
+                    planes.append(replace(pf, wq=_EMPTY, mips=()))
+                    continue
+                step = render_mpl.plane_step(pf, self._px_bound)
+                j = pyramid.level_for(step)
+                planes.append(pf if step == 1 else
+                              replace(pf, wq=pf.mips[j], mips=pf.mips[j + 1:]))
+            out.append(replace(vf, planes=tuple(planes)))
+        return out
+
     def _render_parallel(self, proc, executor, w):
         """Frames render out of order in the pool but reach ffmpeg in order:
         a sliding window of at most w+2 outstanding futures, consumed FIFO by
@@ -404,7 +457,7 @@ class ExportJob(threading.Thread):
                 t, geom, vframes = self._read_record(k)
                 window.append(executor.submit(
                     _worker_render,
-                    (k, t, geom, vframes, self.k0, self.k1)))
+                    (k, t, geom, self._trim(vframes), self.k0, self.k1)))
                 return True
             return False
 

@@ -161,13 +161,13 @@ source) is what keeps startup fast. See `README.md`.
   Measured at 4096²: 3.1 rec/s at 99 MiB/s before (i.e. AT the ceiling), 8.0 at
   4.2 after; at 8192² the before case is not slow but ZERO — no 128 MiB record
   arrives at all. Four rules: the area mean happens ON THE DEVICE once per
-  record (250 ms/plane on the host); the send-time crop is a CONTIGUOUS slice
-  of a pre-reduced level (0.07 ms against 1.1 for a strided gather), which is
-  the only reason a pyramid is built; every level is quantized against the FULL
-  plane's range, so a level change cannot repaint the colorbar under someone
-  who only scrolled; and the window is PHYSICAL, which is what survives
-  auto-expand — `_views_for` resolves per RECORD, so a scrub across a regrid
-  needs no bookkeeping. A plane absent from the request is NOT SENT (`na = 0`,
+  record (250 ms/plane on the host); the send-time crop is a CONTIGUOUS slice of
+  a pre-reduced level (0.07 ms against 1.1 for a strided gather), which is the
+  only reason a pyramid is built; every level is quantized against the FULL
+  plane's range, so a level change cannot repaint the colorbar under someone who
+  only scrolled; and the window is PHYSICAL, which is what survives auto-expand
+  — `_views_for` resolves per RECORD, so a scrub across a regrid needs no
+  bookkeeping. A plane absent from the request is NOT SENT (`na = 0`,
   header only), so the phase portrait stops paying for planes it is not
   showing — which also means **the client must pick a plane by PAIR, not by
   list position**. A reduced panel says so (`↓8×` with the reason in its
@@ -322,8 +322,8 @@ source) is what keeps startup fast. See `README.md`.
   SessionCreate-only, so Solve would compute the old ones (the auto-restart in
   `syncFreshSessionToForm` fires only when the document ALSO moves
   mode/t₂/Δt rec/precision on a fresh idle session). And it clears on a
-  `sessionId` change, because that IS the restart it asks for: it used to
-  clear only at the top of the NEXT import, so "press Restart session to run
+  `sessionId` change, because that IS the restart it asks for: it used to clear
+  only at the top of the NEXT import, so "press Restart session to run
   it" stood over a session already running the imported setup. It survives a panel
   close/reopen on purpose — an import you have not acted on is still
   actionable.
@@ -333,13 +333,13 @@ source) is what keeps startup fast. See `README.md`.
   `SimulatorView.mayDiscardExport` confirms first (Restart, and a transport
   command whose action is `solve` — playback adds no records and is never
   gated) and cancels the job outright on "yes" rather than leaving it to die
-  mid-file. The automatic restarts (first mount, backend recovery) never
-  prompt.
+  mid-file. The automatic restarts (first mount, backend recovery) never prompt.
 - **mp4 export** (`core/videoexport.py` + `core/render_mpl.py` +
   `routers/export.py`): renders an ALREADY-COMPUTED record range on the
   BACKEND — matplotlib/Agg frames piped as raw RGBA into ffmpeg (system ffmpeg,
   absence ⇒ 503). PAUSED-only (409 while running): a running session evicts old
-  records, and the feature is for filming a range you already played back. **Read `notes/export.md` before changing any of it**:
+  records, and the feature is for filming a range you already played
+  back. **Read `notes/export.md` before changing any of it**:
   every figure below was measured, and the note says how.
   **WHAT GOES IN THE FRAME IS A CHOICE** (`ExportSpec.planes` / `.diagnostics`),
   because a 2D record carries far more than a frame can hold: six planes × four
@@ -350,25 +350,32 @@ source) is what keeps startup fast. See `README.md`.
   variant, "phase portrait" every plane × one variant, and the Export panel
   offers both as one-click presets setting the checkboxes.
   `render_mpl.panel_grid` REFLOWS by count when one dimension is 1, else lays
-  out the matrix, rows = planes. Diagnostics are plot ids shared VERBATIM
-  with `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`, `uncertainty0/1`,
+  out the matrix, rows = planes. Diagnostics are plot ids shared VERBATIM with
+  `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`, `uncertainty0/1`,
   `purity`, `lz`) — one vocabulary for the hidden-series preferences, the export
-  wire and the metadata block — and an EMPTY list is legal. **The 2D default drops the four marginals, and that is a physical
-  argument, not a space-saving one**: at ndim=2 the (x,y) and (px,py) PANELS
-  already ARE the spatial and momentum densities. Past `DIAG_ROWS_MAX` = 7 the
-  column splits in two and the panels pay in width (`diag_layout`); the panel
-  states the resulting count and pixel size and warns about thumbnails.
-  Both refusals live in `routers/export.py`, not the schema: what is available
-  depends on the session's ndim, which the request body does not carry. Both
-  name what IS available.
-  **The frame RENDER, not the encode, is the bottleneck — and its cost is the
-  GRID, not the video size**: matplotlib is priced by the ARRAY it is handed, so
-  4096² cost 2247 ms/frame/worker against 256²'s 80 while 1080p and 4K differed
-  by 3%. `render_mpl.plane_step` therefore draws the coarsest mip level that
-  still covers the panel (`_panel_px`), never below it — 4429 → 92 ms at 4096²
-  ×4 variants, 92.6% of pixels bit-identical on a fringed cat state. Panel COUNT
-  went nearly free with it: four panels are each half as wide, so each needs a
-  quarter of the samples. So export renders
+  wire and the metadata block — and an EMPTY list is legal. **The 2D default
+  drops the four marginals, and that is a physical argument, not a space-saving
+  one**: at ndim=2 the (x,y) and (px,py) PANELS already ARE the spatial and
+  momentum densities. Past `DIAG_ROWS_MAX` = 7 the column splits in two and the
+  panels pay in width (`diag_layout`); the panel states the resulting count and
+  pixel size and warns about thumbnails.
+  Both refusals live in `routers/export.py`, not the schema (what is available
+  depends on the session's ndim, which the body does not carry), and both name
+  what IS available.
+  **NEITHER THE ENCODE NOR THE VIDEO SIZE IS THE COST — THE PLANE IS**, twice
+  over, and both fixes are "only what a panel can draw". (1) matplotlib is priced
+  by the ARRAY handed to it: 4096² cost 2247 ms/frame/worker against 256²'s 80
+  while 1080p and 4K differed by 3%, so `render_mpl.plane_step` draws the
+  coarsest mip level still covering the panel (`_panel_px`), never below it —
+  4429 → 92 ms at 4096²×4 variants, 92.6% of pixels bit-identical on a fringed
+  cat state. (2) the pool is fed by PICKLE and at 8192² a record is 170.8 MiB,
+  70 ms to serialize alone: that was 3.2 fps *whatever the video size*, FHD and
+  4K coming out identical being the tell. `ExportJob._trim` drops unshown
+  planes' payloads and keeps only levels at or under the FIGURE's width — a
+  bound no panel can exceed, so it cannot under-resolve and no layout arithmetic
+  is mirrored. FHD 3.23 → 35.65 rec/s, 4K 3.53 → 8.89, and they now DIFFER, i.e.
+  the render is the wall again. NB a SHORT job measures the pool warmup; read
+  the rolling rate. So export renders
   frames across a **spawn** `ProcessPoolExecutor` (`WIGNERF_EXPORT_WORKERS`,
   auto = min(cpu, 8)) while this thread feeds ORDERED frames to one ffmpeg:
   a sliding window of ≤w+2 futures consumed FIFO, so workers run ahead with
@@ -376,13 +383,11 @@ source) is what keeps startup fast. See `README.md`.
   after that inherits a broken context. A small job (`< max(2·w,
   POOL_MIN_FRAMES=16)`) renders serially, skipping the warmup. Encoder via
   `choose_encoder`/`WIGNERF_EXPORT_ENCODER` — **auto is libx264 EVEN WHERE THE
-  GPU WORKS**, and its probe used to be a 64×64 clip under NVENC's 145×49
-  minimum, so nvenc read as "unavailable" everywhere. See the
-  `WIGNERF_EXPORT_ENCODER` row.
+  GPU WORKS**; see that row for why, and for the probe bug behind it.
   Two passes: a scan collects the E/ΔX·ΔP/γ series, the per-variant FIXED colour
   scale (no brightness flicker), the fixed marginal amplitudes and the widest
-  window any record used, and proves every record is still retained before
-  ffmpeg starts; then one figure update per frame. Only VALUE scales are
+  window any record used, and proves every record is still retained before ffmpeg
+  starts; then one figure update per frame. Only VALUE scales are
   export-wide — the SPATIAL axes follow each record's own geometry
   (`_apply_geom`, which re-captures the blit background too, ticks being static
   art), as the SPA follows the painted frame. The figure is built ONCE and
@@ -403,8 +408,8 @@ source) is what keeps startup fast. See `README.md`.
   offset where the UI shows a flat line at 1.000000, from identical data.
   The "grid lines on plots" toggle rides along in `ExportSpec.show_grid` and
   governs EVERY plot in the frame — charts get uPlot's grid stroke, the W panels
-  get `GridOverlay.vue`'s theme-INDEPENDENT lines drawn AFTER the image
-  (matplotlib puts the axes grid under it, hence the heatmaps first had none). Mirror any change to those rules on both sides.
+  `GridOverlay.vue`'s theme-INDEPENDENT lines drawn AFTER the image (matplotlib
+  puts the axes grid under it, hence the heatmaps first had none). Mirror any change to those rules on both sides.
   The metadata block carries U(x), parameters, the IC as an analytic expression
   (`core/describe.py`) and any live parameter change inside the range
   (`session.param_log`), so one frame documents the whole run; the same facts
@@ -431,13 +436,12 @@ source) is what keeps startup fast. See `README.md`.
   streamed status lags a frame burst by seconds after a pause, and seeding the
   range from it silently exported half the history.
   **The mp4 export follows the UI theme** (`ExportSpec.theme`, defaulted from
-  the app each time the Export panel opens and overridable per job — never
-  persisted, or it would stop tracking). Its schema default is `light`, like the
-  SPA's. It threads the same path `show_grid` does, down to
-  `render_mpl.FrameFigure(theme=)`, which resolves `PALETTE[theme]` once.
+  the app each time the Export panel opens, overridable per job, never persisted
+  or it would stop tracking). Schema default `light`, like the SPA's. It threads
+  the same path `show_grid` does, to `render_mpl.FrameFigure(theme=)`, which
+  resolves `PALETTE[theme]` once.
   `render_mpl`'s `PALETTE`/`VARIANT_COLORS` MIRROR the `--wf-*` values (it
-  cannot read our stylesheet) — change a colour on one side and change it on the
-  other.
+  cannot read our stylesheet): change one side, change the other.
 - **Theming (light/dark)**: a header button (`☀ light` / `☾ dark`) flips the
   whole UI; **light is the DEFAULT** and the choice persists in
   `localStorage.wignerf.theme`, a sibling of `wignerf.layout`/`wignerf.grid` and
@@ -470,8 +474,8 @@ source) is what keeps startup fast. See `README.md`.
   flash on every load; it also declares `color-scheme`, which fixes native
   `<select>`/`<input type=range>` widgets rendering in the OS's LIGHT style.
   **What does NOT follow the theme, on purpose**: the bwr heatmap LUT
-  (blue-white-red with W = 0 at white is the physics convention) and therefore
-  everything drawn ON the heatmap rather than on the page — `GridOverlay.vue`'s
+  (blue-white-red with W = 0 at white is the physics convention) and so
+  everything drawn ON the heatmap rather than the page — `GridOverlay.vue`'s
   grey lines, `Colorbar.vue`'s chrome, the panels' overlay labels, `ICEditor`'s
   IC-marker rings. Saturated filled action buttons stay put too; they read
   correctly on white. What DOES change and is easy to miss: **variant curve
@@ -479,8 +483,8 @@ source) is what keeps startup fast. See `README.md`.
   `#fbbf24` amber on white is unreadable) via `variantColor()`, and the
   Timeline readouts' halo (`--wf-label-shadow` inverts).
   **A data trace gets its OWN role, never a borrowed one.** `--wf-wave-re/im/abs`
-  are three roles for three series precisely so that adjusting the time cursor
-  cannot silently repaint |ψ|² in a chart it has nothing to do with.
+  are three roles for three series precisely so adjusting the time cursor cannot
+  silently repaint |ψ|² in a chart it has nothing to do with.
 - **Parameter policy**: U, c, mass, hbar_eff, tol, dt_sign, auto_expand
   apply live at the frontier; **ndim**/grid/IC/variant-set and the whole COMPUTE
   group (precision, device, history_mb — the Setup panel's third section)
@@ -567,10 +571,10 @@ source) is what keeps startup fast. See `README.md`.
   broken form.
   **Every saturated action button carries `.wf-solid`** (`style.css`): it
   supplies `color: #fff` — those buttons never set a text colour, they INHERITED
-  the shell's light text, which went invisible ("black on blue") the moment the
-  shell could be light — and a disabled state that drops to the neutral raised
-  surface, because `disabled:opacity-40` over a saturated fill is pale colour
-  under equally pale text, unreadable in either theme.
+  the shell's light text, which went invisible ("black on blue") once the shell
+  could be light — and a disabled state dropping to the neutral raised surface,
+  because `disabled:opacity-40` over a saturated fill is pale colour under
+  equally pale text, unreadable in either theme.
 - **Run modes: `interactive` vs `batch`** (SessionCreate `mode`; `batch`
   requires `t2`). Both start paused. INTERACTIVE computes until paused and
   streams a coalesced live preview (the newest complete record) so you can
@@ -822,13 +826,13 @@ the free/reserved readings behind every claim here — are in
 | `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and an enforced POLICY**: `SessionCreate.device` (restart-only) may NARROW it per session but never widen it — a spec outside `xp.devices_allowed(WIGNERF_DEVICE)` (the pool **plus cpu**) is a 422 naming the pool, as is a malformed or absent one. It used to check only that the spec parsed and the card existed, so a host pinned to `cuda:1` (or to `cpu`, to keep its cards free) could be overridden by any client. `GET /api/device` returns BOTH `devices` (the pool) and `choices` — and `choices` IS `devices_allowed`, the same list the validator uses, so the Setup select can never offer a device the API refuses. That endpoint is where every HOST fact the form needs before it can create anything lives: the device lists, `WIGNERF_PRECISION`, and the per-ndim grid ceilings (`max_grid`, `max_cells`, `bytes_per_cell_2d`). Those sit OUTSIDE `_probe_backend`'s `lru_cache`, so they follow a monkeypatched `config` and ride the probe's error path. CPU is always a legal target but never appears in an `auto` pool on a CUDA host, hence the append. `resolve_devices` returns CANONICAL specs (a bare `cuda` → `cuda:0`), without which that membership test would reject a device the host does offer. |
 | `WIGNERF_PORT` | `8010` | Backend port (8000 belongs to urantia-library). Used by start.sh; `uvicorn --port` otherwise. |
 | `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (restart-only). float32 is a PREVIEW mode — see the float64/float32 gotcha and `notes/precision.md`. Do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING; an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`, which is `Optional` and **resolved in `_check`, not by a `default_factory`** — a hard-coded literal there once made this var decorative, and a factory once refused sessions over a value the client never sent: a gate must refuse what was ASKED FOR. An omitted precision resolves to the host default at **every** ndim. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the control — or an IMPORT supplies one — the payload OMITS the field, so the host decides and the answer comes back in `status`. That is what makes the `/device` probe non-load-bearing. Two deliberate exceptions: an **imported** setup document marks the precision CHOSEN (`markPrecisionChosen`), because reproducing the run is what the document is for and without it the form showed a float32 that never happened behind a "restart to apply" no restart could clear; and a form with **auto-expand on** sends `float64` explicitly, because auto-expand is float64-only, so asking for it IS asking for float64. |
-| `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
+| `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS set `16384`. The CEILING as well as the default: `SessionCreate.history_mb` may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
 | `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. **`auto` = `libx264 -preset veryfast`, even on a working GPU** — measured, the same 60-frame 1080p export takes 4.3 s either way and h264_nvenc writes 1.8× the bytes, because the bottleneck is frame RENDERING and the encode is a rounding error against it. `nvenc` selects the GPU encoder explicitly, as does `ExportSpec.encoder` per JOB. Its runtime probe used to encode a 64×64 clip, under NVENC's 145×49 minimum, and so answered "unavailable" everywhere — see `notes/export.md`. The right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to rawvideo input). |
 | `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`); a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
 | `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, and `setNdim` asks the same function). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`): **192 B/cell in float64 and 104 in float32** — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², plus ~300 MiB of CUDA context per process per device. HIGHER than step-loop figures, and not a regression: a step loop misses `adjust_step`'s transient and the frame build. Workers spread over the pool, so what binds is the per-card share — 4 variants at 8192² is ~24 GiB/card at 2+2, which does **not** fit even the 3090, so cap by variant count and not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
-| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all. What actually binds is the per-device fit check, `routers/sessions._fit_error` (see the GPU section). **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree until the restart. Reading them off `status` broke the panel in BOTH directions (a 2D form offering N up to 4096 with no footprint line at all, and a 1D form's select collapsing to one option). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted because both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling.** **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis, so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API. **`AXIS_N_FLOOR` is shared with `setNdim`**: a dims switch lands N *inside the target's list* — their own choice when offerable, else that ndim's DEFAULT, clamped by the target's cap. Capping from ABOVE alone left a HOLE in the select (1D → 2D → 1D ran a 1D session at 64²); falling back to the FLOOR is its quieter twin. Pinned in `config.test.ts`. |
+| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all. What binds is the per-device fit check, `routers/sessions._fit_error` (see the GPU section). **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree until the restart. Reading them off `status` broke the panel in BOTH directions (a 2D form offering N up to 4096 with no footprint line at all, and a 1D form's select collapsing to one option). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted because both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling.** **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis, so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API. **`AXIS_N_FLOOR` is shared with `setNdim`**: a dims switch lands N *inside the target's list* — their own choice when offerable, else that ndim's DEFAULT, clamped by the target's cap. Capping from ABOVE alone left a HOLE in the select (1D→2D→1D ran a 1D session at 64²); falling back to the FLOOR is its quieter twin. Pinned in `config.test.ts`. |
 | `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values, and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, and a fixed cell count is wrong in both directions (refusing 128×128×64×64 on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one). The real check asks the driver. Measured with `bench.py --ndim 2 --footprint`, which runs a whole worker record rather than a step loop: **176 B/cell in float64 and 96 in float32**, flat across sizes and identical for the relativistic variants — 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ in float64, so **80⁴ is reachable only in float32**. **The STATE is only 5% of that** (W is real: 8 B/cell); the rest is the step's machinery at full shape. `config.BYTES_PER_CELL_2D` carries the breakdown and is **keyed by precision** because `_fit_error` reads it: a flat float64 figure would refuse precisely the grids float32 makes affordable. Throughput on the 3090: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — **32⁴ is for exploration and 64⁴ is a serious run**. Both the rail's refusal and the fit check quote the estimate, and `/api/device`'s `bytes_per_cell` (per ndim, per precision) feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — at either ndim, though the 1D line stays quiet under 0.5 GiB where the number decides nothing. |
 
 ## Commands
@@ -1085,7 +1089,7 @@ is that lesson firing a second time).
   `render_mpl.mathtext_ok` and falls back to plain per line. **AN IC EXPRESSION
   IS NEVER TYPESET AT ALL**, and says so by returning `None` rather than a copy
   of the plain line: `_emit` skips substitution only on its single-fragment
-  branch, so once a line WRAPPED a user's literal `px` became `$p_x$` after all.
+  branch, so once a line WRAPPED a user's literal `px` became `$p_x$`.
   **The header readout and the block deliberately DISAGREE**: the header's
   geometry follows the PAINTED record as the SPA does; the block's is labelled
   "at record k0" and stays.

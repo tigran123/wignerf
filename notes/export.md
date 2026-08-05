@@ -302,3 +302,61 @@ noise.
 Note the 4-variant row: 4429 -> 92 ms. Four panels in one figure are each half
 the width, so each needs a quarter of the samples — the pyramid makes panel
 COUNT nearly free too, where before it was linear.
+
+
+## The render pool was fed by pickle, and that was the real 3.2 fps (2026-08-05)
+
+Reported after the mip-level fix above: *"I still get 3.2 fps rendering of FHD
+video, of just one variant. And the same rendering speed for 4K as well."* The
+grid was **8192²**, which the previous sweep never reached (it stopped at
+4096²), and the "same for 4K" was the tell: if the RENDER dominated, 4K would
+cost more. It did not, so something upstream of the render was the ceiling.
+
+It was the process boundary. Every frame is handed to a `spawn` worker through
+a pickle, and the parent's feed thread does that serially:
+
+    N=4096: base  32.0 MiB + mips 10.7 = 42.7 MiB, pickled in 18 ms  (55 fps)
+    N=8192: base 128.0 MiB + mips 42.7 = 170.8 MiB, pickled in 70 ms (14 fps)
+
+...and 70 ms is only the serialize; the same bytes are then written to a pipe
+and unpickled on the far side. ~312 ms/frame, i.e. **3.2 fps whatever the video
+size** — which is exactly the reported number, and exactly why FHD and 4K were
+identical. Meanwhile the panel the worker draws into is ~767 px, i.e. **2 MiB**.
+
+`ExportJob._trim` now strips what the worker cannot draw BEFORE it is pickled:
+planes the job does not show lose their payload (a phase portrait of one plane
+shipped all six), and the rest keep only the levels at or under `_px_bound`.
+
+**The bound is the FIGURE's width, not the panel's**, and that choice is the
+point: a panel cannot be wider than the figure it sits in, so the bound can
+never trim below what the renderer needs — no layout arithmetic is mirrored
+into `videoexport`, and a future layout change cannot silently under-resolve.
+The worker then picks its own exact level out of what survives, because every
+retained level keeps its absolute decimation. Cost of being conservative: it
+ships ~10.8 MiB instead of the ~2.7 MiB an exact bound would. Irrelevant — that
+is 5 ms of pickling against 70.
+
+Measured A/B, same session and same 70-record job at 8192², one variant, the
+only difference being `_trim` replaced by the identity:
+
+    FHD   before  3.23 fps rolling   23.8 s wall
+          after  35.65 fps rolling    5.1 s wall
+    4K    before  3.53 fps rolling   25.0 s wall
+          after   8.89 fps rolling   11.6 s wall
+
+Note what the "after" column proves: FHD and 4K now DIFFER by 4x. The
+bottleneck has moved back onto the render, where 4K genuinely costs more, which
+is the shape the first fix was supposed to produce and could not while the pipe
+was the wall.
+
+Two traps in reproducing this:
+
+- **A short job measures the pool warmup, not the render.** 20 frames at
+  8192² reported 3.5 fps AFTER the fix, because spawning 8 processes and
+  building a FrameFigure in each swamps it. Use enough frames to read the
+  ROLLING rate past the warmup, which is what the panel shows anyway.
+- **Do not build a fixture's planes from one shared array.** pickle memoizes,
+  so six planes sharing a buffer report a sixth of the true payload and a
+  "before" that is already trimmed. `wq.copy()` per plane; the first version of
+  `test_only_the_levels_a_worker_can_draw_cross_the_process_boundary` failed on
+  exactly this and the code was innocent.
