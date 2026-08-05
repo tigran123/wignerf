@@ -3,10 +3,11 @@ import { computed, ref, watch } from 'vue'
 import type { Frame } from '../lib/protocol'
 import type { GeomCfg } from '../lib/config'
 import type { ProgressEvent } from '../composables/useSession'
-import { VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
+import { VARIANT_META, variantColor, vidOfKey, type VariantKey } from '../lib/variants'
 import { createViewWindow, remapView, type Domain } from '../lib/viewWindow'
 import { planeLabel, planeLabelHtml, planes as planesOf } from '../lib/axes'
-import { viewChanged, viewKey, type PlaneViewReq } from '../lib/planeView'
+import { mergeViews, planeKey, viewKey, viewsChanged,
+         type PlaneViewReq } from '../lib/planeView'
 import { panelMode, panelPlaneIdx, panelVariantIdx } from '../lib/panelView'
 import { AU_TIME_FS } from '../lib/units'
 import WignerPanel from './WignerPanel.vue'
@@ -102,7 +103,11 @@ const linkedNow = computed(() => linked.value && canLink.value)
  * `view` message describing the whole screen. It has to be batched: the server
  * treats the message as the complete picture (a plane it does not mention is
  * one this client is not showing, and is not sent at all), so four panels each
- * posting their own would leave three of them dark.
+ * posting their own would leave three of them dark. For the same reason the
+ * flush MERGES this burst over what was last sent (planeView.mergeViews) rather
+ * than sending the burst itself — bursts are routinely partial (one panel
+ * resizing, one zoomed while unlinked), and only a frame paint speaks for
+ * everyone.
  *
  * Coalesced on a microtask rather than debounced by a timer. The events that
  * produce these already arrive in bursts of one-per-panel — a frame paint, a
@@ -123,21 +128,17 @@ function onPanelView(v: PlaneViewReq) {
 
 function flushViews() {
   flushQueued = false
-  // The live set of panels, so a panel that has just unmounted stops being
+  // The live set of panels, keyed the way the SERVER keys a request (vid +
+  // pair, not the cell key), so a panel that has just unmounted stops being
   // reported — otherwise the server keeps cropping and sending a plane nothing
   // is drawing.
-  const live = new Set(cells.value.map((c) => c.key))
-  let changed = pending.size > 0 && sentViews.size !== pending.size
-  for (const [k, v] of pending) {
-    if (viewChanged(sentViews.get(k), v)) changed = true
-  }
-  // Drop entries for panels that went away; that is a change too.
-  for (const k of sentViews.keys()) if (!pending.has(k)) changed = true
-  if (!changed) return
-  sentViews.clear()
-  for (const [k, v] of pending) sentViews.set(k, v)
+  const live = new Set(cells.value.map(
+    (c) => planeKey(vidOfKey(c.variant), c.plane[0], c.plane[1])))
+  const next = mergeViews(sentViews, pending, live)
   pending.clear()
-  void live
+  if (!viewsChanged(sentViews, next)) return
+  sentViews.clear()
+  for (const [k, v] of next) sentViews.set(k, v)
   emit('view', [...sentViews.values()])
 }
 
@@ -204,6 +205,7 @@ const gridClass = computed(() => {
            class="min-h-0 border rounded overflow-hidden"
            :style="{ borderColor: variantColor(c.variant) + '66' }">
         <WignerPanel :frame-source="frameSource" :variant-index="c.variantIndex"
+                     :vid="vidOfKey(c.variant)" :geom="geom"
                      :plane="c.plane" :label="c.label" :show-grid="showGrid"
                      :show-cells="showCells"
                      :view="linkedNow ? shared : viewFor(c.key)"

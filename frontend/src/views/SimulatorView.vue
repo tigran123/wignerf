@@ -143,6 +143,13 @@ let restartsStarted = 0
 async function restart() {
   createError.value = ''
   restartsStarted++
+  // The viewport belongs to the session it was measured for: this session's
+  // panel set is about to be replaced (plotsKey remounts them), and the resend
+  // below must not tell a NEW session what an old panel set was showing. It did,
+  // and a restart that added qr+cr got two panels the server had been told
+  // nobody was watching. Cleared before the create, so the remounting panels
+  // repopulate it in time for their own socket.
+  lastView = []
   try {
     unsub?.()
     await session.create(payload())
@@ -270,6 +277,12 @@ function applyLive(params: Record<string, unknown>) {
  * Without the resend a recovered session would go back to full planes and the
  * large-grid session would be right back where it started, with nothing on
  * screen to explain it.
+ *
+ * The cache is what the CURRENT panels are showing and nothing more — restart()
+ * clears it, because a viewport measured for one panel set is a lie about
+ * another. It is also what the panels' mount-time request lands in: they emit
+ * before the socket opens, so this resend is how a fresh session's FIRST frame
+ * is already a crop rather than a whole plane.
  */
 let lastView: unknown[] = []
 function sendView(planes: unknown[]) {

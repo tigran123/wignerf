@@ -30,7 +30,12 @@ export interface PlaneViewReq {
  * identifies a request in both.
  */
 export function viewKey(v: PlaneViewReq): string {
-  return `${v.vid}:${v.a},${v.b}`
+  return planeKey(v.vid, v.a, v.b)
+}
+
+/** The same key from the parts, for a panel that has nothing to request yet. */
+export function planeKey(vid: number, a: number, b: number): string {
+  return `${vid}:${a},${b}`
 }
 
 /**
@@ -55,4 +60,40 @@ export function viewChanged(a: PlaneViewReq | undefined, b: PlaneViewReq): boole
 
 function pow2(v: number): number {
   return 1 << Math.max(0, 31 - Math.clz32(Math.max(1, Math.round(v))))
+}
+
+/**
+ * The next viewport to send: what was sent last, updated by this burst, minus
+ * the panels that have gone away.
+ *
+ * A MERGE and not a replacement, because the server reads one message as the
+ * COMPLETE picture — a panel missing from it is one this client is not showing,
+ * and stops being sent at all. Bursts, though, are routinely partial: a frame
+ * paint re-registers every panel at once, but an unlinked zoom or a single
+ * panel's resize speaks for one. Replacing the map with that burst retracted
+ * the other three panels' planes, which then arrived header-only.
+ *
+ * `live` is keyed by viewKey, so a panel that has just unmounted is dropped
+ * rather than kept alive by a stale entry — otherwise the server keeps cropping
+ * and sending a plane nothing is drawing.
+ */
+export function mergeViews(sent: Map<string, PlaneViewReq>,
+                           pending: Map<string, PlaneViewReq>,
+                           live: Set<string>): Map<string, PlaneViewReq> {
+  const next = new Map<string, PlaneViewReq>()
+  for (const k of live) {
+    const v = pending.get(k) ?? sent.get(k)
+    if (v) next.set(k, v)
+  }
+  return next
+}
+
+/** Whether `next` is worth sending in place of `sent` (see viewChanged). */
+export function viewsChanged(sent: Map<string, PlaneViewReq>,
+                             next: Map<string, PlaneViewReq>): boolean {
+  if (sent.size !== next.size) return true
+  for (const [k, v] of next) {
+    if (viewChanged(sent.get(k), v)) return true
+  }
+  return false
 }

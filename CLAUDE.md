@@ -158,23 +158,37 @@ source) is what keeps startup fast. See `README.md`.
   fix is now BUILT: **the client sends a `view` (physical window + pixel size
   per panel) and the server ships only that** — a decimated crop out of a
   per-record mip pyramid (`core/pyramid.py`, `core/planeview.py`, protocol v5).
-  Measured at 4096²: 3.1 rec/s at 99 MiB/s before (i.e. AT the ceiling), 8.0 at
-  4.2 after; at 8192² the before case is not slow but ZERO — no 128 MiB record
-  arrives at all. Four rules: the area mean happens ON THE DEVICE once per
-  record (250 ms/plane on the host); the send-time crop is a CONTIGUOUS slice of
-  a pre-reduced level (0.07 ms against 1.1 for a strided gather), which is the
-  only reason a pyramid is built; every level is quantized against the FULL
-  plane's range, so a level change cannot repaint the colorbar under someone who
-  only scrolled; and the window is PHYSICAL, which is what survives auto-expand
-  — `_views_for` resolves per RECORD, so a scrub across a regrid needs no
-  bookkeeping. A plane absent from the request is NOT SENT (`na = 0`,
-  header only), so the phase portrait stops paying for planes it is not
-  showing — which also means **the client must pick a plane by PAIR, not by
-  list position**. A reduced panel says so (`↓8×` with the reason in its
+  At 4096² it turned a saturated transport into a solver-bound one; at 8192² the
+  before case is not slow but ZERO. Four rules: the area mean happens ON THE
+  DEVICE once per record; the send-time crop is a CONTIGUOUS slice of a
+  pre-reduced level, which is the only reason a pyramid is built; every level is
+  quantized against the FULL plane's range, so a level change cannot repaint the
+  colorbar under someone who only scrolled; and the window is PHYSICAL, which is
+  what survives auto-expand — `_views_for` resolves per RECORD, so a scrub
+  across a regrid needs no bookkeeping. A plane absent from the request is NOT
+  SENT (`na = 0`, header only), so the phase portrait stops paying for planes it
+  is not showing — which also means **the client must pick a plane by PAIR, not
+  by list position**. A reduced panel says so (`↓8×` with the reason in its
   title): area-averaging is honest but invisible, and fringes below one pixel
-  vanish with nothing on screen to suggest it. The viewport is re-sent on
-  reconnect, because `send` no-ops on a closed socket and the server drops a
-  departing client's. Numbers in `notes/downsampling.md`.
+  vanish with nothing on screen to suggest it.
+  **BECAUSE A VIEWPORT IS AUTHORITATIVE, EVERY WAY OF STATING ONE INCOMPLETELY
+  IS A BLANK PANEL** — three shipped at once (2026-08-05: two of four heatmaps
+  blank after a Restart that added variants). A panel must be
+  able to say what it shows BEFORE it has ever painted — vid from its variant
+  KEY (`variants.vidOfKey`), extents falling back to the session geometry — or
+  the mount and resize requests are dead code and a panel the server is NOT
+  sending cannot ask to be. A header-only plane is answered with a REQUEST, not
+  just a kept texture: `na = 0` also means "you never said you were watching
+  this". `flushViews` MERGES over the live panel set (`planeView.mergeViews`),
+  because only a frame paint speaks for every panel — an unlinked zoom that
+  REPLACED the map retracted the other three planes. And `lastView`, re-sent on
+  reconnect (`send` no-ops on a closed socket and the server drops a departing
+  client's viewport), is CLEARED by `restart()`: a viewport measured for one
+  panel set is a lie about another. Diagnostic: a panel with a title and NO
+  COLORBAR has been reached by frames and not given a plane, and its marginals
+  keep updating — which is what rules out the worker. Numbers, and the whole
+  archaeology, in `notes/downsampling.md` — read it before touching
+  `requestView`, `flushViews` or `lastView`.
   Replay never skips a record; it slips on WS
   backpressure. The UI dial is "0" plus a log range 20 ms–1.5 s.
   **THAT BACKPRESSURE IS OURS AND MUST STAY OURS** (`protocol.AckCmd`, 2026-08-05).
@@ -259,15 +273,13 @@ source) is what keeps startup fast. See `README.md`.
   colorbar**, overlaid in its corner (`Colorbar.vue`, taking an explicit
   min/max). `WignerPanel` uploads `f.variants[variantIndex]` and the renderer
   sets `q = [v.wmin, v.wmax]` from it, so the four variants' scales drift apart
-  as they evolve — measured on a cat state in x²/2 + 0.3x⁴ at t = 15: QN wmin
-  −1.87e-1 vs CN −2.70e-1 (44% apart), wmax +3.18e-1 vs +3.51e-1. A single
-  shared bar read `variants[0]` and so mislabelled the other three panels; it
-  agreed with all of them only at record 0, which IS the IC, which is exactly
-  why it looked right. The IC preview has one too — it is a W plot with its own
-  range. Overlaid rather than stacked because it then costs no layout height:
-  the bar used to head the diagnostics column, the tallest of the three in
-  portrait (808 px against setup 758, IC 557), so a row spent there was a row
-  the panels started later by.
+  as they evolve (~44% by t = 15 on a cat state; figures in `Colorbar.vue`'s
+  docstring). A single shared bar read `variants[0]` and so mislabelled the other
+  three panels; it agreed with all of them only at record 0, which IS the IC,
+  which is exactly why it looked right. The IC preview has one too — it is a W
+  plot with its own range. Overlaid rather than stacked because it then costs no
+  layout height: the bar used to head the diagnostics column, the tallest of the
+  three in portrait, so a row spent there was a row the panels started later by.
 - **Boundary watch / auto-expand** (`core/boundary.py`): detection is
   ALWAYS on — every record, each worker sums the outer edge band of the ρ/φ
   marginals it already computed (host-side, O(Nx+Np), no extra device sync) and
@@ -364,18 +376,17 @@ source) is what keeps startup fast. See `README.md`.
   what IS available.
   **NEITHER THE ENCODE NOR THE VIDEO SIZE IS THE COST — THE PLANE IS**, twice
   over, and both fixes are "only what a panel can draw". (1) matplotlib is priced
-  by the ARRAY handed to it: 4096² cost 2247 ms/frame/worker against 256²'s 80
-  while 1080p and 4K differed by 3%, so `render_mpl.plane_step` draws the
-  coarsest mip level still covering the panel (`_panel_px`), never below it —
-  4429 → 92 ms at 4096²×4 variants, 92.6% of pixels bit-identical on a fringed
-  cat state. (2) the pool is fed by PICKLE and at 8192² a record is 170.8 MiB,
-  70 ms to serialize alone: that was 3.2 fps *whatever the video size*, FHD and
-  4K coming out identical being the tell. `ExportJob._trim` drops unshown
-  planes' payloads and keeps only levels at or under the FIGURE's width — a
-  bound no panel can exceed, so it cannot under-resolve and no layout arithmetic
-  is mirrored. FHD 3.23 → 35.65 rec/s, 4K 3.53 → 8.89, and they now DIFFER, i.e.
-  the render is the wall again. NB a SHORT job measures the pool warmup; read
-  the rolling rate. So export renders
+  by the ARRAY handed to it — 4096² cost 28× what 256² did while 1080p and 4K
+  differed by 3% — so `render_mpl.plane_step` draws the coarsest mip level still
+  covering the panel (`_panel_px`), never below it: 48× faster at 4096²×4
+  variants, 92.6% of pixels bit-identical on a fringed cat state. (2) the pool is
+  fed by PICKLE and at 8192² a record is 170.8 MiB, 70 ms to serialize alone,
+  which pinned it to 3.2 fps *whatever the video size* — FHD and 4K coming out
+  identical being the tell. `ExportJob._trim` drops unshown planes' payloads and
+  keeps only levels at or under the FIGURE's width — a bound no panel can exceed,
+  so it cannot under-resolve and no layout arithmetic is mirrored. 11× at FHD,
+  2.5× at 4K, and they now DIFFER, i.e. the render is the wall again. NB a SHORT
+  job measures the pool warmup; read the rolling rate. So export renders
   frames across a **spawn** `ProcessPoolExecutor` (`WIGNERF_EXPORT_WORKERS`,
   auto = min(cpu, 8)) while this thread feeds ORDERED frames to one ffmpeg:
   a sliding window of ≤w+2 futures consumed FIFO, so workers run ahead with
@@ -415,9 +426,9 @@ source) is what keeps startup fast. See `README.md`.
   (`session.param_log`), so one frame documents the whole run; the same facts
   go into the mp4 `comment` tag as JSON. Anchored at `FrameFigure.META_TOP`
   with `va="top"`, growing DOWNWARD, and **11 lines fit at 8 pt**; a realistic
-  4-variant run sits at the edge, so `_meta_fontsize` shrinks to fit (one size
-  for BOTH columns) and past a 5 pt floor `_meta_fit` elides with a pointer to
-  the comment tag — honest, since `describe.config_json` really carries it.
+  4-variant run sits at the edge, so `_meta_fontsize` shrinks to fit (one size for
+  BOTH columns) and past a 5 pt floor `_meta_fit` elides, pointing at the comment
+  tag — honest, since `describe.config_json` really carries it.
   `describe.IC_SRC_MAX` caps an IC expression against the same budget, in
   PHYSICAL lines. Static art in the blit background, so free per frame.
   Progress: `export` events on the session WS plus a REST poll, carrying
@@ -1182,11 +1193,11 @@ is that lesson firing a second time).
   **THE MOMENTUM BOX CANNOT PRODUCE A NORM DEFICIT, AND NOTHING ELSE SEES IT
   EITHER.** The transform is exactly N_k-periodic in the momentum index, so
   content outside the box ALIASES back in rather than being lost. Measured on a
-  packet at p₀ = +2 with a momentum box excluding its mean momentum entirely:
-  norm 1.0000000000, purity 1.000000, edge band 6.5e-06 — every scalar
-  diagnostic perfect on a completely wrong state, while `_psi_lattice`'s
-  direct-quadrature **momentum mass** reads 4.8e-16. It is the only detector
-  there is; do not remove it because "the edge band covers that".
+  packet whose momentum box excludes its mean momentum entirely: norm, purity and
+  edge band ALL perfect to their last printed digit on a completely wrong state,
+  while `_psi_lattice`'s direct-quadrature **momentum mass** reads 4.8e-16. It is
+  the only detector there is; do not remove it because "the edge band covers
+  that".
   **ψ IS NORMALISED OVER THE EXTENDED SPATIAL BOX**, so ∫W dμ is the in-box mass
   fraction and the norm deficit keeps the meaning it has for the Gaussian kinds;
   normalising over the visible box makes it a structural zero. The extension is
@@ -1447,12 +1458,11 @@ is that lesson firing a second time).
 - **The BROWSER'S WebSocket receive path is the large-grid wall, and it
   degrades with MESSAGE SIZE — not the server, not painting, not pacing.** At
   4096² it tops out at ~112 MiB/s with `queue_drops: 0` and the client IDLE,
-  waiting on delivery, while the same server feeds a raw Python client at 402
-  MiB/s; at 2048² the same browser sustains ≥480 MiB/s, so the cost is
-  per-message. **This is what made display downsampling the only real fix, and
-  why no pacing policy can help** — a pacer targets paint time, 33× off the
-  real constraint. Also: `pack_frame` costs 28 ms/record at 4096² ON THE EVENT
-  LOOP. NB the "~3 GB RSS hump, transient, not a leak" recorded here in
+  waiting on delivery, while the same server feeds a raw Python client 4× that
+  and the same browser sustains 4× it at 2048². **This is what made display
+  downsampling the only real fix, and why no pacing policy can help** — a pacer
+  targets paint time, 33× off the real constraint. Also: `pack_frame` costs
+  28 ms/record at 4096² ON THE EVENT LOOP. NB the "~3 GB RSS hump, transient, not a leak" recorded here in
   2026-07-23 was the UNBOUNDED TRANSPORT BUFFER — bounded now by the credit
   cap, and the same backlog that was killing the socket. Numbers and that
   correction in `notes/session-lifecycle.md`.

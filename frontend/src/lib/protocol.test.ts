@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { FLAG_REPLAY, MODE_PROJECTION, decodeFrame } from './protocol'
 import { planes as planesOf } from './axes'
+import { keyOfVid, vidOfKey } from './variants'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -39,6 +40,10 @@ describe.each([['frame', 1], ['frame2d', 2]])(
         const v = f.variants[i]!
         const m = meta.variants[i]
         expect(v.vid).toBe(m.vid)
+        // The vid a PANEL asks with is derived from its variant key, not read
+        // off a frame (WignerPanel has to be able to ask before its first
+        // paint), so pin that map against the wire rather than a hand table.
+        expect(vidOfKey(keyOfVid(v.vid))).toBe(v.vid)
         for (const k of ['E', 'purity', 'dt', 'lz'] as const) {
           expect(v[k]).toBeCloseTo(m[k], 6)
         }

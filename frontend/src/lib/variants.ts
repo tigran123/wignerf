@@ -39,3 +39,15 @@ export function variantColor(k: VariantKey): string {
 export function keyOfVid(vid: number): VariantKey {
   return ((vid & 1 ? 'q' : 'c') + (vid & 2 ? 'r' : 'n')) as VariantKey
 }
+
+/**
+ * key -> vid bitfield; the inverse of keyOfVid (qn 1, qr 3, cn 0, cr 2 — the
+ * same numbers backend/core/protocol.py builds the frame's variant headers
+ * from). Derived from the KEY rather than read off a painted frame, because a
+ * panel has to be able to say which variant it is showing before it has ever
+ * painted — that is what it takes to ask the server for its plane at all (see
+ * WignerPanel.requestView).
+ */
+export function vidOfKey(k: VariantKey): number {
+  return (k[0] === 'q' ? 1 : 0) | (k[1] === 'r' ? 2 : 0)
+}

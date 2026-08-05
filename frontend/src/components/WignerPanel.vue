@@ -4,6 +4,7 @@ import Colorbar from './Colorbar.vue'
 import GridOverlay from './GridOverlay.vue'
 import type { Frame } from '../lib/protocol'
 import { variantName } from '../lib/protocol'
+import type { GeomCfg } from '../lib/config'
 import { label as axisLabel, planeIndex, planeTitle } from '../lib/axes'
 import { isZoomed, panBy, resetView, zoomAt, type ViewWindow } from '../lib/viewWindow'
 import type { PlaneViewReq } from '../lib/planeView'
@@ -17,6 +18,21 @@ const props = defineProps<{
   frameSource: (h: (f: Frame) => void) => () => void
   /** Which variant of the bundle this panel shows. */
   variantIndex: number
+  /**
+   * That variant's id, which is how the SERVER names it (the panel's own
+   * `variantIndex` is a position in the bundle). A prop and not something read
+   * off a painted frame: this is half of what a panel needs to ASK for its
+   * plane, and a panel that cannot ask before its first paint cannot recover
+   * from not being sent one. See requestView.
+   */
+  vid: number
+  /**
+   * Geometry of the session (the PAINTED frame's, once one has arrived —
+   * PanelGrid follows it per record). The other half of the question above: the
+   * request is in physical extents, so a panel that has never painted needs
+   * some domain to state them against.
+   */
+  geom: GeomCfg
   /**
    * Which 2D plane of that variant, as its axis pair (see lib/axes.ts). A 1D
    * record has exactly one, [0, 1], and that plane IS W.
@@ -42,9 +58,6 @@ const reduction = ref(1)
 // labelled "Quantum, non-relativistic" kept that text after the label prop
 // became "x,y".
 const vidName = ref('')
-/** This panel's variant id, from the painted frame — the server keys views by
- *  it, and the panel's own `variantIndex` is a position in the bundle. */
-const vidOf = ref<number | null>(null)
 const title = computed(() => props.label ?? vidName.value)
 const subtitle = ref('')
 // This panel's OWN colour range, for its overlaid colorbar. Per panel because
@@ -70,18 +83,38 @@ const pair = computed<readonly [number, number]>(() => props.plane ?? [0, 1])
 const full = ref<{ a1: number; a2: number; b1: number; b2: number;
                   na: number; nb: number } | null>(null)
 
+/**
+ * The extents this panel works against: the painted frame's, and — before the
+ * first one — the session geometry from the prop.
+ *
+ * The frame still WINS, which is what makes a scrub across an auto-expand
+ * regrid follow the record rather than the session. The fallback exists so that
+ * a panel can state its viewport at mount, one message BEFORE the first frame:
+ * the server sends whole planes until a client says what it shows, and at
+ * 4096²+ that first whole plane is the thing display downsampling exists to
+ * avoid.
+ */
+const domain = computed(() => {
+  if (full.value) return full.value
+  const g = props.geom
+  const [a, b] = pair.value
+  if (g.lo[a] == null || g.lo[b] == null) return null
+  return { a1: g.lo[a]!, a2: g.hi[a]!, b1: g.lo[b]!, b2: g.hi[b]!,
+           na: g.N[a]!, nb: g.N[b]! }
+})
+
 /** This plane's two lattices, for the cell overlay. Taken from the painted
  *  frame like the extents are, so a scrub across a regrid draws the cells that
  *  record really had. */
 const lattice = computed<[AxisLattice, AxisLattice] | null>(() => {
-  const d = full.value
+  const d = domain.value
   if (!d) return null
   return [{ lo: d.a1, hi: d.a2, n: d.na }, { lo: d.b1, hi: d.b2, n: d.nb }]
 })
 
 /** Extents of the current view WINDOW, for the axis overlay. */
 const viewDomain = computed(() => {
-  const d = full.value
+  const d = domain.value
   if (!d) return null
   const v = props.view ?? { x0: 0, x1: 1, y0: 0, y1: 1 }
   return {
@@ -104,15 +137,23 @@ const labels = ref<[string, string]>(['x', 'p'])
  * Emitted rather than sent: the request has to be BATCHED with every other
  * panel's (see PanelGrid), or four panels would each overwrite the others'
  * entries in a map the server keys by panel.
+ *
+ * NOTHING HERE COMES FROM A PAINTED FRAME, deliberately. It used to take the
+ * vid and the extents from one, which made this a no-op until the panel had
+ * already been sent its plane — so a panel the server was NOT sending (a
+ * header-only plane) could not ask to be, and stayed blank for the life of the
+ * page. See the na === 0 branch below and notes/downsampling.md.
  */
 function requestView() {
   const d = viewDomain.value
-  const vid = vidOf.value
-  if (!d || vid == null) return
+  // A canvas with no layout yet has no honest pixel size: pixelSize() clamps to
+  // 1, and the server floors a request at VIEW_N_MIN, so an unlaid-out panel
+  // would ask for — and be answered with — a 64-cell thumbnail of its window.
+  const el = canvas.value
+  if (!d || !el?.clientWidth || !el.clientHeight) return
   const [pw, ph] = renderer.pixelSize()
-  if (!pw || !ph) return
   const [a, b] = pair.value
-  emit('view', { vid, a, b, a1: d.a1, a2: d.a2, b1: d.b1, b2: d.b2,
+  emit('view', { vid: props.vid, a, b, a1: d.a1, a2: d.a2, b1: d.b1, b2: d.b2,
                  na: pw, nb: ph })
 }
 
@@ -166,17 +207,29 @@ onMounted(() => {
     // the wrong plane. (It is still the canonical order — but nothing here
     // needs to depend on that.)
     const p = v.planes.find((q) => q.a === a && q.b === b)
-    if (!p) return
+    if (!p) {
+      // this record does not carry our plane at all: say what we show, in case
+      // that is why (see below)
+      requestView()
+      return
+    }
     vidName.value = variantName(v.vid)
-    vidOf.value = v.vid
     subtitle.value = planeTitle(f.ndim, [a, b], true)
     labels.value = [axisLabel(f.ndim, a), axisLabel(f.ndim, b)]
     full.value = { a1: f.lo[a]!, a2: f.hi[a]!, b1: f.lo[b]!, b2: f.hi[b]!,
                    na: f.N[a]!, nb: f.N[b]! }
     // na === 0 is "not sent" — keep the last texture rather than blanking the
     // panel, which is what a frame arriving between a request and its answer
-    // would otherwise do.
-    if (p.na === 0) return
+    // would otherwise do. But ASK AGAIN: the server sends a plane no viewport
+    // mentions as a bare header, so this is also what "you never told me you
+    // were showing this" looks like, and a panel that only asked after a
+    // successful paint could never get out of it. That is precisely how a
+    // 2-variant session's viewport, replayed into a 4-variant one, left two
+    // panels blank for the life of the page.
+    if (p.na === 0) {
+      requestView()
+      return
+    }
     wmin.value = p.wmin
     wmax.value = p.wmax
     reduction.value = Math.max(p.step[0], p.step[1])
