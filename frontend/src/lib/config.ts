@@ -2,7 +2,12 @@
 
 import { C_AU } from './units'
 import { labels as axisLabels, nAxes } from './axes'
+import { DEFAULT_IC_EXPR, isExprKind, isICKind, type ICExprKind,
+         type ICKind } from './icKinds'
 import { ALL_VARIANTS, type VariantKey } from './variants'
+
+export { DEFAULT_IC_EXPR, IC_KINDS, isExprKind, isICKind } from './icKinds'
+export type { ICExprKind, ICKind } from './icKinds'
 
 export type Ndim = 1 | 2
 
@@ -47,8 +52,21 @@ export interface ICComponentCfg {
 }
 
 export interface ICCfg {
-  type: 'mixture' | 'cat'
+  type: ICKind
   components: ICComponentCfg[]
+  /**
+   * BOTH expression drafts, always present, and kept alongside the Gaussian
+   * components rather than replacing them.
+   *
+   * Two, not one, because a W and a ψ are different objects on different
+   * variable sets (x,p / x,y,px,py against x / x,y) — one shared string would
+   * be invalid the instant you switched tab. And the components stay alive for
+   * the same reason `setType` already preserves them across mixture↔cat:
+   * switching must be non-destructive in every direction. `payload()` deep-
+   * copies the whole config, so an exported setup document carries the tab you
+   * were NOT on as well, and an import restores it.
+   */
+  expr: Record<ICExprKind, string>
 }
 
 export interface SimConfig {
@@ -152,11 +170,13 @@ export const DEFAULT_IC: Record<Ndim, ICCfg> = {
     type: 'mixture',
     components: [{ q0: [2.0], k0: [0.0], sigma_q: [0.70711],
                    sigma_k: [0.70711], weight: 1, phase: 0 }],
+    expr: DEFAULT_IC_EXPR[1],
   },
   2: {
     type: 'mixture',
     components: [{ q0: [2.0, 0.0], k0: [0.0, 1.0], sigma_q: [0.70711, 0.70711],
                    sigma_k: [0.70711, 0.70711], weight: 1, phase: 0 }],
+    expr: DEFAULT_IC_EXPR[2],
   },
 }
 
@@ -169,10 +189,106 @@ export function cloneComponent(c: ICComponentCfg): ICComponentCfg {
   }
 }
 
-/** The default IC for a dimensionality, freshly copied. */
+/** The default IC for a dimensionality, freshly copied — `expr` included, or
+ *  the form would mutate the module constant for the life of the page. */
 export function defaultIC(ndim: Ndim): ICCfg {
   return { type: DEFAULT_IC[ndim].type,
-           components: DEFAULT_IC[ndim].components.map(cloneComponent) }
+           components: DEFAULT_IC[ndim].components.map(cloneComponent),
+           expr: { ...DEFAULT_IC[ndim].expr } }
+}
+
+/**
+ * The IC as the WIRE spells it: `expr` is the ACTIVE kind's expression, a plain
+ * string, or absent.
+ *
+ * The form keeps both drafts so switching tabs is non-destructive, but a
+ * SessionCreate describes one run and that run has one initial condition —
+ * carrying the draft you are not using into the session spec would be form
+ * state masquerading as run state, and it is what `describe.setup_document`
+ * would then publish as "the config this session was created with".
+ *
+ * mergeConfig accepts either spelling coming back, the same bargain
+ * normalizeGrid and normalizeComponent already make for their own shapes.
+ */
+export function icPayload(ic: ICCfg): Record<string, unknown> {
+  const out: Record<string, unknown> = { type: ic.type }
+  // EACH KIND SENDS ITS OWN SHAPE AND ONLY ITS OWN. The form holds both at once
+  // on purpose — switching tabs must not destroy the Gaussian components you
+  // spent a minute placing, nor the expression you spent one typing — but the
+  // WIRE carries exactly what the chosen kind is built from, which is what
+  // core/protocol.ICSpec now enforces on the other end.
+  //
+  // Sending both was not merely redundant. A `psi` that still carried 2D
+  // components from an earlier session was refused by SessionCreate with "the
+  // grid is 1D but 1 initial-condition component(s) carry 2 coordinate(s)
+  // each", a sentence about components a psi does not use; and a Gaussian
+  // carrying a dead `expr` round-tripped it through the exported setup document
+  // into the mp4 comment tag, so an import showed an expression that had no
+  // part in the run it claims to reproduce.
+  if (isExprKind(ic.type)) out.expr = ic.expr[ic.type]
+  else out.components = ic.components
+  return out
+}
+
+/**
+ * Repoint any expression still sitting at the OTHER dimensionality's default at
+ * this one — the `wasDefaultU` rule, third call site.
+ *
+ * This exists because `loadConfig` builds `defaultConfig()` at ndim=1 ALWAYS and
+ * then merges a stored config over it, and a config stored before this feature
+ * has no `ic.expr` key at all. Without this, every existing user's first 2D page
+ * load would land on a W(x,p) in a four-variable world: valid-looking, dead, and
+ * behind a tab they had not touched.
+ *
+ * `keep` is that "which keys were supplied" bookkeeping, and it turned out to be
+ * required rather than avoidable — see the body.
+ */
+export function conformICExprToNdim(ic: ICCfg, ndim: Ndim,
+                                    keep: readonly ICExprKind[] = []) {
+  const other: Ndim = ndim === 1 ? 2 : 1
+  for (const k of ['wexpr', 'psi'] as const) {
+    // `keep` is the drafts the CALLER was just handed, and they are off limits.
+    //
+    // "Still at the other ndim's default" is a proxy for "untouched", and it is
+    // only a good one on an explicit dimensionality switch. Elsewhere it is
+    // wrong in both directions, because DEFAULT_IC_EXPR[1] is itself a legal 2D
+    // expression (its free symbols are a subset of {x, y}): a 2D user who
+    // deliberately types that y-independent cat had it rewritten on the next
+    // page load, and — worse — an IMPORTED document whose own expression
+    // happened to match had it replaced by this function immediately after
+    // mergeConfig had just read it in, so the setup no longer reproduced the run
+    // it came from. Both are the rule setNdim states for U(x): a hand-written
+    // expression must never be discarded.
+    if (keep.includes(k)) continue
+    if (ic.expr[k] === DEFAULT_IC_EXPR[other][k]) ic.expr[k] = DEFAULT_IC_EXPR[ndim][k]
+  }
+}
+
+/**
+ * Each component's coordinates reshaped to `ndim` — the second dimension
+ * mirrors the first, centred at the origin (the separable product of what was
+ * there); going back drops it.
+ *
+ * Extracted from setNdim so importConfig can use it too. An expression IC's
+ * components are INERT, so refusing an otherwise-perfect document over their
+ * dimensionality would be wrong; reshaping them is both harmless and what
+ * closes a pre-existing hole, since loadConfig already accepts a stored config
+ * whose components disagree with its own grid.
+ */
+export function reshapeComponents(cs: ICComponentCfg[], ndim: Ndim) {
+  for (const k of cs) {
+    if (ndim === 2) {
+      k.q0 = [k.q0[0] ?? 0, 0]
+      k.k0 = [k.k0[0] ?? 0, 0]
+      k.sigma_q = [k.sigma_q[0] ?? 0.5, k.sigma_q[0] ?? 0.5]
+      k.sigma_k = k.sigma_k ? [k.sigma_k[0]!, k.sigma_k[0]!] : null
+    } else {
+      k.q0 = [k.q0[0] ?? 0]
+      k.k0 = [k.k0[0] ?? 0]
+      k.sigma_q = [k.sigma_q[0] ?? 0.5]
+      k.sigma_k = k.sigma_k ? [k.sigma_k[0]!] : null
+    }
+  }
 }
 
 function num(v: unknown, fallback: number): number {
@@ -304,6 +420,11 @@ export function axisSizeOptions(ndim: number, cap: number,
 export function setNdim(c: SimConfig, ndim: Ndim, cap = Infinity) {
   if (c.grid.ndim === ndim) return
   const wasDefaultU = c.potential === DEFAULT_POTENTIAL[c.grid.ndim]
+  // ...computed BEFORE c.grid.ndim moves, exactly as wasDefaultU is
+  const wasDefaultExpr = {
+    wexpr: c.ic.expr.wexpr === DEFAULT_IC_EXPR[c.grid.ndim].wexpr,
+    psi: c.ic.expr.psi === DEFAULT_IC_EXPR[c.grid.ndim].psi,
+  }
   const keep = c.grid.axes
   // The BOX carries over — a 2D run wants the same extents its 1D counterpart
   // had — but the RESOLUTION is re-chosen, because N means a different thing
@@ -355,22 +476,16 @@ export function setNdim(c: SimConfig, ndim: Ndim, cap = Infinity) {
   })
   c.grid.ndim = ndim
   c.grid.axes.splice(0, c.grid.axes.length, ...next)
-  for (const k of c.ic.components) {
-    if (ndim === 2) {
-      k.q0 = [k.q0[0]!, 0]
-      k.k0 = [k.k0[0]!, 0]
-      k.sigma_q = [k.sigma_q[0]!, k.sigma_q[0]!]
-      k.sigma_k = k.sigma_k ? [k.sigma_k[0]!, k.sigma_k[0]!] : null
-    } else {
-      k.q0 = [k.q0[0]!]
-      k.k0 = [k.k0[0]!]
-      k.sigma_q = [k.sigma_q[0]!]
-      k.sigma_k = k.sigma_k ? [k.sigma_k[0]!] : null
-    }
-  }
+  reshapeComponents(c.ic.components, ndim)
   // U(x) cannot mean U(x,y): only replace it if the user never edited it away
   // from the default, so a hand-written potential is never silently discarded.
   if (wasDefaultU) c.potential = DEFAULT_POTENTIAL[ndim]
+  // BOTH expressions, under the same rule and each judged on its own — not just
+  // the active one. A 1D-only W(x,p) left sitting behind an unselected tab in a
+  // 2D form is valid-looking and dead; a hand-written one that IS carried over
+  // fails the preview with a free-symbol message, which is the correct outcome.
+  for (const k of ['wexpr', 'psi'] as const)
+    if (wasDefaultExpr[k]) c.ic.expr[k] = DEFAULT_IC_EXPR[ndim][k]
 }
 
 /*
@@ -472,15 +587,32 @@ export function precisionForPayload(c: SimConfig): SimConfig['precision'] | null
 export function mergeConfig(target: SimConfig, s: unknown) {
   if (!s || typeof s !== 'object') return
   const src = s as Record<string, any>
+  /** Expression drafts this document actually carried — never repointed below. */
+  const supplied: ICExprKind[] = []
   const g = normalizeGrid(src.grid)
   if (g) {
     target.grid.ndim = g.ndim
     target.grid.axes.splice(0, target.grid.axes.length, ...g.axes)
   }
-  if (Array.isArray(src.ic?.components) && src.ic.components.length) {
-    target.ic.type = src.ic.type === 'cat' ? 'cat' : 'mixture'
-    target.ic.components.splice(0, target.ic.components.length,
-                                ...src.ic.components.map(normalizeComponent))
+  // `type` and `expr` are NOT behind the components guard. They used to be, so
+  // a document of {type: 'psi', expr: {...}} with no components had both
+  // silently ignored and merged as a mixture.
+  if (src.ic && typeof src.ic === 'object') {
+    if (isICKind(src.ic.type)) target.ic.type = src.ic.type
+    if (Array.isArray(src.ic.components) && src.ic.components.length)
+      target.ic.components.splice(0, target.ic.components.length,
+                                  ...src.ic.components.map(normalizeComponent))
+    // Either spelling: an object carries BOTH drafts (a stored browser config),
+    // a bare string carries the ACTIVE kind's (a setup document or an mp4
+    // comment tag, where only the run's own IC exists — see icPayload).
+    const e = src.ic.expr
+    if (typeof e === 'string' && isExprKind(target.ic.type)) {
+      target.ic.expr[target.ic.type] = e
+      supplied.push(target.ic.type)
+    } else if (e && typeof e === 'object')
+      // key by key: a partial {psi: '...'} must not blank wexpr
+      for (const k of ['wexpr', 'psi'] as const)
+        if (typeof e[k] === 'string') { target.ic.expr[k] = e[k]; supplied.push(k) }
   }
   // An older setup file or mp4 has no `precision` key; absent keys are
   // skipped, so an import of one lands on float64 — the safe direction.
@@ -504,6 +636,12 @@ export function mergeConfig(target: SimConfig, s: unknown) {
   // and tol raised to the float32 floor for whatever precision the merge
   // actually ended up with, rather than the one it started from
   applyPrecisionInvariants(target)
+  // The merged grid decides both of these, so they run last: components whose
+  // dimensionality disagrees with the grid are reshaped rather than left for
+  // ICEditor.coord's `?? 0` to paper over, and an expression still at the other
+  // ndim's default is repointed at this one.
+  reshapeComponents(target.ic.components, target.grid.ndim)
+  conformICExprToNdim(target.ic, target.grid.ndim, supplied)
 }
 
 /**
@@ -565,8 +703,10 @@ export function importConfig(target: SimConfig, doc: unknown) {
     throw new Error('not a wignerf setup file')
   const d = doc as Record<string, any>
   const cfg = (d.config && typeof d.config === 'object') ? d.config : d
+  // An expression IC has no components at all, so requiring them here killed
+  // such a document at the door with "no grid/potential/IC", which is a lie.
   if (!cfg.grid || typeof cfg.grid !== 'object' || typeof cfg.potential !== 'string'
-      || !cfg.ic || !Array.isArray(cfg.ic.components))
+      || !cfg.ic || typeof cfg.ic !== 'object')
     throw new Error('not a wignerf setup file (no grid/potential/IC)')
   const ng = normalizeGrid(cfg.grid)
   if (!ng) throw new Error('grid is neither {ndim, axes} nor {x1, x2, Nx, ...}')
@@ -582,12 +722,22 @@ export function importConfig(target: SimConfig, doc: unknown) {
     // the user presses Restart
     if (a.N % 2 !== 0) throw new Error(`grid axis ${names[i]}: N must be even`)
   })
-  if (!cfg.ic.components.length) throw new Error('the IC has no components')
-  const nd = normalizeComponent(cfg.ic.components[0]).q0.length
-  if (nd !== ng.ndim)
-    throw new Error(`the grid is ${ng.ndim}D but the IC components are ${nd}D`)
-  if (cfg.ic.type !== 'mixture' && cfg.ic.type !== 'cat')
-    throw new Error(`unknown IC type "${cfg.ic.type}"`)
+  if (!isICKind(cfg.ic.type)) throw new Error(`unknown IC type "${cfg.ic.type}"`)
+  if (isExprKind(cfg.ic.type)) {
+    // What an expression IC needs instead of components. Its own components, if
+    // any came along, are inert — mergeConfig reshapes them to the grid rather
+    // than refusing an otherwise-perfect document over them.
+    const raw = cfg.ic.expr
+    const e = typeof raw === 'string' ? raw : raw?.[cfg.ic.type]
+    if (typeof e !== 'string' || !e.trim())
+      throw new Error(`the IC type is "${cfg.ic.type}" but ic.expr.${cfg.ic.type} is missing`)
+  } else {
+    if (!Array.isArray(cfg.ic.components) || !cfg.ic.components.length)
+      throw new Error('the IC has no components')
+    const nd = normalizeComponent(cfg.ic.components[0]).q0.length
+    if (nd !== ng.ndim)
+      throw new Error(`the grid is ${ng.ndim}D but the IC components are ${nd}D`)
+  }
   if (Array.isArray(cfg.variants)
       && !cfg.variants.some((v: string) => (ALL_KEYS as readonly string[]).includes(v)))
     throw new Error('no known variants in the file')
@@ -626,6 +776,10 @@ export function resetToDefaults(c: SimConfig) {
   c.grid.axes.splice(0, c.grid.axes.length, ...d.grid.axes)
   c.ic.type = d.ic.type
   c.ic.components.splice(0, c.ic.components.length, ...d.ic.components)
+  // ...both expressions too, or a reset leaves a stale one behind a tab it also
+  // just switched away from — invisible until someone clicks it
+  c.ic.expr.wexpr = d.ic.expr.wexpr
+  c.ic.expr.psi = d.ic.expr.psi
   c.variants.splice(0, c.variants.length, ...d.variants)
   c.potential = d.potential
   c.mass = d.mass

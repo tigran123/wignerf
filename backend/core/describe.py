@@ -137,6 +137,29 @@ def _vec(parts, sep=", "):
     return parts[0] if len(parts) == 1 else "(%s)" % sep.join(parts)
 
 
+# An IC expression may be up to expr.MAX_EXPR_LEN = 500 characters, while
+# meta_columns wraps the right column at 150 with a 4-space continuation. Cap it
+# and say so: the mp4 comment tag carries the text in full (config_json dumps
+# cfg verbatim), so this elides rather than lies, the same bargain _meta_fit
+# strikes.
+#
+# THE BUDGET IS IN PHYSICAL LINES AND WAS MEASURED, not reasoned from the source
+# length — the previous value was chosen as "three lines' worth" and was four.
+# What one costs is the wrapped header plus the normalization line, plus the
+# truncation note WHEN it fires, so the two cases differ and both matter.
+# Measured over {wexpr, psi} x {1D, 2D} through _emit(…, 150, nd), which is the
+# only path these lines take to the figure: 200 is the largest cap holding an
+# untruncated expression to 3 physical lines, and a truncated one costs 4
+# whatever the cap is, since the note is itself a line. Against param_lines' 3-8
+# that is 6-12 in a column fitting 11 at 8 pt, so only the very worst case
+# reaches _meta_fontsize's shrink — which is what it is for.
+IC_SRC_MAX = 200
+
+
+def _src(text):
+    return text if len(text) <= IC_SRC_MAX else text[:IC_SRC_MAX - 1] + "…"
+
+
 def ic_expression(ic, hbar_eff, ndim=None, math=False):
     """The initial condition as an analytic expression, with the concrete
     numbers substituted. Returns a list of text lines.
@@ -151,13 +174,50 @@ def ic_expression(ic, hbar_eff, ndim=None, math=False):
       dimension is exact.
     """
     from . import axes as ax
-    comps = list(ic.components)
     hbar = float(hbar_eff)
+    # ndim comes from the components only when there ARE components. An
+    # expression IC has none, so `comps[0].ndim` would be an IndexError on every
+    # export of one — which is why both render_mpl call sites pass ndim=.
+    comps = list(ic.components)
     nd = ndim if ndim is not None else comps[0].ndim
     labels = ax.labels(nd)
     args = ",".join(labels)
     # psi lives on configuration space only — "psi(x,p,0)" would be nonsense
     qargs = ",".join(labels[:nd])
+
+    # The two EXPRESSION kinds print the user's own source string, which is
+    # exactly what makes the block "how to reproduce this run": it is the text
+    # you paste back into the IC box. "∝" rather than "=" because both are
+    # normalized by something this block cannot print — it has no grid.
+    #
+    # The source is NOT typeset, and `math=True` returns None per line to SAY so
+    # rather than returning the same string twice.
+    #
+    # Returning identical plain and math strings looked equivalent and was not.
+    # _emit only skips substitution on its single-fragment branch; the moment the
+    # logical line exceeds the column width it wraps and runs ax.sub_math_text on
+    # every fragment, so a user's literal `px` became `$p_x$` after all —
+    # measured on a 126-character 2D wexpr, well inside both IC_SRC_MAX and
+    # MAX_EXPR_LEN. That breaks this line's entire job (it is the text you paste
+    # back into the IC box) and the wrapping arithmetic with it, since five
+    # characters then draw as two glyphs. ndim=1 never showed it, because `x` and
+    # `p` are already single letters. None is the signal _emit already has for
+    # "no typeset twin exists", which is exactly the situation.
+    if ic.type in ("wexpr", "psi"):
+        src = _src(getattr(ic, "expr", "") or "")
+        if ic.type == "wexpr":
+            lines = ["IC (analytic W):  W(%s,0) ∝ %s" % (args, src),
+                     "    normalized by its own integral over the grid "
+                     "(an arbitrary expression has no analytic norm)"]
+        else:
+            lines = ["IC (analytic ψ, ℏ = %s):  W(%s,0) = Wigner[ψ],  "
+                     "ψ(%s,0) ∝ %s" % (_num(hbar), args, qargs, src),
+                     "    normalized by ∫|ψ|² over the extended spatial box; "
+                     "W by the discrete Wigner transform"]
+        if len(src) != len(getattr(ic, "expr", "") or ""):
+            lines.append("    expression truncated for display — full text in "
+                         "the mp4 comment tag")
+        return [None]*len(lines) if math else lines
 
     if ic.type == "cat":
         terms = []

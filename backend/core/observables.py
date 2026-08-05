@@ -153,7 +153,7 @@ def _base(W, grid, hbar_eff, planes, fam):
     return dict(
         norm=float(marg[0].sum())*grid.d[0],
         purity=(2.*pi*float(hbar_eff))**grid.ndim
-        * float(xp.sum(W*W, dtype=xp.float64))*grid.dV,
+        * float(xp.sum(W*W, dtype=xp.float64))*grid.dmu,
         # <Lz> = <x*py> - <y*px>, each from the mixed plane that already holds
         # exactly the joint density it needs. Undefined in 1D.
         lz=(_cross(planes, grid, (0, 3)) - _cross(planes, grid, (1, 2))

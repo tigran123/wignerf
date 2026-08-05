@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from core import describe, protocol, videoexport
+from core import describe, protocol, render_mpl, videoexport
 from core.render_mpl import FrameFigure, RangeStats, meta_columns
 from main import app
 
@@ -141,7 +141,7 @@ def test_video_labels_match_the_ui():
         fig.close()
     assert "purity γ(t) = 2πℏ∬W²dxdp" in titles
     assert "E(t)" in titles and "ΔX·ΔP(t)" in titles
-    assert "ρ(x) = ∫W dp" in titles and "φ(p) = ∫W dx" in titles
+    assert "ρ(x) = ∫W dp" in titles and "ρ(p) = ∫W dx" in titles
 
 
 def test_series_ylim_matches_uplot_rule():
@@ -599,3 +599,80 @@ def test_export_unknown_session_and_job():
         assert client.get("/api/exports/nope").status_code == 404
         assert client.get("/api/exports/nope/file").status_code == 404
         assert client.delete("/api/exports/nope").status_code == 404
+
+
+# -- the expression initial conditions -----------------------------------------
+
+def _expr_ic(kind, expr):
+    from types import SimpleNamespace
+    return SimpleNamespace(type=kind, components=[], expr=expr)
+
+
+@pytest.mark.parametrize("nd", [1, 2])
+@pytest.mark.parametrize("kind,expr", [("wexpr", "3.5*exp(-x^2-p^2)"),
+                                       ("psi", "hermite(3,x)*exp(-x^2/2)")])
+def test_an_expression_ic_describes_itself_without_components(kind, expr, nd):
+    """ic_expression used to derive ndim from comps[0].ndim, which is an
+    IndexError for a component-less IC — i.e. on every export of one. Both
+    render_mpl call sites pass ndim= for exactly this reason."""
+    lines = describe.ic_expression(_expr_ic(kind, expr), 1.0, ndim=nd)
+    assert lines and expr in lines[0]
+    assert "normalized" in lines[1]
+
+
+@pytest.mark.parametrize("kind", ["wexpr", "psi"])
+def test_an_expression_ic_is_never_mathified_even_when_it_wraps(kind):
+    """The source is the user's own string — the text you paste back into the IC
+    box — and must reach the figure verbatim.
+
+    ASSERTED THROUGH _emit, WHICH IS WHERE IT HAPPENS. The predecessor of this
+    test compared ic_expression's plain and math outputs, which are equal by
+    construction on that branch, so it passed while the bug was live: _emit only
+    skips substitution when a logical line fits in ONE fragment, and the moment
+    it wraps it runs ax.sub_math_text on every fragment. A literal `px` then came
+    out as `$p_x$` — five characters drawing as two glyphs, which also makes the
+    character-count wrapping a guess. ndim=1 cannot see any of this, because `x`
+    and `p` are already single letters, so the case has to be 2D AND long enough
+    to wrap.
+    """
+    src = ("exp(-(x-1)^2 - (y+2)^2 - (px-0.5)^2 - (py+0.5)^2) + "
+           "0.3*exp(-(x+1)^2 - (y-2)^2 - (px+1.5)^2 - (py-1.5)^2)"
+           "*cos(2*px*x + 2*py*y)")
+    assert len(src) <= describe.IC_SRC_MAX      # not truncation doing the work
+    ic = _expr_ic(kind, src)
+    plain = describe.ic_expression(ic, 1.0, ndim=2)
+    math = describe.ic_expression(ic, 1.0, ndim=2, math=True)
+    # None, not a copy of the plain line: it is the signal _emit already has for
+    # "there is no typeset twin", and the only one its wrapping branch honours.
+    assert math == [None]*len(plain)
+    out = render_mpl._emit(plain, math, 150, 2)
+    assert len(out) > 1, "the case must actually wrap or it proves nothing"
+    joined = " ".join(out)
+    assert "$" not in joined
+    assert "p_x" not in joined and "p_y" not in joined
+    # every fragment of the source survives, in order
+    assert src.replace(" ", "") in joined.replace(" ", "").replace("\n", "")
+
+
+@pytest.mark.parametrize("nd", [1, 2])
+@pytest.mark.parametrize("kind", ["wexpr", "psi"])
+def test_a_long_expression_is_truncated_with_a_pointer_not_clipped(kind, nd):
+    long = "exp(-x^2/2)*(" + "+".join("%d*x^%d" % (i, i) for i in range(60)) + ")"
+    assert len(long) > describe.IC_SRC_MAX
+    ic = _expr_ic(kind, long)
+    lines = describe.ic_expression(ic, 1.0, ndim=nd)
+    assert "…" in lines[0]
+    assert "comment tag" in lines[-1]
+    # THE BUDGET IS IN PHYSICAL LINES, which is what the block actually spends —
+    # the predecessor asserted len(lines) == 3 on the PRE-WRAP list, so it could
+    # not see the number its own comment named (the real figure was 5). A
+    # truncated expression costs 4 because the pointer is itself a line; see
+    # describe.IC_SRC_MAX for the measurement this cap comes from.
+    phys = render_mpl._emit(lines, describe.ic_expression(ic, 1.0, ndim=nd,
+                                                          math=True), 150, nd)
+    assert len(phys) == 4
+    # ...and an expression that just fits costs one less, with no pointer
+    short = _expr_ic(kind, "a"*describe.IC_SRC_MAX)
+    assert len(render_mpl._emit(
+        describe.ic_expression(short, 1.0, ndim=nd),
+        describe.ic_expression(short, 1.0, ndim=nd, math=True), 150, nd)) == 3

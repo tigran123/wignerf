@@ -76,7 +76,7 @@ def test_embed_window_is_exact_at_four_axes():
     gs = _state()
     g = gs.make_grid(b)
     W = _blob(gs, b)
-    dV = prod(gs.d)
+    dmu = prod(gs.d)
 
     # (a) a whole-cell move, different and non-zero on every axis, both signs
     shift = (+5, -3, +2, -1)
@@ -93,8 +93,8 @@ def test_embed_window_is_exact_at_four_axes():
     assert np.array_equal(Wm[:-5, 3:, :-2, 1:], W[5:, :-3, 2:, :-1])
     assert not Wm[-5:].any() and not Wm[:, :3].any()     # entering cells zero
     assert not Wm[:, :, -2:].any() and not Wm[:, :, :, :1].any()
-    assert abs(Wm.sum() - W.sum())*dV < 1e-10
-    assert abs((Wm*Wm).sum() - (W*W).sum())*dV < 1e-12
+    assert abs(Wm.sum() - W.sum())*dmu < 1e-10
+    assert abs((Wm*Wm).sum() - (W*W).sum())*dmu < 1e-12
 
     # (b) ONE axis doubled — the plan a single tripped axis produces, and the
     #     one that doubles the working set
@@ -108,8 +108,8 @@ def test_embed_window_is_exact_at_four_axes():
     W1[16:48] = 0.0
     assert not W1.any()
     W1 = embed_window(W, gs, d1, np)
-    assert W1.sum()*prod(d1.d) == pytest.approx(W.sum()*dV, rel=1e-13)
-    assert (W1*W1).sum()*prod(d1.d) == pytest.approx((W*W).sum()*dV, rel=1e-13)
+    assert W1.sum()*prod(d1.d) == pytest.approx(W.sum()*dmu, rel=1e-13)
+    assert (W1*W1).sum()*prod(d1.d) == pytest.approx((W*W).sum()*dmu, rel=1e-13)
 
     # (c) TWO axes doubled at once (a radially spreading state trips both), and
     #     the momentum axes left alone — a 4x working set, not 16x

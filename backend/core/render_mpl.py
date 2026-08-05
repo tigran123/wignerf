@@ -208,7 +208,7 @@ def diagnostic_label(ndim, pid, math=False):
     a = _marg_axis(pid)
     if a is not None:
         name = ax.sub_math(ax.label(ndim, a)) if math else ax.label(ndim, a)
-        return "%s(%s)" % ("φ" if ax.is_momentum(ndim, a) else "ρ", name)
+        return "ρ(%s)" % name      # every marginal, see ax.marginal_title
     if pid == "E":
         return "E"
     if pid.startswith("uncertainty"):
@@ -848,7 +848,7 @@ def meta_columns(cfg, geom, stats, variants, k0, k1, n_frames, fps,
     # being derived by substitution from the other. Most of them differ only in
     # the axis names and a blanket pass would do — but "ΔX·ΔPx" carries a
     # CAPITAL Px that is not an axis label, so a substitution pass left it
-    # plain beside a subscripted "φ(px)" three words away. Generating both from
+    # plain beside a subscripted "ρ(px)" three words away. Generating both from
     # the same sources keeps every name in one spelling.
     def both(fmt, *plain_args, math_args=None):
         rows.append((fmt % plain_args,
@@ -886,9 +886,10 @@ def meta_columns(cfg, geom, stats, variants, k0, k1, n_frames, fps,
     # follows the ORIGINAL ℏ, not whatever a live change left behind
     hbar0 = describe.state_at(cfg, param_log, -1).get("hbar_eff", cfg.hbar_eff)
     right_plain = (describe.param_lines(cfg, param_log, k0, k1)
-                   + describe.ic_expression(cfg.ic, hbar0))
+                   + describe.ic_expression(cfg.ic, hbar0, ndim=nd))
     right_math = (describe.param_lines(cfg, param_log, k0, k1, math=True)
-                  + describe.ic_expression(cfg.ic, hbar0, math=True))
+                  + describe.ic_expression(cfg.ic, hbar0, ndim=nd,
+                                          math=True))
     right = _emit(right_plain, right_math, 150, nd)
     return left, right
 
@@ -987,10 +988,23 @@ def _emit(plain_lines, math_lines, width, ndim):
 
 
 def _wrap(lines, width):
+    # break_on_hyphens=False, because a minus sign is not a hyphen and this
+    # column is full of them. textwrap's default treats "exp(-x^2/2)" as
+    # hyphenated and will break it right after the minus, so an IC expression
+    # came out as "∝ exp(-" / "x^2/2)*(0*x^0+…" — three characters on one line,
+    # the expression severed at an operator, and the block's whole job (the text
+    # you paste back into the IC box) broken. It costs lines too: the same
+    # expression took 5 physical lines instead of 4.
+    #
+    # This is the same class of damage _NB exists to prevent — a break INSIDE
+    # one fact — and _NB cannot cover it, since _NB only protects spaces. It
+    # applies to the whole block rather than the expression lines alone because
+    # every other hyphen here is also a minus or a compound term: "[-7, 7]",
+    # "1e-5", "single-precision". None of them should ever be split.
     out = []
     for line in lines:
-        out.extend(textwrap.wrap(line, width, subsequent_indent="    ")
-                   or [""])
+        out.extend(textwrap.wrap(line, width, subsequent_indent="    ",
+                                 break_on_hyphens=False) or [""])
     return out
 
 

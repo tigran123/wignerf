@@ -486,3 +486,217 @@ describe('axisSizeOptions', () => {
     expect(axisSizeOptions(1, 128)).toEqual([128])
   })
 })
+
+/**
+ * The two expression IC kinds. Everything here is decidable without a DOM,
+ * which is the whole reason it lives in lib/ — vitest runs with `environment:
+ * node` and there is no component-test harness at all.
+ */
+const BASE_2D_GRID = {
+  ndim: 2,
+  axes: [{ lo: -8, hi: 8, N: 64 }, { lo: -8, hi: 8, N: 64 },
+         { lo: -7, hi: 7, N: 64 }, { lo: -7, hi: 7, N: 64 }],
+}
+
+describe('expression initial conditions', () => {
+  it('gives a fresh copy of both drafts, so the form cannot mutate the defaults', async () => {
+    const { m } = await load(undefined)
+    const a = m.defaultIC(2)
+    a.expr.wexpr = 'MUTATED'
+    expect(m.defaultIC(2).expr.wexpr).toBe(m.DEFAULT_IC_EXPR[2].wexpr)
+  })
+
+  it('loads an old stored config, which has no ic.expr at all', async () => {
+    const { m, cfg } = await load(BASE)
+    expect(cfg.ic.type).toBe('mixture')
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[1].wexpr)
+    expect(cfg.ic.expr.psi).toBe(m.DEFAULT_IC_EXPR[1].psi)
+  })
+
+  it('gives an old stored 2D config the 2D expressions, not the 1D ones', async () => {
+    // loadConfig builds defaultConfig() at ndim=1 ALWAYS and merges the stored
+    // grid over it, so without conformICExprToNdim every existing user's first
+    // 2D page load would sit on a W(x,p) in a four-variable world.
+    const { m, cfg } = await load({
+      ...BASE, grid: BASE_2D_GRID,
+      ic: { type: 'mixture',
+            components: [{ q0: [2, 0], k0: [0, 1], sigma_q: [0.7, 0.7],
+                           sigma_k: [0.7, 0.7], weight: 1, phase: 0 }] },
+    })
+    expect(cfg.grid.ndim).toBe(2)
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[2].wexpr)
+    expect(cfg.ic.expr.psi).toBe(m.DEFAULT_IC_EXPR[2].psi)
+  })
+
+  it('merges a type and an expr that arrive without components', async () => {
+    // `type` used to sit INSIDE the components guard, so this document merged
+    // as a mixture and its expression was dropped on the floor.
+    const { cfg } = await load({ ...BASE, ic: { type: 'psi', expr: { psi: 'exp(-x^2)' } } })
+    expect(cfg.ic.type).toBe('psi')
+    expect(cfg.ic.expr.psi).toBe('exp(-x^2)')
+  })
+
+  it('merges one draft without blanking the other', async () => {
+    const { m, cfg } = await load({ ...BASE, ic: { type: 'psi', expr: { psi: 'x' } } })
+    expect(cfg.ic.expr.psi).toBe('x')
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[1].wexpr)
+  })
+
+  it('falls back to mixture for an unknown stored type', async () => {
+    const { cfg } = await load({ ...BASE, ic: { ...BASE.ic, type: 'nonsense' } })
+    expect(cfg.ic.type).toBe('mixture')
+  })
+})
+
+describe('setNdim and the expression drafts', () => {
+  it('adopts the target ndim expressions when both are untouched', async () => {
+    const { m, cfg } = await load(undefined)
+    m.setNdim(cfg, 2)
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[2].wexpr)
+    expect(cfg.ic.expr.psi).toBe(m.DEFAULT_IC_EXPR[2].psi)
+    m.setNdim(cfg, 1)
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[1].wexpr)
+  })
+
+  it('carries a hand-written expression over instead', async () => {
+    const { m, cfg } = await load(undefined)
+    cfg.ic.expr.psi = 'exp(-x^2/2)*cos(3*x)'
+    m.setNdim(cfg, 2)
+    expect(cfg.ic.expr.psi).toBe('exp(-x^2/2)*cos(3*x)')
+  })
+
+  it('swaps the INACTIVE draft too', async () => {
+    // A 1D-only W(x,p) left behind an unselected tab in a 2D form is
+    // valid-looking and dead — the failure a "swap only the active one"
+    // shortcut produces.
+    const { m, cfg } = await load(undefined)
+    cfg.ic.type = 'psi'
+    cfg.ic.expr.psi = 'MINE'
+    m.setNdim(cfg, 2)
+    expect(cfg.ic.expr.psi).toBe('MINE')
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[2].wexpr)
+  })
+})
+
+describe('importing an expression setup document', () => {
+  it('imports one that has no components at all', async () => {
+    const { m, cfg } = await load(undefined)
+    m.importConfig(cfg, { config: { ...BASE, ic: { type: 'wexpr',
+                                                   expr: { wexpr: 'exp(-x^2-p^2)' } } } })
+    expect(cfg.ic.type).toBe('wexpr')
+    expect(cfg.ic.expr.wexpr).toBe('exp(-x^2-p^2)')
+    expect(cfg.ic.components.length).toBeGreaterThan(0)   // defaults stay usable
+  })
+
+  it('refuses an expression kind whose own expression is missing', async () => {
+    const { m, cfg } = await load(undefined)
+    expect(() => m.importConfig(cfg, { config: { ...BASE, ic: { type: 'psi' } } }))
+      .toThrow(/ic\.expr\.psi is missing/)
+  })
+
+  it('reshapes an expression IC components rather than refusing them', async () => {
+    // They are inert for this kind, so a dimensionality mismatch in them is no
+    // reason to reject an otherwise perfect document...
+    const { m, cfg } = await load(undefined)
+    m.importConfig(cfg, { config: {
+      ...BASE, grid: BASE_2D_GRID,
+      ic: { type: 'psi', expr: { psi: 'exp(-x^2-y^2)' },
+            components: [{ x0: 1, p0: 0, sigma_x: 0.5, sigma_p: 0.5 }] } } })
+    expect(cfg.ic.components[0]!.q0).toHaveLength(2)
+  })
+
+  it('...but still refuses a MIXTURE whose components are the wrong ndim', async () => {
+    const { m, cfg } = await load(undefined)
+    expect(() => m.importConfig(cfg, { config: {
+      ...BASE, grid: BASE_2D_GRID,
+      ic: { type: 'mixture',
+            components: [{ x0: 1, p0: 0, sigma_x: 0.5, sigma_p: 0.5 }] } } }))
+      .toThrow(/grid is 2D but the IC components are 1D/)
+  })
+
+  it('still refuses an unknown type', async () => {
+    const { m, cfg } = await load(undefined)
+    expect(() => m.importConfig(cfg, { config: { ...BASE, ic: { type: 'zzz' } } }))
+      .toThrow(/unknown IC type/)
+  })
+})
+
+describe('reset restores both expressions at the current dimensionality', () => {
+  it('resets a 2D setup to the 2D expressions', async () => {
+    const { m, cfg } = await load(undefined)
+    m.setNdim(cfg, 2)
+    cfg.ic.type = 'wexpr'
+    cfg.ic.expr.wexpr = 'junk'
+    cfg.ic.expr.psi = 'more junk'
+    m.resetToDefaults(cfg)
+    expect(cfg.ic.type).toBe('mixture')
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[2].wexpr)
+    expect(cfg.ic.expr.psi).toBe(m.DEFAULT_IC_EXPR[2].psi)
+  })
+})
+
+describe('an expression a document actually supplied is never repointed', () => {
+  /**
+   * conformICExprToNdim's "still at the OTHER ndim's default" is a proxy for
+   * "untouched", and it is a good one ONLY on an explicit dimensionality
+   * switch. Everywhere else it is wrong, because DEFAULT_IC_EXPR[1] is itself a
+   * legal 2D expression — its free symbols are a subset of {x, y} — so the test
+   * cannot tell "you never touched this" from "you typed exactly this".
+   */
+  it('a stored 2D config holding the 1D default psi keeps it across a reload',
+     async () => {
+    // read the constant before load()'s resetModules; the string is the same
+    const one = (await import('./icKinds')).DEFAULT_IC_EXPR[1].psi
+    const { m, cfg } = await load({
+      grid: { ndim: 2, axes: [{ lo: -8, hi: 8, N: 32 }, { lo: -8, hi: 8, N: 32 },
+                              { lo: -9, hi: 9, N: 32 }, { lo: -9, hi: 9, N: 32 }] },
+      potential: '(x^2+y^2)/2',
+      ic: { type: 'psi', components: [], expr: { psi: one, wexpr: 'exp(-x^2)' } },
+      variants: ['qn'], mode: 'interactive', record_dt: 0.05,
+    })
+    expect(cfg.grid.ndim).toBe(2)
+    expect(cfg.ic.expr.psi).toBe(one)          // NOT rewritten to the 2D default
+    expect(cfg.ic.expr.wexpr).toBe('exp(-x^2)')
+  })
+
+  it('an IMPORT keeps the expression it carried, in the bare-string spelling',
+     async () => {
+    // The bare string is the spelling a setup document and an mp4 comment tag
+    // use (icPayload sends one expression, not both), so it is the spelling an
+    // import actually takes — and it was the one with no test.
+    const { m, cfg } = await load(undefined)
+    const one = m.DEFAULT_IC_EXPR[1].psi
+    m.importConfig(cfg, { config: {
+      grid: { ndim: 2, axes: [{ lo: -8, hi: 8, N: 32 }, { lo: -8, hi: 8, N: 32 },
+                              { lo: -9, hi: 9, N: 32 }, { lo: -9, hi: 9, N: 32 }] },
+      potential: '(x^2+y^2)/2',
+      ic: { type: 'psi', expr: one },
+      variants: ['qn'], mode: 'interactive', record_dt: 0.05 } })
+    expect(cfg.ic.type).toBe('psi')
+    expect(cfg.ic.expr.psi).toBe(one)
+  })
+
+  it('...but a draft the document did NOT carry is still repointed', async () => {
+    // The convenience the rule exists for survives: a document with no expr at
+    // all (everything before this feature) must not leave a 2D form holding a
+    // W(x,p) behind a tab the user has not opened.
+    const { m, cfg } = await load(undefined)
+    m.importConfig(cfg, { config: {
+      grid: { ndim: 2, axes: [{ lo: -8, hi: 8, N: 32 }, { lo: -8, hi: 8, N: 32 },
+                              { lo: -9, hi: 9, N: 32 }, { lo: -9, hi: 9, N: 32 }] },
+      potential: '(x^2+y^2)/2',
+      ic: { type: 'mixture', components: [
+        { q0: [1, 0], k0: [0, 0], sigma_q: [0.5, 0.5], sigma_k: [0.5, 0.5] }] },
+      variants: ['qn'], mode: 'interactive', record_dt: 0.05 } })
+    expect(cfg.ic.expr.psi).toBe(m.DEFAULT_IC_EXPR[2].psi)
+    expect(cfg.ic.expr.wexpr).toBe(m.DEFAULT_IC_EXPR[2].wexpr)
+  })
+
+  it('an explicit setNdim still repoints an untouched default', async () => {
+    // The one place the proxy IS right: the user just asked for the switch.
+    const { m, cfg } = await load(undefined)
+    expect(cfg.ic.expr.psi).toBe(m.DEFAULT_IC_EXPR[1].psi)
+    m.setNdim(cfg, 2)
+    expect(cfg.ic.expr.psi).toBe(m.DEFAULT_IC_EXPR[2].psi)
+  })
+})

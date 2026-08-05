@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 import config
 from core import describe
+from core import initial
 from core import fit
 from core import session as sessions
 from core.potential import PotentialError, compile_potential
@@ -150,9 +151,28 @@ async def create_session(cfg: SessionCreate, request: Request):
     if cfg.ic.type == "mixture" and any(c.sigma_k is None
                                         for c in cfg.ic.components):
         raise HTTPException(422, "sigma_k is required for mixture components")
+    # The grid rail FIRST, before anything is compiled or probed — the order
+    # /preview/wigner already uses. Same body, same two problems, same answer:
+    # a grid over the ceiling is refused for its grid whichever endpoint it
+    # reaches, which is the property grid_limit_error's docstring is about. It
+    # also keeps a sympy parse and a 33⁴ finiteness probe off a request that was
+    # never going to start a session.
     bad = grid_limit_error(cfg.grid, len(cfg.variants), cfg.precision)
     if bad:
         raise HTTPException(422, bad)
+    # THE IC IS COMPILED HERE, beside compile_for's compilation of U, and for
+    # two reasons. A bad expression must be a 422 at the door: the IC is
+    # otherwise built inside each SolverWorker, so it would instead kill four
+    # worker threads after the session had been created and answered for. And
+    # the result is threaded through to the session, so those four workers share
+    # one sympy parse rather than racing to repeat it.
+    try:
+        compiled_ic = initial.compile_ic(cfg.ic, cfg.hbar_eff, cfg.grid.ndim,
+                                         ranges=initial.probe_ranges(
+                                             cfg.ic.type, cfg.grid,
+                                             cfg.hbar_eff))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     nd = cfg.grid.ndim
     # the ceilings this session must report and (for auto-expand) plan against
     cap, cells = config.max_grid(nd), config.max_cells(nd)
@@ -197,7 +217,8 @@ async def create_session(cfg: SessionCreate, request: Request):
         cfg, cp, device=device,
         fft_threads=_fft_threads(len(cfg.variants)),
         history_bytes=history_mb*1024*1024,
-        max_grid=cap, history_mb_max=config.HISTORY_MB, max_cells=cells)
+        max_grid=cap, history_mb_max=config.HISTORY_MB, max_cells=cells,
+        compiled_ic=compiled_ic)
     # Prefix the WS path with the app's root_path so it inherits the nginx
     # prefix (uvicorn --root-path /wignerf, from APP_ROOT_PATH). Empty in dev.
     root_path = request.scope.get("root_path", "").rstrip("/")

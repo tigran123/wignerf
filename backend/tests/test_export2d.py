@@ -365,8 +365,8 @@ def test_2d_titles_match_the_ui():
     axis names as real subscripts, which is the ONLY difference."""
     assert ax.marginal_title(2, 0) == "ρ(x) = ∫W dy dpx dpy"
     assert ax.marginal_title(2, 1) == "ρ(y) = ∫W dx dpx dpy"
-    assert ax.marginal_title(2, 2) == "φ(px) = ∫W dx dy dpy"
-    assert ax.marginal_title(2, 3) == "φ(py) = ∫W dx dy dpx"
+    assert ax.marginal_title(2, 2) == "ρ(px) = ∫W dx dy dpy"
+    assert ax.marginal_title(2, 3) == "ρ(py) = ∫W dx dy dpx"
     assert ax.uncertainty_title(2, 0) == "ΔX·ΔPx(t)"
     assert ax.uncertainty_title(2, 1) == "ΔY·ΔPy(t)"
     assert ax.purity_title(2) == "purity γ(t) = (2πℏ)²⨌W²dxdydpxdpy"
@@ -397,7 +397,7 @@ def test_2d_titles_match_the_ui():
 def test_subscripts_are_mathtext_and_only_on_the_axis_names():
     """Real subscripts, measured free (they live in STATIC artists, so the
     per-frame blit never touches them). Everything else — the integrals, γ, ℏ,
-    ρ, φ — stays the same Unicode the screen uses, so the two cannot drift."""
+    ρ, γ — stays the same Unicode the screen uses, so the two cannot drift."""
     assert ax.sub_math("px") == "$p_x$"
     assert ax.sub_math("x") == "x"          # one letter: no math mode at all
     assert ax.sub_math("p") == "p"
@@ -440,7 +440,7 @@ def test_the_metadata_block_says_what_the_frame_shows():
     lone, _r = meta_columns(cfg, _geom(), st, ["qn"], 0, 2, 3, 30)
     assert "6 planes × 1 variant = 6" in " ".join(" ".join(lone).split())
     assert "plots omitted:" in text
-    for lbl in ("ρ(x)", "ρ(y)", "φ($p_x$)", "φ($p_y$)", "ΔX·Δ$P_x$",
+    for lbl in ("ρ(x)", "ρ(y)", "ρ($p_x$)", "ρ($p_y$)", "ΔX·Δ$P_x$",
                 "⟨$L_z$⟩"):
         assert lbl in text
     assert "grid at record 0: 16×16×16×16" in text

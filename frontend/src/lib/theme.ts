@@ -77,6 +77,15 @@ watch(theme, (v) => {
  *  not settable afterwards, which is why the charts destroy+rebuild on a
  *  theme change, exactly as they already do for the grid-lines toggle). */
 export interface ChartPalette {
+  /** Re/Im of the IC editor's wavefunction charts — see style.css for why they
+   *  are separate hues rather than one hue with two dash patterns. No
+   *  render_mpl counterpart: the mp4 never draws these. */
+  waveRe: string
+  waveIm: string
+  /** |psi|^2 — its OWN role, not `cursor`. Sharing the time-cursor's colour
+   *  meant a future adjustment to that cursor silently repainted a data trace
+   *  in two charts it has nothing to do with. */
+  waveAbs: string
   axis: string
   tick: string
   grid: string
@@ -87,9 +96,11 @@ export interface ChartPalette {
 
 const FALLBACK: Record<ThemeName, ChartPalette> = {
   light: { axis: '#525252', tick: '#a3a3a3', grid: '#d4d4d8',
-           gridSoft: '#f4f4f5', text: '#404040', cursor: '#db2777' },
+           gridSoft: '#f4f4f5', text: '#404040', cursor: '#db2777',
+           waveRe: '#0f766e', waveIm: '#7c3aed', waveAbs: '#db2777' },
   dark: { axis: '#a3a3a3', tick: '#525252', grid: '#3f3f46',
-          gridSoft: '#26262666', text: '#d4d4d4', cursor: '#f472b6' },
+          gridSoft: '#26262666', text: '#d4d4d4', cursor: '#f472b6',
+          waveRe: '#2dd4bf', waveIm: '#a78bfa', waveAbs: '#f472b6' },
 }
 
 const cache = new Map<ThemeName, ChartPalette>()
@@ -113,6 +124,9 @@ export function chartPalette(): ChartPalette {
     const v = (name: string, dflt: string) =>
       cs.getPropertyValue(name).trim() || dflt
     p = {
+      waveRe: v('--wf-wave-re', fb.waveRe),
+      waveIm: v('--wf-wave-im', fb.waveIm),
+      waveAbs: v('--wf-wave-abs', fb.waveAbs),
       axis: v('--wf-chart-axis', fb.axis),
       tick: v('--wf-chart-tick', fb.tick),
       grid: v('--wf-chart-grid', fb.grid),

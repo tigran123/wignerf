@@ -326,8 +326,72 @@ class ICComponent(BaseModel):
 
 
 class ICSpec(BaseModel):
-    type: Literal["mixture", "cat"]
-    components: list[ICComponent] = Field(min_length=1, max_length=8)
+    """Four kinds, two shapes. `mixture`/`cat` are parameterized by Gaussian
+    components; `wexpr`/`psi` are one analytic expression each (see
+    core/initial.compile_ic).
+
+    FLAT, not a discriminated union, and deliberately so: routers/preview.py's
+    `class WignerPreviewIn(ICSpec)` is plain subclass inheritance, which a union
+    cannot be. `components` therefore loses its min_length and the validator
+    below carries the requirement instead — with a sentence a person can read,
+    because lib/apierror.apiErrorText renders it and pydantic's own
+    "List should have at least 1 item" is the blob that motivated that helper.
+
+    An OLD setup document supplies `components` and omits `expr`, so it still
+    validates untouched — which describe.setup_document's round-trip test pins.
+    """
+    type: Literal["mixture", "cat", "wexpr", "psi"]
+    components: list[ICComponent] = Field(default_factory=list, max_length=8)
+    # A schema rail only, in the spirit of `device: max_length=200`. The real
+    # 500-character refusal lives in expr.screen_tokens, which measures BEFORE
+    # tokenizing, and says so in words.
+    expr: Optional[str] = Field(default=None, max_length=4096)
+
+    @model_validator(mode="after")
+    def _check(self):
+        """Require the kind's OWN shape, and NORMALIZE AWAY the other one's.
+
+        **CARRYING BOTH SHAPES IS LEGAL AND MUST STAY LEGAL.** The editor holds a
+        default for every tab at once — that is the whole reason switching tabs
+        is non-destructive — so a form on the `wexpr` tab genuinely has Gaussian
+        components sitting behind it, a stored browser config has both, and so
+        does every setup document and mp4 comment tag written before the field
+        existed. REFUSING the foreign field made all of those a 422: measured on
+        a cold start with cleared local data, selecting the W(x,p) or ψ(x) tab
+        answered *"an IC of type 'wexpr' is one expression and carries no
+        Gaussian components (got 1)"* — a schema telling a client its own
+        defaults are invalid. A rule that only holds once every client has been
+        rewritten is not a schema rule.
+
+        So the foreign field is DROPPED here instead, which fixes the three
+        things the refusal was aimed at without breaking anyone:
+        `SessionCreate._check`'s per-component ndim loop no longer sees stale
+        components on a `psi` (it used to refuse one with "the grid is 1D but 1
+        initial-condition component(s) carry 2 coordinate(s) each", a sentence
+        about components it does not use); `describe.setup_document` cannot
+        publish a dead `expr` as part of a run it had no part in, because by the
+        time anything downstream sees this model the field is gone; and `expr` on
+        a Gaussian kind cannot smuggle 4096 unscreened characters into an
+        exported artefact, for the same reason. Normalizing at the door beats
+        checking at each use — there is exactly one place to get it right, and
+        `WignerPreviewIn` inherits it.
+
+        `lib/config.icPayload` sends only the active kind's shape as well. That
+        is belt and braces, and this is the belt: the server must not depend on
+        any client having been updated.
+        """
+        if self.type in ("wexpr", "psi"):
+            if not (self.expr or "").strip():
+                raise ValueError(
+                    "an IC of type %r needs an 'expr' expression" % self.type)
+            self.components = []
+        else:
+            if not self.components:
+                raise ValueError(
+                    "an IC of type %r needs at least one Gaussian component"
+                    % self.type)
+            self.expr = None
+        return self
 
 
 # adjust_step shrinks |dt| until one full step and two half steps agree to a
@@ -472,6 +536,10 @@ class SessionCreate(BaseModel):
         if self.precision == "float32" and self.auto_expand:
             raise ValueError(MSG_EXPAND_F32)
         nd = self.grid.ndim
+        # Empty for an expression IC, which is correct rather than an oversight:
+        # its dimensionality is decided by which free symbols the expression may
+        # use, and that check lives where sympy does (initial.compile_ic), not
+        # in the schema module.
         bad = [c for c in self.ic.components if c.ndim != nd]
         if bad:
             raise ValueError("the grid is %dD but %d initial-condition "

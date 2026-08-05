@@ -66,6 +66,18 @@ export function isMomentum(ndim: number, axis: number): boolean {
   return axis >= ndim
 }
 
+/**
+ * The Fourier-conjugate partner of an axis: q_i <-> k_i, index-matched.
+ *
+ * Mirrors core/axes.conjugate, which states the pairing once for the whole
+ * program. It is here because the wavefunction preview is the first frontend
+ * code that needs "the momentum axis dual to spatial axis i" — and a wrong
+ * pairing is the classic multi-D error precisely because nothing complains.
+ */
+export function conjugate(ndim: number, axis: number): number {
+  return axis >= ndim ? axis - ndim : axis + ndim
+}
+
 /** The axes a plane is reduced OVER — empty at ndim=1. */
 export function complement(ndim: number, plane: readonly [number, number]): number[] {
   const out: number[] = []
@@ -98,9 +110,15 @@ export function planeTitle(ndim: number, plane: readonly [number, number],
   return `${over.length === 2 ? '∬' : '∫'}W ${measure(ndim, over, html)}`
 }
 
-/** rho(x) = int W dp   /   phi(py) = int W dx dy dpx */
+/**
+ * rho(x) = int W dp   /   rho(py) = int W dx dy dpx
+ *
+ * EVERY marginal is rho, momentum ones included — see core/axes.marginal_title
+ * for why: phi now belongs to the psi tab's wavefunction chart, which is a
+ * probability AMPLITUDE where this is a DENSITY.
+ */
 export function marginalTitle(ndim: number, axis: number, html = false): string {
-  const sym = isMomentum(ndim, axis) ? 'φ' : 'ρ'
+  const sym = 'ρ'
   const over: number[] = []
   for (let a = 0; a < 2 * ndim; a++) if (a !== axis) over.push(a)
   const name = html ? labelHtml(ndim, axis) : label(ndim, axis)

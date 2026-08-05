@@ -21,11 +21,13 @@ import Timeline from '../components/Timeline.vue'
 import { useSession } from '../composables/useSession'
 import { applyPrecisionInvariants, geomOf,
          loadConfig, precisionForPayload, precisionIsUserChosen, saveConfig,
-         setHostPrecision, type GeomCfg } from '../lib/config'
+         setHostPrecision, icPayload, type GeomCfg } from '../lib/config'
 import { labels as axisLabels } from '../lib/axes'
 import { apiErrorText } from '../lib/apierror'
 import { displayInterval } from '../lib/perf'
 import { transportAction } from '../lib/transport'
+import { sticky } from '../lib/sticky'
+import { edgeBand } from '../lib/cells'
 import { theme, toggleTheme } from '../lib/theme'
 import { ALL_VARIANTS, VARIANT_META, variantColor, type VariantKey } from '../lib/variants'
 
@@ -107,6 +109,14 @@ function payload() {
   // costs nothing when the fix-up has already run.
   applyPrecisionInvariants(cfg)
   const p: Record<string, unknown> = JSON.parse(JSON.stringify(cfg))
+  // The form keeps BOTH expression drafts and the Gaussian components at once;
+  // a session spec describes ONE run and so carries one kind's shape (see
+  // icPayload). Deep-copied like everything else above it: icPayload returns
+  // `cfg.ic.components` itself, which is the live reactive Proxy, and putting
+  // that back into `p` would undo the snapshot the line above exists to take —
+  // axios serializes in a microtask, so an edit landing in between would be
+  // picked up by a request that had already been described as sent.
+  p.ic = JSON.parse(JSON.stringify(icPayload(cfg.ic)))
   if (cfg.mode === 'interactive') delete p.t2
   // '' / 0 are the form's way of saying "whatever the host is configured for";
   // the API wants the field absent, not an empty string or a zero it would
@@ -315,7 +325,29 @@ watch(() => [cfg.mode, cfg.t2, cfg.record_dt, cfg.precision],
  */
 const sessionNdim = computed(() =>
   session.status.value?.ndim ?? cfg.grid.ndim)
-const wOf = computed(() => `W(${axisLabels(sessionNdim.value).join(',')},t)`)
+/**
+ * `W(x,p,t)` — or `W(x,p,0)` while the only state that exists IS the initial
+ * condition.
+ *
+ * THE TIME ARGUMENT IS WHAT DISTINGUISHES THE TWO FACTS, and it is the whole
+ * reason this warning is now said once, in one place. The edge detector runs on
+ * the IC preview and on the live record; at record 0 those are the SAME state,
+ * so the fact was genuinely duplicated — and it used to be reported twice, in
+ * two different sentences ("W(x,p,t) has reached…" in the header, "this IC
+ * reaches…" under the preview), in two places, appearing at different times,
+ * carrying the identical number. Differencing the axis sets hid the duplicate
+ * but made the surviving copy flicker in and out during a run, which is worse:
+ * the reader cannot tell whether a fact that comes and goes is one fact or two.
+ *
+ * So: one sentence, one place, and the argument says which state it is about.
+ */
+const wOf = computed(() =>
+  `W(${axisLabels(sessionNdim.value).join(',')},${atRecordZero.value ? '0' : 't'})`)
+
+/** Nothing has been computed beyond the Cauchy data, so the state being
+ *  reported on IS the initial condition. */
+const atRecordZero = computed(() =>
+  (session.status.value?.record_extent?.[1] ?? -1) <= 0)
 
 /**
  * The largest edge-band reading among the tripped axes. Naming the NUMBER
@@ -331,7 +363,31 @@ const boundaryWorst = computed(() => {
   return vals.length ? Math.max(...vals) : null
 })
 
-const boundaryText = computed(() => {
+/**
+ * Axes the FORM's initial condition trips, straight from the IC preview.
+ *
+ * It reaches the header rather than being drawn under the preview because it is
+ * the SAME fact the boundary watch reports, from the same detector — see wOf.
+ * It is used only while the form differs from the running session: when they
+ * agree, the session has already computed record 0 from this very IC and its own
+ * reading is the authoritative one. That condition is `restartNeeded`, which
+ * does not flicker, so neither does the choice between the two sources.
+ */
+const icEdge = ref<{ axis: string; mass: number }[]>([])
+
+const icEdgeText = computed(() => {
+  if (!restartNeeded.value || !icEdge.value.length) return ''
+  const worst = icEdge.value.reduce((a, b) => (b.mass > a.mass ? b : a))
+  const i = axisLabels(cfg.grid.ndim).indexOf(worst.axis)
+  const cells = i >= 0 && cfg.grid.axes[i] ? edgeBand(cfg.grid.axes[i]!.N) : 0
+  return `W(${axisLabels(cfg.grid.ndim).join(',')},0) reaches the `
+    + `${icEdge.value.map((e) => e.axis).join(', ')} edge — `
+    + `${worst.mass.toExponential(1)} of its integral is in the outer `
+    + `${cells} cells. This is the IC in the form, not the running session — `
+    + `restart to compute it.`
+})
+
+const boundaryRaw = computed(() => {
   const b = session.boundary.value
   if (!b) return ''
   const axes = b.axes.join(', ')
@@ -382,6 +438,50 @@ const boundaryBand = computed(() => {
 })
 
 /** The explanation the message no longer carries, on hover. */
+// Held for MIN_DWELL_MS after the condition clears. The boundary watch flips
+// its axis set every record or two when a packet sloshes through the edge band,
+// so the raw computed appeared and vanished faster than its sentence could be
+// read — see lib/sticky. Display only: boundaryRaw stays instantaneous.
+// ONE TIMER PER SOURCE, combined afterwards — never sticky() over the join.
+//
+// These two are independent: `boundaryRaw` comes from the live boundary watch
+// and flips every record or two while a packet crosses the edge band, and
+// `icEdgeText` is a steady property of the form. Wrapping `a || b` in one
+// sticky makes the dwell conditional on the OTHER line being empty: with an
+// edited IC that also trips an edge, every clear of `boundaryRaw` leaves a
+// non-empty value, which sticky correctly reads as a REPLACEMENT and applies at
+// once — so two different sentences alternated at record rate with no dwell at
+// all, the precise flicker sticky was added to stop. It also made the × look
+// inert, since nulling session.boundary substituted the other sentence in the
+// same flush. A dwell that only works when the message is alone is not a dwell.
+const boundaryHeld = sticky(() => boundaryRaw.value)
+const icEdgeHeld = sticky(() => icEdgeText.value)
+const boundaryText = computed(() => boundaryHeld.value || icEdgeHeld.value)
+
+/**
+ * Dismissal is BY TEXT, and both halves of that matter.
+ *
+ * Clearing `session.boundary` alone — which is all the × used to do — cannot
+ * dismiss this any more, twice over: the sentence may come from `icEdgeText` or
+ * from the session's standing `status.boundary`, neither of which that touches,
+ * and even for the transient event `sticky` goes on displaying the last value
+ * for its dwell. The button looked inert because it was.
+ *
+ * Keyed on the text rather than a boolean so that dismissing one warning never
+ * hides the NEXT, different one — the same rule the IC editor's strip follows.
+ * The transient event is still cleared, because leaving it set would keep the
+ * identical sentence alive and make the dismissal look like it did nothing the
+ * moment anything else re-rendered.
+ */
+const boundaryDismissed = ref('')
+const boundaryShown = computed(() =>
+  !!boundaryText.value && boundaryText.value !== boundaryDismissed.value)
+
+function dismissBoundary() {
+  boundaryDismissed.value = boundaryText.value
+  session.boundary.value = null
+}
+
 const boundaryTitle = computed(() => {
   const b = session.boundary.value
   if (!b) return ''
@@ -906,7 +1006,7 @@ onBeforeUnmount(() => {
            Full width, so no message has to be truncated to fit a header row.
            The float32 badge stays inline on purpose: it is a permanent property
            of the session, set before there is anything to watch. -->
-      <div v-if="restartNeeded || boundaryText || paramFlash || regridFlash"
+      <div v-if="restartNeeded || boundaryShown || paramFlash || regridFlash"
            class="absolute left-0 right-0 top-full z-30 flex items-center
                   gap-4 flex-wrap px-3 py-1 text-xs
                   bg-panel/95 border-b border-line-soft shadow-sm">
@@ -914,10 +1014,10 @@ onBeforeUnmount(() => {
           setup changed —
           <button class="underline" @click="requestRestart">restart</button> to apply
         </span>
-        <span v-if="boundaryText" class="text-warn" :title="boundaryTitle">
+        <span v-if="boundaryShown" class="text-warn" :title="boundaryTitle">
           ⚠ {{ boundaryText }}
-          <button class="underline" title="dismiss (reappears if the boundary state changes)"
-                  @click="session.boundary.value = null">×</button>
+          <button class="underline" title="dismiss (reappears if the warning changes)"
+                  @click="dismissBoundary()">×</button>
         </span>
         <span v-if="paramFlash" class="text-ok">✓ {{ paramFlash }}</span>
         <span v-if="regridFlash" class="text-info">⤢ {{ regridFlash }}</span>
@@ -948,8 +1048,7 @@ onBeforeUnmount(() => {
         <ICEditor :ic="cfg.ic" :grid="cfg.grid" :hbar-eff="cfg.hbar_eff"
                   :precision="cfg.precision" :quiet="!!createError"
                   :show-grid="showGrid" :show-cells="showCells"
-                  :live-edge-axes="session.boundary.value?.axes
-                                   ?? session.status.value?.boundary?.axes ?? null"
+                  @edge="(f) => { icEdge = f }"
                   @changed="restartNeeded = true"
                   @validity="(v: boolean) => icValid = v" />
       </aside>
@@ -997,8 +1096,7 @@ onBeforeUnmount(() => {
           <ICEditor :ic="cfg.ic" :grid="cfg.grid" :hbar-eff="cfg.hbar_eff"
                     :precision="cfg.precision" :quiet="!!createError"
                     :show-grid="showGrid" :show-cells="showCells"
-                  :live-edge-axes="session.boundary.value?.axes
-                                   ?? session.status.value?.boundary?.axes ?? null"
+                  @edge="(f) => { icEdge = f }"
                   @changed="restartNeeded = true"
                     @validity="(v: boolean) => icValid = v" />
         </div>

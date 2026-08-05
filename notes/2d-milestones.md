@@ -505,3 +505,230 @@ convergence against a fine reference (**ratio 4.51**), and a direction-flip
 round trip (**1.31e-6**, against ~1e-9 for the fixed-dt propagator equivalent,
 because the flip forces an adjust and the reverse pass is not the forward one
 played backwards).
+
+
+## The M7 (one exponent slot) gotcha, as it stood before the 2026-08-05 split
+
+- **ONE exponent slot, because every committed substep inside a record is the
+  same size (M7, 2026-08-02) — and the CACHED PLAN is what makes that true.**
+  `worker._advance` used to walk a record at the full `dt` and clamp the last
+  substep onto τ_k; that straggler was a different dt, so it needed a second
+  slot (`_exp_odd`) beside `_exp_main`, 4 complex meshes = 64 B/cell, the
+  largest single item in the 4D working set. `_substep` now divides what is
+  left of the record into `n = ceil(|rem|/|dt|)` EQUAL steps of `rem/n`. `ceil`
+  rounds UP after a one-ulp quotient correction, so the step never materially
+  exceeds `dt` and the schedule is never less accurate than the one it replaced.
+  (The 8-entry dict THAT replaced kept seven dead pairs alive — 1781 → 904 MiB
+  at 4 workers, 1024² — because dt is re-tuned every 20 steps so old entries
+  were never asked for again.)
+  **Adaptive retuning is a NON-COMMITTING boundary probe.** `adjust_step`
+  selects the cap before a record, but its trial state is dropped; the whole
+  record then runs on `_substep`'s quotient. A cadence reached mid-record is
+  latched and probed at the next target, rather than splitting the record into
+  two production sizes.
+  **`_substep` caches its plan against `t_tgt`, and that is not an
+  optimization — without it the milestone backfires.** `rem` shrinks as the
+  record is walked, so recomputing `rem/n` at every substep returns sizes that
+  differ in the last ulps: nominally identical, but DISTINCT float keys, so the
+  one slot misses on nearly every step. Measured without the cache: **5 distinct
+  sizes across 12 substeps and 22 rebuilds over three records**, against the
+  two-slot scheme's one cached production pair per record. A stale plan is as
+  wrong as a stale exponent, so `_exp_clear` drops both together — every site
+  that invalidates one must invalidate the other.
+  **And because the size is cached, `_advance` iterates on the substep COUNT and
+  must never go back to summing toward τ_k.** The pre-M7 loop could exit on
+  `|τ_k − t| > eps` because its last step was clamped to `min(|dt|, |rem|)` and
+  therefore self-correcting; a cached size has no such step. Once n accumulations
+  of `rem/n` land further than `eps = 1e-12·max(1, |τ_k|)` from the target — n
+  ~ 25000 at t ~ 5, which two maximal `adjust_step` contractions reach — the loop
+  takes ANOTHER full substep, marches PAST τ_k and never returns, since dts keeps
+  its sign. Measured on the residual loop at dt = record_dt/50000 from t = 5:
+  **11.5 million substeps for a record wanting 50000**, still going when a
+  watchdog stopped it — an unkillable spin with no error and no emitted record,
+  where the old scheme was merely slow. Pinned by
+  `test_a_record_that_needs_many_substeps_still_terminates`.
+  **The production rebuild COUNT is at most one per record**, because
+  τ_k − τ_(k−1) normally changes the quotient's float key. The controller's
+  temporary probe pairs are separate and dropped before that production pair is
+  built. So M7 buys MEMORY, not speed; do not let the halved slot count imply a
+  halved rebuild rate. Measured 208 → 176 B/cell in 2D and 224 → 192 in 1D
+  (float32 112 → 96, 120 → 104) — a flat −32 B/cell at both dimensionalities,
+  −15.4% and −14.3%. The row that promised −22% predated M1's measurement of the
+  208 it was a fraction OF.
+  **`adjust_step`'s returned state and pair are DROPPED, not stored.** It
+  selects the cap from a trial state; no trial becomes a production substep, so
+  the cached pair always belongs to `_substep`'s quotient. Storing the pair, as
+  the old code did for free, would be the second slot resurrected once per
+  adjust.
+  **What the physics suite cannot see**: `test_propagator*.py` and
+  `test_precision.py` drive `Propagator` directly through a private fixed-dt
+  `evolve()` helper, so they never enter `_advance` — all 72 items were bitwise
+  unchanged by M7 and would be just as unchanged by a scheduler that never
+  landed on τ_k. `tests/test_substep.py` exists for that gap: one size per
+  record, the step within one ulp of `dt`, one cached production pair per
+  record, boundary-only probes, both time directions, and O(dt²) convergence
+  (measured ratio 4.51). It caught the missing plan cache.
+
+
+## The M1 (float32 in 2D) gotcha, as it stood before the 2026-08-05 split
+
+- **FLOAT32 IN 2D (M1): choose it for MEMORY, not for speed, and know that it
+  raises the boundary warning on a contained state at 32⁴.** The mixed scheme
+  (float64 meshes and `qd()` evaluations, complex64 only for the spectral array
+  and the exponent phases — see the float64/float32 gotcha) has no
+  dimension-aware line in it and holds BITWISE at 4 axes, which had to be checked
+  because the multi-D Bopp shift moves every spatial argument of U together;
+  pinned by `test_exponent_construction_stays_double`, parametrized over ndim.
+  **MEMORY: 96 B/cell against float64's 176** — 55%, flat across 32⁴–80⁴,
+  identical for the relativistic variants, and better than the ~58% predicted
+  from 1D. 2.75 → 1.50 GiB/worker at 64⁴, and 80⁴ becomes reachable at all.
+  (Those are post-M7 figures; M1 measured 3.25 → 1.75 at 208/112 B/cell.)
+  **SPEED: 1.48× at 64⁴, not the ~3.4× predicted** (2.63× at 32⁴, 2.09 at 48⁴,
+  1.64 at 80⁴) — and not the machine, since the 1D control on the same card in
+  the same session gave 3.29× at the SAME 16.8M cell count. The 2D step
+  transforms two axes of a 4D array at a time where 1D transforms one axis of a
+  2D array, and cuFFT's single-precision advantage for that strided layout is far
+  smaller. Do not quote the 1D figure for 2D. **`TOL_MIN_F32` did NOT move**: the
+  `adjust_step` residual floor SATURATES rather than growing with cells (2D
+  2.0–2.5e-6 flat from 32⁴ to 64⁴, 4× margin against 1e-5).
+  **At 32⁴ it puts REAL mass in the edge band and latches the boundary warning
+  within ~7 s** — 1.0e-3 of the integral after 12000 steps on the shipping 2D
+  default, a fully contained state, against **3.1e-5 for the IDENTICAL state in
+  float64**; 48⁴ stays clear and 64⁴ flickers, so it is the COARSE grid that
+  cannot carry single precision, not 2D as such. **No threshold was moved for
+  this**, deliberately: the mass is genuinely there, it GROWS with step count so
+  any fixed threshold is outrun by a long enough run, and one high enough to be
+  safe would sit past the point where real wrap does damage. What changed is the
+  WORDS — `SimulatorView.boundaryTitle` names single precision as a cause in a
+  float32 2D session, because the standing remedy ("restart with a larger
+  domain") is the one thing that cannot help here. Pinned by
+  `test_float32_in_2d_moves_real_mass_to_the_edge_band`; full numbers in
+  `notes/2d-milestones.md`.
+
+
+## The M3 (auto-expand in 2D) gotcha, as it stood before the 2026-08-05 split
+
+- **AUTO-EXPAND IN 2D (M3): the orchestration was free and the GUARD is the
+  whole feature.** `core/fit.py` is the create-time check asked again mid-run,
+  SHARED with `routers/sessions._fit_error` so the two cannot drift (each writes
+  its own message: at create time the advice is "drop a variant, change device"
+  and mid-run none of that is available). Five things that must not be undone —
+  **read `notes/2d-milestones.md` before editing `fit.py`,
+  `worker._apply_regrid` or `Propagator.set_grid`**, which has the measurements:
+  the per-device inequality is `n·per_new·REGRID_PEAK ≤ (F + n·per_old)·
+  FIT_MARGIN`, and **the `+ n·per_old` term is load-bearing, not a refinement**
+  (it is what correctly allows a single-worker 64⁴ doubling on the 2080 Ti —
+  5.50 GiB of new footprint against ~6.4 free on a card that is ALREADY holding
+  the 2.75 GiB worker wanting to grow, which `F` alone refuses: 6.05 needed
+  against 5.81, and 8.28 once its own worker is counted. The figures moved with
+  M7 and the shape did not; recompute them, do not carry them);
+  **it is asked of a DOUBLING and of nothing else** — for a pure window shift
+  `per_new == per_old` and the same expression demands `0.222·n·per_old` free to
+  slide a window that allocates nothing, so `fit.regrid_shortfall` returns `[]`
+  for any non-growing window BEFORE it reads the driver (pinned by
+  `test_a_pure_move_is_never_refused_for_memory` and
+  `test_a_window_slides_even_when_the_device_is_full`), and the reading is taken
+  ONCE per attempt because a re-read between candidates could accept a plan
+  neither reading allows;
+  **release before allocate** in `worker._apply_regrid` (exponent slots first,
+  then the state through a one-element box so `_run`'s local does not pin it,
+  then `set_grid` dropping meshes, FFT plans and this thread's cuFFT plan cache
+  and freeing the pool before rebuilding) — this is what makes `REGRID_PEAK` =
+  1.10 honest, and it is ALLOCATION ORDER ONLY, so ndim=1 stays bitwise
+  unaffected;
+  **what the guard cannot see is ACCEPTED** — another process, a sibling session
+  whose committed plan has not landed, and the bigger unguarded transients
+  elsewhere; `FIT_MARGIN` does not cover them and must not be read as if it did.
+  What makes that acceptable is the failure mode: a lost race is a cupy OOM
+  inside `_apply_regrid`, fatal by design, so the session pauses LOUDLY with a
+  traceback (pinned by
+  `test_a_failed_regrid_stops_the_run_instead_of_going_quiet` — the day that goes
+  silent the limitation stops being acceptable). Both the refusal and the accept
+  path log the reading and the ask, which is what makes such an OOM diagnosable;
+  and **`no_room` is its own boundary ACTION with a `limit` FIELD**, not a
+  flavour of `capped`. `capped` = the per-axis `WIGNERF_MAX_GRID` ceiling,
+  `no_room` = the guard made us give a doubling up, and their remedies are
+  opposite (a smaller grid vs a bigger card or fewer variants). It carries
+  `denied` and `applied`, because a denied doubling can still leave a shift to
+  commit and one sentence for both reads as a self-contradiction beside the ⤢
+  flash. `limit` ∈ {`device`, `cells`} because `_afford_regrid`'s two guards have
+  nothing in common — against the `WIGNERF_MAX_CELLS_2D` rail, freeing the card
+  does nothing and neither does float32 (a cell count is precision-independent),
+  and a rail denial once told the user to free a card with 100+ GiB spare
+  (`test_a_cell_rail_denial_does_not_blame_the_card`). It is a MESSAGE latch,
+  like `_capped_posted`, and NOT a scheduling gate like `_invalid_posted`: as a
+  gate, one refusal switched auto-expand off for the rest of the run — the
+  tripped axes that reset it never clear on their own — including the pure shifts
+  that were never the problem (`test_a_denial_does_not_disable_auto_expand_for_
+  the_rest_of_the_run`). A plan that commits with nothing denied clears it, so a
+  LATER denial is announced rather than swallowed. Do not re-propose gating
+  `SUPPORT_EPS` on the 2D noise floor: measured and refuted, the planner scanning
+  only TRIPPED axes.
+
+
+## The M2 (relativistic 2D) gotcha, as it stood before the 2026-08-05 split
+
+- **RELATIVISTIC 2D (`qr`/`cr`, M2)**: the physics core was already generic —
+  `_kinetic()` builds T = c√(Σkᵢ² + m²c²) and its gradient at any ndim, and the
+  streaming/observables/frame paths never cared. Four rules survive it; the
+  measurements are in `notes/2d-milestones.md`.
+  **SEPARABILITY IS UNAVAILABLE HERE, and the natural test would fail against
+  correct code.** `test_separable_run_equals_two_1d_runs` needs T separable as
+  well as U, and c√(px²+py²+m²c²) is not a sum — a 2D relativistic run is
+  genuinely NOT the outer product of two 1D relativistic runs. Since separability
+  is what validates the 4D pipeline against trusted 1D code, the replacement is
+  `test_relativistic_matches_an_independent_schroedinger_run` (the same TDSE
+  reference as the Bopp anchor, with the square-root Salpeter T applied exactly
+  in the Fourier basis), and what it asserts is the **dt RATIO**: 4.58 at c = 10,
+  falling to 3.46 at c = 5 and 2.65 at c = 3 as the residual meets the same
+  dt-independent ~1.5e-5 GRID floor the non-relativistic anchor hits below
+  dt = 0.005. Do not lower c to make it "more relativistic".
+  **Never assert quantum ≡ classical for qr/cr**: the Moyal corrections vanish
+  for a quadratic U, but T is not quadratic in k, so the kinetic Bopp difference
+  and the gradient genuinely differ. ⟨Lz⟩ DOES transfer — T depends on the
+  momenta only through |k|, so rotational symmetry holds and
+  `test_angular_momentum` extends unchanged; it is the one existing 2D anchor
+  that does.
+  **The mc² cancellation does NOT worsen in 4D** — absolute error flat at
+  3.6e-12 (1D) to 4.2e-12 (2D), because it is m²c²·eps, a couple of ulps, and
+  that does not care how many momentum components enter the sum. There is no
+  float32 version of it to measure: exponent construction stays double at every
+  ndim, verified bitwise. **And relativistic is FREE in memory and in time**, so
+  `BYTES_PER_CELL_2D` did not move — a √ over meshes that already exist costs
+  nothing and the FFTs are still the whole cost. The uncertainty-shear diagnostic
+  works, at **c = 10 and not c = 137** (shear goes as 1/c⁴, so 137.036 needs
+  ~1200 steps to clear the noise, which at 57 ms/step over 32⁴ is not a test).
+
+
+## The milestone section, as it stood before the 2026-08-05 split
+
+
+**These are not optional extras — they are all wanted, and each is out of the
+first 2D cut only so the physics core lands verified.** **EVERY GATE IS NOW
+GONE**: M1 (float32, 2026-07-27), M2 (relativistic, -27), M4 (mp4, -28) and M3
+(auto-expand, 2026-08-01) have all landed, and nothing in the codebase refuses
+anything on the grounds of `ndim == 2`; what each cost is in its gotcha below.
+**M7 landed 2026-08-02** — not a gate either, an enhancement, and the first of
+these to be finished at BOTH dimensionalities at once. What is left (M5, M6) are
+enhancements that simply do not exist yet at either dimensionality — no refusal
+to relax, no half-feature to mistake for a working one.
+
+Three lessons from retiring those four, kept because the next milestone will
+need them (the full retrospectives are in `notes/2d-milestones.md`):
+**the verification is the work and the gate removal is a few lines** — the
+physics core was already generic every time, and M1's measurement contradicted
+its prediction in both directions at once; **look for the accounting the gate
+was hiding**, since each milestone's real work turned out to be a constant
+nobody had listed (`BYTES_PER_CELL_2D`, `RangeStats.scale`, `session.max_cells`,
+and M7's `fit.REGRID_PEAK`, which got RELATIVELY worse as the worker got smaller)
+— but expect false positives there too, and settle them by measuring at the
+point the code actually runs, not by reasoning from two documented measurements;
+and **a gate can carry a stale REASON**, so re-measure the claim it rests on and
+not only the risk it names.
+
+| # | Milestone | v1 gate | What it needs |
+|---|---|---|---|
+| M5 | **Cuts / slices** | the wire reserves a per-plane `mode` byte; only `mode=0` (projection) is defined | Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime. A cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
+| M6 | **FFT fusion** | — | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, which changes numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass in both 1D and 2D. |
+| ~~M7~~ | ~~**One exponent slot instead of two**~~ | — | **DONE 2026-08-02.** `worker._advance` divides each record into `ceil(rem/dt)` EQUAL substeps instead of walking at `dt` and clamping a straggler, so the second exponent slot that straggler needed is gone. Measured **208 → 176 B/cell in 2D and 224 → 192 in 1D** (float32 112 → 96 and 120 → 104), i.e. −32 B/cell everywhere and −15.4%, NOT the −22% this row used to claim — see the one-exponent-slot gotcha below for why that figure was stale and what else had to move. |
+

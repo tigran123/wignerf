@@ -10,7 +10,7 @@
  * render_mpl.py — the panel promises what the video will do, and a promise
  * that drifts is worse than no promise.
  */
-import { labels, isMomentum, marginalTitle, purityTitle, uncertaintyTitle,
+import { labels, marginalTitle, purityTitle, uncertaintyTitle,
          lzTitle, ndimOf } from './axes'
 
 /** Plot ids, shared verbatim with lib/plotPrefs.ts and the export wire. */
@@ -55,7 +55,8 @@ export function diagnosticTitle(ndim: number, id: DiagId): string {
 export function diagnosticLabel(ndim: number, id: DiagId): string {
   if (id.startsWith('marg')) {
     const a = Number(id.slice(4))
-    return `${isMomentum(ndim, a) ? 'φ' : 'ρ'}(${labels(ndim)[a]})`
+    // every marginal is rho, momentum ones included — see axes.marginalTitle
+    return `ρ(${labels(ndim)[a]})`
   }
   if (id === 'E') return 'E'
   if (id.startsWith('uncertainty'))

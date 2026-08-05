@@ -29,14 +29,14 @@ describe('diagnostics vocabulary', () => {
   })
 
   it('names each plot as the SPA does', () => {
-    expect(diagnosticTitle(2, 'marg2')).toBe('φ(px) = ∫W dx dy dpy')
+    expect(diagnosticTitle(2, 'marg2')).toBe('ρ(px) = ∫W dx dy dpy')
     expect(diagnosticTitle(2, 'purity')).toBe(
       'purity γ(t) = (2πℏ)²⨌W²dxdydpxdpy')
     expect(diagnosticTitle(2, 'lz')).toBe('⟨Lz⟩(t) = ⟨x·py − y·px⟩')
     expect(diagnosticTitle(1, 'uncertainty0')).toBe('ΔX·ΔP(t)')
     // chips are short enough for a 26rem popover
     expect(diagnosticLabel(2, 'marg0')).toBe('ρ(x)')
-    expect(diagnosticLabel(2, 'marg3')).toBe('φ(py)')
+    expect(diagnosticLabel(2, 'marg3')).toBe('ρ(py)')
     expect(diagnosticLabel(2, 'uncertainty1')).toBe('ΔY·ΔPy')
     expect(diagnosticLabel(2, 'purity')).toBe('γ')
     expect(diagnosticLabel(2, 'lz')).toBe('⟨Lz⟩')

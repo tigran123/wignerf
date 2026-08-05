@@ -100,6 +100,18 @@
   --wf-chart-text: #404040;
   --wf-chart-select: rgba(0, 0, 0, 0.07);
   --wf-cursor: #db2777;
+  /* Re/Im of the IC editor's wavefunction charts. THREE DISTINCT HUES, not one
+     hue and a dash pattern: Re phi and Im phi coincide exactly for perfectly
+     ordinary inputs (psi = e^-(x-2)^2/2 + i e^-(x+2)^2/2 gives Re == Im at every
+     p), and where two same-coloured curves coincide the dashed one's GAPS reveal
+     the solid one beneath, so the pair renders as a single solid line and one of
+     them silently disappears. The dash survives as a second cue.
+     render_mpl.py deliberately has no mirror of these — it never draws these
+     charts — which is why they are the one --wf-chart-* pair with no Python
+     counterpart. */
+  --wf-wave-re: #0f766e;
+  --wf-wave-im: #7c3aed;
+  --wf-wave-abs: #db2777;
 
   /* readouts painted over the timeline bar: the halo has to be the OPPOSITE
      of the text it separates from the bar */
@@ -144,6 +156,9 @@
   --wf-chart-text: #d4d4d4;
   --wf-chart-select: rgba(255, 255, 255, 0.12);
   --wf-cursor: #f472b6;
+  --wf-wave-re: #2dd4bf;
+  --wf-wave-im: #a78bfa;
+  --wf-wave-abs: #f472b6;
 
   --wf-label-shadow: 0 1px 2px rgb(0 0 0 / 0.85);
 }

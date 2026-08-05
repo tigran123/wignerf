@@ -334,10 +334,15 @@ class SessionClock:
 class SimSession:
     def __init__(self, cfg, compiled_potential, loop, device, fft_threads,
                  history_bytes, max_grid=4096, history_mb_max=None,
-                 max_cells=None):
+                 max_cells=None, compiled_ic=None):
         self.id = uuid.uuid4().hex[:12]
         self.cfg = cfg
         self.compiled_potential = compiled_potential
+        # The IC compiled once, for the same reason the potential is: every
+        # worker builds the same initial condition, and for the expression kinds
+        # that means a sympy parse each. None is legal — from_spec compiles on
+        # demand — so a caller that predates the expression kinds still works.
+        self.compiled_ic = compiled_ic
         self.loop = loop
         self.devices = resolve_devices(device)
         self.fft_threads = fft_threads
@@ -987,11 +992,13 @@ class SimSession:
 
 
 def create_session(cfg, compiled_potential, device, fft_threads, history_bytes,
-                   max_grid=4096, history_mb_max=None, max_cells=None):
+                   max_grid=4096, history_mb_max=None, max_cells=None,
+                   compiled_ic=None):
     loop = asyncio.get_running_loop()
     s = SimSession(cfg, compiled_potential, loop, device, fft_threads,
                    history_bytes, max_grid=max_grid,
-                   history_mb_max=history_mb_max, max_cells=max_cells)
+                   history_mb_max=history_mb_max, max_cells=max_cells,
+                   compiled_ic=compiled_ic)
     with _LOCK:
         SESSIONS[s.id] = s
     s.start()

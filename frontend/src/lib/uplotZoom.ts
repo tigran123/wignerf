@@ -197,7 +197,7 @@ export function createUplotZoom(opts: {
 /**
  * Give a chart an HTML title. uPlot assigns `titleEl.textContent = opts.title`,
  * so markup has to be written after construction — which is the only way to get
- * a real subscript into "φ(p<sub>y</sub>) = ∫W dx dy dp<sub>x</sub>". Called
+ * a real subscript into "ρ(p<sub>y</sub>) = ∫W dx dy dp<sub>x</sub>". Called
  * right after makeChart(), and again on every rebuild, since the element is new.
  */
 export function setPlotTitleHtml(chart: { root: HTMLElement }, html: string) {

@@ -83,7 +83,12 @@ class Grid:
         self.lo = tuple(float(a.lo) for a in axes)
         self.hi = tuple(float(a.hi) for a in axes)
         self.d = tuple(a.cell for a in axes)
-        self.dV = prod(self.d)
+        # dmu (dμ) — the PHASE-SPACE measure, the product of every axis's cell
+        # size, i.e. what a sum over the state has to be weighted by to become
+        # an integral. Named for a measure rather than a volume (it was dV)
+        # because that is what it is: at ndim=2 it spans four axes, two of them
+        # momenta, and "volume" reads as the spatial one it is not.
+        self.dmu = prod(self.d)
 
         v, dual, amp = [], [], []
         for a, axis in enumerate(axes):
@@ -101,11 +106,17 @@ class Grid:
             amp.append(dd*axis.n/2.)              # == pi/d[a]
             dual.append(-amp[a] + dd*i)
         self.v = tuple(v)
+        # The DUAL vectors in natural order, kept rather than discarded after D
+        # is built: the psi initial condition integrates over theta explicitly
+        # (initial.psi_wigner) and needs it unshifted, exactly as the Gaussian
+        # builders need `v`. D below is built from these same array objects, so
+        # it is bitwise what it always was.
+        self.dual_v = tuple(dual)
         self.dual_amp = tuple(amp)
 
         self.C = tuple(backend.fftshift(v[a]).reshape(self._bshape(a))
                        for a in range(self.n_axes))
-        self.D = tuple(backend.fftshift(dual[a]).reshape(self._bshape(a))
+        self.D = tuple(backend.fftshift(self.dual_v[a]).reshape(self._bshape(a))
                        for a in range(self.n_axes))
         self.Q, self.K = self.C[:self.ndim], self.C[self.ndim:]
         self.Lam, self.Theta = self.D[:self.ndim], self.D[self.ndim:]
@@ -139,6 +150,15 @@ class Grid:
         (their caller applies shift() before propagating), so this is their
         counterpart to the shifted `C`."""
         return self.v[a].reshape(self._bshape(a))
+
+    def nat_dual_mesh(self, a):
+        """NATURAL-order mesh of axis a's Fourier DUAL, broadcast-shaped over
+        the full state — the dual counterpart of nat_mesh.
+
+        theta_i, the dual of the momentum axis k_i (axes.conjugate), is what the
+        psi initial condition's Wigner transform integrates over, and it works
+        in natural order like every other initial-condition builder."""
+        return self.dual_v[a].reshape(self._bshape(a))
 
     def sub_meshes(self, axs):
         """Shifted coordinate meshes broadcast within the SUBSPACE spanned by

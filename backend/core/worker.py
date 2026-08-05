@@ -124,9 +124,14 @@ class SolverWorker(threading.Thread):
             # dataclass arithmetic), so record geometry and lattice points
             # agree with the scheduler bitwise
             self._grid_state = GridState.from_spec(cfg.grid)
-            g, Wnat, _, _ = initial.from_spec(
+            # compiled ONCE by the router and shared, exactly as
+            # compiled_potential is: this method runs per variant, so compiling
+            # here would have up to four threads parsing the same expression
+            # simultaneously through sympy's global caches.
+            g, Wnat, _, _, _ = initial.from_spec(
                 cfg.grid, cfg.ic, cfg.hbar_eff, backend,
-                grid=self._grid_state.make_grid(backend))
+                grid=self._grid_state.make_grid(backend),
+                compiled=self.session.compiled_ic)
             U, gradU = self.session.compiled_potential.for_backend(backend)
             prop = Propagator(g, mass=cfg.mass, c=cfg.c, hbar_eff=cfg.hbar_eff,
                               tol=cfg.tol, U=U, gradU=gradU, **self.flavor)

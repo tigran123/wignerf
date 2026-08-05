@@ -429,13 +429,13 @@ def test_observables_match_a_naive_computation(backend):
 
     W = np.asarray(Wn)                      # natural order
     d = g.d
-    dV = g.dV
+    dmu = g.dmu
     v = [backend.asnumpy(x) for x in g.v]
 
-    assert obs.norm == pytest.approx(W.sum()*dV, abs=1e-12)
+    assert obs.norm == pytest.approx(W.sum()*dmu, abs=1e-12)
     for a in range(4):
         m = W.sum(axis=tuple(b for b in range(4) if b != a)) \
-            * (dV/d[a])
+            * (dmu/d[a])
         np.testing.assert_allclose(obs.marg[a], m, atol=1e-14)
         assert obs.mean[a] == pytest.approx((v[a]*m).sum()*d[a], abs=1e-12)
 
@@ -451,9 +451,9 @@ def test_observables_match_a_naive_computation(backend):
     PX = v[2][None, None, :, None]
     PY = v[3][None, None, None, :]
     E = ((PX**2 + PY**2)/2. + (X**2 + Y**2)/2.)*W
-    assert obs.E == pytest.approx(E.sum()*dV, abs=1e-10)
-    assert obs.lz == pytest.approx(((X*PY - Y*PX)*W).sum()*dV, abs=1e-10)
-    assert obs.purity == pytest.approx((2.*pi)**2*(W*W).sum()*dV, abs=1e-12)
+    assert obs.E == pytest.approx(E.sum()*dmu, abs=1e-10)
+    assert obs.lz == pytest.approx(((X*PY - Y*PX)*W).sum()*dmu, abs=1e-10)
+    assert obs.purity == pytest.approx((2.*pi)**2*(W*W).sum()*dmu, abs=1e-12)
 
 
 def test_cat_state_is_a_valid_2d_quantum_state(backend):
@@ -465,8 +465,8 @@ def test_cat_state_is_a_valid_2d_quantum_state(backend):
     comps = [GaussianComponent((-2.0, 0.0), (0.0, 0.0), sq, sk),
              GaussianComponent((2.0, 0.0), (0.0, 0.0), sq, sk)]
     W = cat_wigner(g, comps, 1.0)
-    assert float(W.sum())*g.dV == pytest.approx(1.0, abs=1e-6)
-    assert (2.*pi)**2*float((W*W).sum())*g.dV == pytest.approx(1.0, abs=1e-4)
+    assert float(W.sum())*g.dmu == pytest.approx(1.0, abs=1e-6)
+    assert (2.*pi)**2*float((W*W).sum())*g.dmu == pytest.approx(1.0, abs=1e-4)
     assert float(W.min()) < -1e-3         # interference fringes go negative
 
 

@@ -46,6 +46,7 @@ empties the pool after every preview, every preview was already cold.
 import logging
 import threading
 import traceback
+from dataclasses import replace
 from typing import Literal, Optional
 from urllib.parse import quote
 
@@ -75,6 +76,21 @@ router = APIRouter()
 # mistake: the 2D cross-Wigner is the outer product of two per-dimension cores,
 # and those cores are 2D arrays — only the product is ever full size, so the
 # closed form's own temporaries cost nothing at 4D scale.
+# The two EXPRESSION kinds are bounded BELOW these, at every size, and that is
+# by construction rather than by luck: their builds are blocked against fixed
+# byte budgets (initial.IC_BLOCK_BYTES, initial.PHI_KERNEL_BYTES), so their peak
+# is the float64 output plus a constant and their per-cell figure is largest at
+# the SMALLEST grid. Measured on the 3090, 2026-08-04, in a fresh process each
+# (a shared pool retains blocks and reads as 0):
+#
+#   psi     1D 1024^2 36.4   2048^2 17.2   4096^2 10.3   2D 32^4 20.1   64^4 9.0
+#   wexpr   1D 1024^2 12.6                                       64^4 9.8
+#
+# against the cat figures above, which the same instrument reproduces as 88.1
+# and 56.0 — which is what says it is measuring the right thing. An arbitrary
+# expression's UNBLOCKED transient is not a constant at all (it grows with the
+# expression tree's width, and MAX_EXPR_LEN is 500), so the blocking is what
+# lets this table stay one number per ndim.
 PREVIEW_BYTES_PER_CELL = {1: 88, 2: 56}
 PREVIEW_HEADROOM = 1.4     # never take the last of a card a session is using
 # ...and the same idea for host RAM, which MemAvailable already reports net of
@@ -267,7 +283,7 @@ class WignerPreviewIn(ICSpec):
     precision: Optional[Literal["float64", "float32"]] = None
 
 
-def _build_frame(b, req):
+def _build_frame(b, req, compiled=None):
     """Build the preview bundle on `b`. EVERY device array is a local of this
     function, so all of them die when it returns — which is precisely what lets
     the caller's _release() hand the VRAM back. Keeping the build in its own
@@ -278,15 +294,21 @@ def _build_frame(b, req):
     Returns only host data: `wq` comes back through backend.asnumpy inside
     quantize, and rho/phi likewise out of observables."""
     with b.device():
-        g, W, warns, edge = initial.from_spec(req.grid, req, req.hbar_eff, b)
-        deficit = abs(1.0 - float(W.sum())*g.dV)
+        g, W, warns, edge, norm = initial.from_spec(
+            req.grid, req, req.hbar_eff, b, compiled=compiled)
+        # The measured deficit for the analytically-normalized Gaussian kinds;
+        # for the expression kinds the state carries its own answer (psi knows
+        # what fraction of its mass the box holds, and a wexpr was normalized BY
+        # this very sum, so measuring it here would report a structural zero).
+        if norm.method == "analytic":
+            norm = replace(norm, deficit=abs(1.0 - float(W.sum())*g.dmu))
         vf, _obs = frame.build(g.shift(W), g, req.hbar_eff)
         payload = protocol.pack_frame(0, 0.0, g.geom(), [vf],
                                       flags=protocol.FLAG_LIVE_PREVIEW)
-    return payload, deficit, warns, edge
+    return payload, norm, warns, edge
 
 
-def _respond(payload, deficit, warns, edge=()):
+def _respond(payload, norm, warns, edge=()):
     # HTTP headers are latin-1 only: percent-encode so warnings can carry
     # Unicode (sigma, hbar, rho...); the client decodeURIComponent()s it.
     #
@@ -295,8 +317,21 @@ def _respond(payload, deficit, warns, edge=()):
     # fact about the same axes from record 0 on, so the client has to be able to
     # drop the axes already covered and word only what is left. A string it had
     # to pattern-match would make that a guess.
+    #
+    # The deficit header is EMPTY when the number is not a diagnostic, rather
+    # than a structural zero: an expression W is normalized by its own grid sum,
+    # so "norm deficit on grid: 0.000e+00" would be a health check that always
+    # passes, which reads as reassurance and is worse than no line at all. The
+    # client renders that line under `v-if`, so an empty value removes it.
+    # X-Wignerf-IC-Norm carries what IS worth saying in its place — for a wexpr
+    # the raw integral it was divided by, which pre-answers "why does
+    # multiplying my expression by 5 change nothing?".
     return Response(content=payload, media_type="application/octet-stream",
-                    headers={"X-Wignerf-Norm-Deficit": "%.3e" % deficit,
+                    headers={"X-Wignerf-Norm-Deficit":
+                             "%.3e" % norm.deficit if norm.method != "grid-sum"
+                             else "",
+                             "X-Wignerf-IC-Norm": "%s:%.6g:%.6g"
+                             % (norm.method, norm.raw, norm.momentum_mass),
                              "X-Wignerf-Warnings": quote(" | ".join(warns)),
                              "X-Wignerf-Edge": ",".join(
                                  "%s:%.3e" % (a, m) for a, m in edge)})
@@ -323,8 +358,15 @@ def preview_wigner(req: WignerPreviewIn):
     # the build instead is what forced the GPU branch below to translate every
     # ValueError into a 422 — including cupy's, which turned a device problem
     # into "your IC is wrong" and skipped the CPU fallback that exists for it.
+    #
+    # compile_ic covers both shapes: components_of for the Gaussian kinds, and a
+    # sympy parse for the expression ones. The parse allocates nothing either,
+    # which is what keeps it on this side of the device choice — and the compiled
+    # result is then handed to the build rather than recomputed inside it.
     try:
-        initial.components_of(req, req.hbar_eff, req.grid.ndim)
+        compiled = initial.compile_ic(req, req.hbar_eff, req.grid.ndim,
+                                      ranges=initial.probe_ranges(req.type, req.grid,
+                                                 req.hbar_eff))
     except ValueError as e:
         raise HTTPException(422, str(e))
     spec = _pick_device(req.grid.cells, req.grid.ndim)
@@ -339,6 +381,9 @@ def preview_wigner(req: WignerPreviewIn):
     # the card until the next SUCCESSFUL preview, starving the very solver the
     # fallback exists to protect.
     failed = None
+    ic_error = None          # a CLIENT error caught on the GPU path, re-raised
+                             # after the release below rather than from inside
+                             # the handler that cannot free anything
     if spec is not None:
         b = pool = None      # _backend() itself can raise (a vanished device)
         try:
@@ -346,9 +391,29 @@ def preview_wigner(req: WignerPreviewIn):
             pool = _pool(spec, b)
             with _gpu_lock, b.xp.cuda.using_allocator(pool.malloc):
                 try:
-                    return _respond(*_build_frame(b, req))
+                    return _respond(*_build_frame(b, req, compiled))
                 finally:
                     _release(b, pool)
+        except initial.ICError as e:
+            # NOT a device failure, so NOT a fallback: an IC that cannot be
+            # built (a W integrating to zero, a psi that is not finite) will
+            # fail identically on the CPU and then surface as a 500. Most of
+            # these are only knowable once W exists, which is why they cannot
+            # join the pre-flight above — but they are still the client's.
+            #
+            # THE RELEASE IS DEFERRED THE SAME WAY THE OOM PATH'S IS, and this
+            # is the whole point of `failed` existing. Calling _release here
+            # would free nothing at all, for the reason stated above the `failed
+            # = None` line: the exception is live for the duration of this
+            # handler, so its traceback still references _build_frame's frame
+            # and every device array in it. A 422 would then park the whole
+            # build on the card until some LATER preview succeeded, which is
+            # exactly the starvation the structure exists to prevent — and it
+            # is worse here than on the OOM path, because a client typing an
+            # expression hits this repeatedly and by design.
+            if pool is not None:
+                failed = (b, pool)
+            ic_error = e
         except Exception:
             # OOM above all (another session can claim the card between the
             # free-memory check and the build), but anything device-shaped
@@ -368,6 +433,11 @@ def preview_wigner(req: WignerPreviewIn):
                 failed = (b, pool)
     if failed is not None:
         _release(*failed)
+    # Now that the handler has exited and the frame is unreachable, the client's
+    # own error can be answered — and it must NOT fall through to the CPU, which
+    # would rebuild the identical bad IC just to fail identically.
+    if ic_error is not None:
+        raise HTTPException(422, str(ic_error))
     # The CPU fallback's own fit check — the last guard before an allocation
     # nothing else bounds. After the release above, so a failed GPU build hands
     # its VRAM back either way.
@@ -377,4 +447,79 @@ def preview_wigner(req: WignerPreviewIn):
         # fine and the shortage transient, so this is "not right now", not "your
         # request is wrong". 422 when the CPU was always the target.
         raise HTTPException(503 if spec is not None else 422, cpu_bad)
-    return _respond(*_build_frame(_backend("cpu"), req))
+    try:
+        return _respond(*_build_frame(_backend("cpu"), req, compiled))
+    except initial.ICError as e:
+        raise HTTPException(422, str(e))
+
+
+class WavefunctionPreviewIn(BaseModel):
+    """ψ(x) / ψ(x, y) for the IC editor's two line charts. A BARE expression
+    string, exactly as PotentialPreviewIn takes one — this endpoint answers a
+    syntax error without building any state, which is the whole reason it is not
+    folded into /preview/wigner: that one returns a binary frame and can cost a
+    multi-GiB transient, and moving the cut selector must not pay for one."""
+    expr: str
+    grid: GridSpec
+    hbar_eff: float = Field(default=1.0, gt=0)
+    # Which SPATIAL axis to cut along at ndim=2. The momentum axis follows from
+    # axes.conjugate rather than being chosen separately, so the pair can never
+    # be mismatched — the classic multi-D error, and a silent one.
+    cut_axis: int = Field(default=0, ge=0, le=1)
+    n: int = Field(default=512, ge=16, le=4096)
+
+
+@router.post("/preview/wavefunction")
+def preview_wavefunction(req: WavefunctionPreviewIn):
+    """ψ on the spatial lattice and φ on the grid's OWN momentum lattice, each
+    as re/im (the client squares them for |·|²).
+
+    φ IS COMPUTED BY QUADRATURE ON THE FORM'S MOMENTUM AXIS, never by an FFT of
+    ψ. The FFT's dual lattice is 2πℏ/(N·dq) wide and in general is NOT the
+    momentum axis the user chose — and this chart sits directly under a W
+    preview whose vertical axis IS that axis. Two adjacent plots of one state on
+    two different momentum axes is exactly the class of error lib/potentialCuts
+    exists to record.
+
+    An {ok, error} union rather than an HTTP error, matching /preview/potential:
+    a half-typed expression is the normal state of an input someone is typing
+    into, not an exceptional one.
+    """
+    nd = req.grid.ndim
+    # The same rail /preview/wigner is behind. This endpoint allocates too — psi
+    # on the spatial lattice and, per axis, a chunked (N_k x N_q) quadrature —
+    # and it fires on every keystroke, so a grid a session would refuse must not
+    # be sampled here either.
+    bad = grid_limit_error(req.grid)
+    if bad:
+        return {"ok": False, "error": bad}
+    # A blank box is the normal state of an input someone is typing into, and it
+    # is answered HERE rather than by constructing an ICSpec and letting its
+    # validator fire: pydantic's ValidationError is a ValueError, so it would be
+    # caught below and rendered verbatim — the multi-line "1 validation error
+    # for ICSpec … [type=value_error, input_value=…]" blob, echoing the input,
+    # straight into the strip under the charts. That blob is what ICSpec's own
+    # hand-written sentences exist to avoid, and apiErrorText never sees it
+    # because this endpoint answers 200.
+    if not (req.expr or "").strip():
+        return {"ok": False, "error": "ψ: an expression is required"}
+    try:
+        cic = initial.compile_ic(
+            ICSpec(type="psi", expr=req.expr), req.hbar_eff, nd,
+            ranges=req.grid.spatial_extended(req.hbar_eff))
+        psi, phi = initial.wavefunction_cuts(
+            req.grid, cic, req.hbar_eff, _backend("cpu"),
+            cut_axis=min(req.cut_axis, nd - 1), n=req.n)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    except MemoryError:
+        # Not a ValueError, so it used to escape as a 500. The docstring
+        # promises this endpoint answers in the union, and a host under memory
+        # pressure is exactly when a half-typed expression should not take the
+        # request down.
+        return {"ok": False, "error": "not enough memory to sample ψ on this "
+                                      "grid — reduce the axis sizes"}
+    # `axis` is an INDEX, never a label: labels live in core/axes.py,
+    # lib/axes.ts and render_mpl.py, and a fourth copy on the wire is how that
+    # three-way mirror breaks.
+    return {"ok": True, "ndim": nd, "psi": psi, "phi": phi}

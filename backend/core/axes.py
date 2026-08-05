@@ -178,8 +178,18 @@ def plane_title(ndim, plane, math=False):
 
 
 def marginal_title(ndim, axis, math=False):
-    """rho(x) = int W dp   /   phi(py) = int W dx dy dpx"""
-    sym = "φ" if is_momentum(ndim, axis) else "ρ"
+    """rho(x) = int W dp   /   rho(py) = int W dx dy dpx
+
+    EVERY marginal is rho, momentum ones included. They used to be phi, which
+    was fine while nothing else on screen was called that — and stopped being
+    fine when the initial condition gained a psi tab, whose second chart IS the
+    wavefunction's Fourier image and has every right to the letter. Two
+    different objects sharing a symbol one panel apart is worse than a slightly
+    duller name: rho(p) is a probability DENSITY (a reduction of W, real and
+    non-negative), phi(p) is a probability AMPLITUDE (complex, and the thing
+    rho(p) is the modulus square of).
+    """
+    sym = "ρ"
     over = tuple(a for a in range(2*ndim) if a != axis)
     return "%s(%s) = ∫W %s" % (sym, _lbl(ndim, axis, math),
                                _measure(ndim, over, math))

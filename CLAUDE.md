@@ -35,15 +35,34 @@ labels only (`frontend/src/lib/units.ts`).
 - `start.sh` — prod launcher: runs uvicorn only (guards that `backend/.venv`
   and `frontend/dist` exist, else errors). Install/build is manual and
   pre-service — see `README.md`.
-- `notes/` — tracked long-form material split OUT of this file when it passed
-  the 150k-char limit at which Claude Code stops loading it (2026-08-02). It is
-  not auto-loaded, so what remains here is what changes the code you would write
-  today, and each pointer names when to go and read the rest. Currently
-  `notes/2d-milestones.md`: the M1–M4 and M7 retrospectives with every
-  measurement behind the auto-expand memory guard, the float32 and relativistic
-  2D verification, the export figure's typesetting, and the before/after
-  footprint and REGRID_PEAK figures for the one-exponent-slot change.
-  **Anything moved there stays a pointer here — never a silent deletion.**
+- `notes/` — tracked long-form material split OUT of this file, which stops
+  being loaded around 150k characters. It is not auto-loaded, so **what remains
+  here is what changes the code you would write today; HOW it was measured goes
+  to `notes/`, behind a pointer naming when to go and read it.** Anything moved
+  there stays a pointer here — never a silent deletion.
+  **THE BUDGET IS 130,000 CHARACTERS** (`wc -c CLAUDE.md`, in the Commands
+  block). It is stated as a number because "keep it short" alone has now failed
+  twice: the first split (2026-08-02) bought 19,321 chars and 83% of that was
+  spent within two commits, putting the file back over the line by 2026-08-05.
+  When a feature's retrospective would push it over, that retrospective is what
+  moves — not the rule it justifies.
+  - `2d-milestones.md` — M1–M4 and M7: the auto-expand memory guard, the
+    float32 and relativistic 2D verification, the export figure's typesetting,
+    and the one-exponent-slot before/after.
+  - `precision.md` — the float64/float32 bench figures, the mixed-scheme
+    derivation, the two dtype-invisible failure modes, the auto-expand-noise and
+    tol-floor sweeps.
+  - `export.md` — the mp4 encoder probe, pool sizing, blit timings and metadata
+    line-budget arithmetic.
+  - `ui-notices.md` — the transient-notice, boundary-warning, header-strip,
+    parameter-policy and theming archaeology, with the browser reproductions
+    and the edge noise-floor sweep.
+  - `session-lifecycle.md` — every RSS/VRAM figure behind "a closed session must
+    actually free", the browser receive ceiling, and the streaming transport.
+  - `memory-and-devices.md` — the device fit check, the per-cell footprint
+    tables and the IC preview's VRAM release.
+  - `expression-ics.md` — the `wexpr`/`psi` transform verification and the
+    potential validity model.
 
 Dependency workflow (same as urantia-library): edit `requirements*.in`,
 then `uv pip compile requirements[-x].in -o requirements[-x].txt` and
@@ -72,7 +91,10 @@ source) is what keeps startup fast. See `README.md`.
   the classic multi-D error and is silent.
   `Grid` takes a tuple of `Axis(lo, hi, n, d, anchor)` and exposes `N/lo/hi/d`
   tuples, `v` (natural-order vectors), `C`/`D` (shifted coordinate and dual
-  meshes) and `dV`. Every 1D-only spelling — `grid.dx`, `gs.ox`,
+  meshes) and `dmu`, the phase-space measure ∏d[a] — dμ rather than dV
+  because it is a measure on 2·ndim-dimensional phase space, not a spatial
+  volume, and the two would read alike at ndim=1 where they differ least.
+  Every 1D-only spelling — `grid.dx`, `gs.ox`,
   `geom.Nx`, `vf.rho`, `obs.x_std`, `es.x_mass`, `cp.dUdx` — survives as a
   compatibility property that **RAISES at ndim > 1** rather than returning axis
   0/1, so a call site nobody generalized fails loudly instead of computing a
@@ -120,68 +142,56 @@ source) is what keeps startup fast. See `README.md`.
 - **Streaming**: solver workers append records to an in-RAM byte-capped
   `FrameHistory`; the WS streamer (`routers/stream.py`) sends the newest
   lockstep-complete record (live, coalescing — slow clients skip frames) or
-  exact sequential records (replay/scrub). Computation ALWAYS runs at full
-  speed in both modes — neither the dial nor a slow client ever throttles
-  the workers; `delay` (seconds injected between played-back frames)
-  paces only the display. The dial's "0" position (default) means one
-  record per display refresh — the fastest speed at which every frame is
-  still painted: the client measures its refresh interval (lib/perf.ts)
-  and sends that as the delay, and every dial position is clamped to at
-  least it, so delivery never outpaces painting. **At 4096²/8192² that is
+  exact sequential records (replay/scrub). Computation ALWAYS runs at full speed
+  in both modes — neither the dial nor a slow client ever throttles the workers;
+  `delay` paces only the display. The dial's "0" position (default) means one
+  record per display refresh: the client measures its refresh interval
+  (lib/perf.ts) and sends that as the delay, and every dial position is clamped
+  to at least it, so delivery never outpaces painting. **At 4096²/8192² that is
   NOT enough and there is deliberately no client-side pacing loop** — an
-  adaptive pacer keyed on paint time was built and REMOVED on 2026-07-23
-  because paint time is not the binding constraint there (8.7 ms/frame
-  against a 285 ms delivery interval); see the browser-receive-ceiling
-  gotcha. Don't rebuild it: the constraint is the browser's per-message
-  receive cost, so the fix is smaller messages (display downsampling), not
-  a smarter delay. Replay never skips a
-  record; it slips on WS backpressure when the client can't keep up. The
-  UI dial is "0" plus a log range 20 ms–1.5 s. Client frame fan-out is
-  rAF-timed (useSession: decode per message, paint one frame per
-  animation frame; small FIFO with drop-to-newest as a burst safety
-  valve), so texture uploads, uPlot updates and Vue reactivity run per
-  PAINTED frame by construction. That drop-to-newest is why the timeline
-  readout shows painted/s AND received/s (`Timeline.vue`, `perfRates`):
-  when they diverge the client is SKIPPING records, which reads on screen
-  as fast playback and is really loss — one number alone cannot tell the
-  two apart, and the live/compute path makes that worse by design (the
-  `delay` gate applies only to replay — see `advance_cursor` — while live
-  coalesces to the newest record, so computing legitimately animates
-  faster than paced playback). A playback-only run must never coalesce to the
-  frontier while sequential records are unsent (that would teleport
-  playback to the end), and its auto-pause is delivery-aware — it fires
-  only after the frontier record was SENT.
-  **`loop` repeats that pass instead of pausing** (`LoopCmd`, a `loop` checkbox
-  in the transport row beside Solve/Play/Pause, echoed in `status`). It exists
-  because the auto-pause above is correct but easy to walk into: playback stops
-  at the frontier, the button there becomes "Solve", and the Space that was
-  replaying a second ago now COMPUTES. It is a DISPLAY policy like `delay` —
-  never changes what is computed — and it rewinds to `loop_from`, the cursor
-  captured when the pass STARTED, so "again" means the region you asked to
-  watch rather than all of history. Two things are load-bearing. It reuses the
+  adaptive pacer keyed on paint time was built and REMOVED on 2026-07-23,
+  because paint time is not the binding constraint there; see the
+  browser-receive-ceiling gotcha. Don't rebuild it: the constraint is the
+  browser's per-message receive cost, so the fix is smaller messages (display
+  downsampling), not a smarter delay. Replay never skips a record; it slips on
+  WS backpressure. The UI dial is "0" plus a log range 20 ms–1.5 s.
+  Client frame fan-out is rAF-timed (decode per message, paint one frame per
+  animation frame; small FIFO with drop-to-newest as a burst safety valve), so
+  texture uploads, uPlot updates and Vue reactivity run per PAINTED frame by
+  construction. That drop-to-newest is why the timeline readout shows painted/s
+  AND received/s: when they diverge the client is SKIPPING records, which reads
+  on screen as fast playback and is really loss — one number alone cannot tell
+  the two apart, and the live path makes that worse by design (the `delay` gate
+  applies only to replay while live coalesces to the newest record, so computing
+  legitimately animates faster than paced playback). A playback-only run must
+  never coalesce to the frontier while sequential records are unsent, and its
+  auto-pause is delivery-aware — it fires only after the frontier record was
+  SENT.
+  **`loop` repeats that pass instead of pausing** (`LoopCmd`, a checkbox beside
+  Solve/Play/Pause, echoed in `status`). It exists because the auto-pause is
+  correct but easy to walk into: playback stops at the frontier, the button
+  becomes "Solve", and the Space that was replaying a second ago now COMPUTES.
+  It is a DISPLAY policy like `delay` and rewinds to `loop_from`, the cursor
+  captured when the pass STARTED, so "again" means the region you asked to watch
+  rather than all of history. Two things are load-bearing: it reuses the
   auto-pause's delivery gate, so a slow client is never rewound past frames it
   has not been sent; and `browsed` stays True across the wrap, or the next tick
-  re-attaches to the frontier and rolls into computation — precisely the
-  confusion the feature removes. **Rewinding `cursor` alone STALLS the loop
-  silently**: the sender walks forward from `last_sent`, which is still at the
-  frontier, so nothing sends and the display freezes on the last record. Hence
-  `loop_epoch`, bumped on each wrap, which the sender watches to rearm
-  `last_sent` — the job `pending_seek` does for a seek. Measured with that
-  rearm removed: `[8, 3, 4, 5, 6, 7, 8]` and then nothing, against 60 laps with
-  it. NB a test that counts arrivals at the FRONTIER cannot see that failure —
-  the live frame already in flight when the seek was sent is itself the
-  frontier, so a dead loop reads as two passes; count arrivals at the START.
+  re-attaches to the frontier and rolls into computation. **Rewinding `cursor`
+  alone STALLS the loop silently** — the sender walks forward from `last_sent`,
+  which is still at the frontier, so nothing sends and the display freezes.
+  Hence `loop_epoch`, bumped on each wrap, which the sender watches to rearm
+  `last_sent`. NB a test that counts arrivals at the FRONTIER cannot see that
+  failure — the live frame already in flight when the seek was sent is itself
+  the frontier, so a dead loop reads as two passes; count arrivals at the START.
   Pinned by `test_loop_replays_the_same_region_instead_of_stopping`.
-  The transport must stay
-  responsive under full frame backpressure: control JSON (status echoes)
-  is flushed BEFORE frame sends each tick, play/pause are echoed
-  immediately, replay batches are wall-clock-budgeted (~0.2 s) and
-  preempted by pause/seek, and the client flips the transport button
-  optimistically on play/pause. The delay dial is settable only while
-  PAUSED (pause → change → resume) and its thumb is local UI state,
-  re-synced from status when idle. Binary layout in
-  `core/protocol.py`, mirrored by `frontend/src/lib/protocol.ts` and
-  cross-checked via `scripts/gen_fixture.py` + the frontend vitest.
+  The transport must stay responsive under full frame backpressure: control JSON
+  is flushed BEFORE frame sends each tick, play/pause are echoed immediately,
+  replay batches are wall-clock-budgeted (~0.2 s) and preempted by pause/seek,
+  and the client flips the transport button optimistically. The delay dial is
+  settable only while PAUSED and its thumb is local UI state, re-synced from
+  status when idle. Binary layout in `core/protocol.py`, mirrored by
+  `frontend/src/lib/protocol.ts` and cross-checked via `scripts/gen_fixture.py`
+  + the frontend vitest. Measurements in `notes/session-lifecycle.md`.
 - **Record grid**: τ_k = t1 + k·record_dt. Each variant (1–4 worker
   threads: quantum/classical × rel/non-rel) integrates with its own
   adaptive dt (`adjust_step`, every 20 steps) but lands exactly on each τ_k
@@ -204,48 +214,46 @@ source) is what keeps startup fast. See `README.md`.
   portrait (808 px against setup 758, IC 557), so a row spent there was a row
   the panels started later by.
 - **Boundary watch / auto-expand** (`core/boundary.py`): detection is
-  ALWAYS on — every record, each worker sums the outer edge band of the
-  ρ/φ marginals it already computed (host-side, O(Nx+Np), no extra device
-  sync) and `session.report_edge` posts a `boundary` WS event on state
-  change (band = max(4, N/32) cells/side, trigger 1e-6 in float64 and 1e-4
-  in float32 via `EDGE_THRESHOLD_BY_PRECISION`; **gated on a MEASURED noise
-  floor and confirmed over `EDGE_CONFIRM`=4 records** — see the
-  edge-noise-floor gotcha, which is what stops a coarse 2D grid strobing the
-  warning — expansion
-  prevents wrap, it cannot repair it, so it must fire while edge mass is
-  negligible). The `auto_expand` toggle (SessionCreate field AND
-  live-appliable via ParamChange) governs only the RESPONSE: an exact
-  fixed-lattice regrid. **It is refused outright in float32** — single
-  precision cannot supply the measurements it needs; see the float64/float32
-  gotcha for the numbers. dx/dp and the lattice anchor are FROZEN at session
-  creation (`GridState`, integer window arithmetic; extents materialize as
-  anchor + integer·dx, and `Grid` takes explicit dx/dp + anchors so overlap
-  lattice points are bitwise-identical across regrids); move = whole-cell
-  window shift, expand = double an axis (powers of 2, support centered,
-  combined move+double; NO shrink, NO interpolation ever — norm/E/purity
-  survive to machine precision minus the ≤threshold dropped tails). The
-  session commits a `RegridPlan(epoch, k_star, state)` with k_star past
-  every in-flight record; each worker applies it before computing its
-  first record ≥ k_star (`embed_window` + `Propagator.set_grid`), so the
-  switch is lockstep-uniform and records <k_star stay old-geometry. U is
-  revalidated on the union extended Bopp range BEFORE commit (refusal ⇒
-  `invalid_potential` warning, keep computing). **Plan commits and physics
-  commits are mutually exclusive** (both hold `_edge_lock` for their whole
-  body, and `apply_params` orders physics BEFORE any immediate schedule):
-  U/hbar_eff move the Bopp range, a plan validated under stale physics
-  would hit the deliberately-fatal non-finite check at k_star (a per-worker
-  rollback there would desync lockstep geometry), so a pending plan's union
-  window is revalidated under incoming physics and the change is REJECTED
-  if it does not hold — this also closes the race of a plan committing
-  during the streamer's ~ms validation compile. Expansion caps at
-  `WIGNERF_MAX_GRID` (`capped` warning, keep computing; pure moves still
-  work at the cap). Geometry is a PER-RECORD fact: protocol v3 headers
-  carry Nx/Np/x1/x2/p1/p2, history stores geom per record, the streamer
-  packs from the record (never the session), and the frontend follows the
-  PAINTED frame (panels/overlays/marginal axes re-derive per frame;
-  zoom windows remap to the same physical region) — so scrubbing across a
-  regrid boundary just works. Each doubling ≈ 4× step cost and 4×
-  bytes/record (the history cap then holds ¼ the records).
+  ALWAYS on — every record, each worker sums the outer edge band of the ρ/φ
+  marginals it already computed (host-side, O(Nx+Np), no extra device sync) and
+  `session.report_edge` posts a `boundary` WS event on state change (band =
+  max(4, N/32) cells/side, trigger 1e-6 in float64 and 1e-4 in float32 via
+  `EDGE_THRESHOLD_BY_PRECISION`; **gated on a MEASURED noise floor and confirmed
+  over `EDGE_CONFIRM`=4 records** — see the edge-noise-floor gotcha, which is
+  what stops a coarse 2D grid strobing the warning). Expansion prevents wrap, it
+  cannot repair it, so it must fire while edge mass is negligible.
+  The `auto_expand` toggle (SessionCreate field AND live-appliable via
+  ParamChange) governs only the RESPONSE: an exact fixed-lattice regrid. **It is
+  refused outright in float32** — single precision cannot supply the
+  measurements it needs.
+  dx/dp and the lattice anchor are FROZEN at session creation (`GridState`,
+  integer window arithmetic; extents materialize as anchor + integer·dx, so
+  overlap lattice points are bitwise-identical across regrids); move =
+  whole-cell window shift, expand = double an axis (powers of 2, support
+  centered, combined move+double; NO shrink, NO interpolation ever — norm/E/
+  purity survive to machine precision minus the ≤threshold dropped tails). The
+  session commits a `RegridPlan(epoch, k_star, state)` with k_star past every
+  in-flight record; each worker applies it before computing its first record ≥
+  k_star (`embed_window` + `Propagator.set_grid`), so the switch is
+  lockstep-uniform and records <k_star stay old-geometry. U is revalidated on
+  the union extended Bopp range BEFORE commit (refusal ⇒ `invalid_potential`
+  warning, keep computing).
+  **Plan commits and physics commits are mutually exclusive** (both hold
+  `_edge_lock` for their whole body, and `apply_params` orders physics BEFORE
+  any immediate schedule): U/hbar_eff move the Bopp range, a plan validated
+  under stale physics would hit the deliberately-fatal non-finite check at
+  k_star (a per-worker rollback there would desync lockstep geometry), so a
+  pending plan's union window is revalidated under incoming physics and the
+  change is REJECTED if it does not hold — this also closes the race of a plan
+  committing during the streamer's ~ms validation compile. Expansion caps at
+  `WIGNERF_MAX_GRID` (`capped` warning, keep computing; pure moves still work at
+  the cap).
+  Geometry is a PER-RECORD fact: protocol headers carry the axis counts and
+  extents, history stores geom per record, the streamer packs from the record
+  (never the session), and the frontend follows the PAINTED frame (panels/
+  overlays/marginal axes re-derive per frame; zoom windows remap to the same
+  physical region) — so scrubbing across a regrid boundary just works. Each
+  doubling ≈ 4× step cost and 4× bytes/record.
 - **Export panel** (header button "⤓ export") carries two things: the mp4
   below, and the run's SETUP — `GET /sessions/{id}/setup` serves
   `describe.setup_document`, the config the session was CREATED with
@@ -280,272 +288,194 @@ source) is what keeps startup fast. See `README.md`.
   BACKEND — matplotlib/Agg frames piped as raw RGBA into ffmpeg (system
   ffmpeg, absence ⇒ 503). PAUSED-only (409 while running): a running session
   evicts old records, and the feature is for filming a range you already
-  played back.
+  played back. **Read `notes/export.md` before changing any of it** — every
+  figure below was measured, and the note says how.
   **WHAT GOES IN THE FRAME IS A CHOICE** (`ExportSpec.planes` /
-  `.diagnostics`, M4, 2026-07-28), because a 2D record carries far more than a
-  frame can hold: six planes × four variants is 24 panels, and the diagnostics
-  column has NINE plots against 1D's five. The SPA answers that by scrolling
-  its column and offering two panel readings; a video frame can do neither.
+  `.diagnostics`), because a 2D record carries far more than a frame can hold:
+  six planes × four variants is 24 panels against a column of NINE diagnostics.
   So **panels are the CARTESIAN PRODUCT of the selected planes and variants**,
   which makes `PanelGrid`'s two readings the two EDGES of one control rather
   than modes the renderer has to know about — "compare variants" is one plane ×
   every variant, "phase portrait" is every plane × one variant, and the Export
   panel offers both as one-click presets that just set the checkboxes.
-  `render_mpl.panel_grid` REFLOWS by count when one dimension is 1 (so 1D and
-  "compare variants" keep the 1×1/1×2/2×2 tiling the figure always had, and six
-  planes give the 3×2 the phase portrait shows on screen) and otherwise lays out
-  the matrix itself, rows = planes. Diagnostics are plot ids shared VERBATIM
-  with `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`, `uncertainty0/1`,
-  `purity`, `lz`) — one vocabulary for the hidden-series preferences, the export
-  wire and the metadata block — and an EMPTY list is legal (a panels-only
-  video). **The 2D default drops the four marginals, and that is a physical
+  `render_mpl.panel_grid` REFLOWS by count when one dimension is 1 and otherwise
+  lays out the matrix itself, rows = planes. Diagnostics are plot ids shared
+  VERBATIM with `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`,
+  `uncertainty0/1`, `purity`, `lz`) — one vocabulary for the hidden-series
+  preferences, the export wire and the metadata block — and an EMPTY list is
+  legal. **The 2D default drops the four marginals, and that is a physical
   argument, not a space-saving one**: at ndim=2 the (x,y) and (px,py) PANELS
-  already ARE the spatial and momentum densities, so ρ(x) is a further reduction
-  of something a panel is showing, and dropping them keeps the frame's shape
-  (one 5-row column, panels at `[0.045, 0.60]`) identical to 1D's. Past
-  `DIAG_ROWS_MAX` = 7 plots the column splits in two and the panels pay for it
-  in width (`diag_layout`); the Export panel states the resulting panel count
-  and approximate pixel size and warns when they become thumbnails. Both
-  refusals live in `routers/export.py` and not in the schema, for the reason the
-  `variants` check does: what is available depends on the session's ndim, which
-  the request body does not carry — and both name what IS available, since a 1D
-  session has one plane and no ⟨Lz⟩ and neither is guessable from the index that
-  failed. `RangeStats` is keyed to match: `scale[(variant, plane)]` and
-  `uncert[(variant, dim)]`, `marg_max` per axis, `lo`/`hi` per axis.
-  **The frame RENDER, not the encode, is the bottleneck** (measured 4-var 1024²:
-  ~410 ms/frame render at 4K vs 34–109 ms to encode, and the encode already
-  overlaps via the pipe; 363 ms of the render is the four `imshow` panels). So
-  export renders frames across a `ProcessPoolExecutor` (`export_workers`,
-  `WIGNERF_EXPORT_WORKERS`, auto = min(cpu, 8)) while this thread feeds the
-  ORDERED frames to one ffmpeg — a sliding window of ≤w+2 futures consumed FIFO
-  by `.result()` (workers run ahead, memory bounded). Measured ~3× (4K/4-var
-  2.2 → ~7 fps; 1080p 3.3 → ~9-10 fps). The pool is **spawn, NOT fork** — the
-  backend initializes CUDA and forking after that inherits a broken context;
-  spawn workers only touch matplotlib/numpy (never cupy — `xp` imports it
-  lazily). A small job (`< max(2·w, POOL_MIN_FRAMES=16)`) renders serially
-  in-process to skip the ~1-2 s pool warmup (`_render_serial`). Encoder via
-  `choose_encoder`/`WIGNERF_EXPORT_ENCODER` (auto|cpu|nvenc): auto uses the GPU
-  **`h264_nvenc` encoder** if a one-shot runtime probe passes (`_nvenc_ok`,
-  cached — the encoder can be built-in yet fail with no driver/GPU, e.g. the
-  VPS), else `libx264 -preset veryfast -crf 18` (was `medium`; ~2× faster, file
-  ~7% larger, visually identical for this smooth content, and frees cores for
-  the render pool). NB the GPU path is the h264_nvenc ENCODER, NOT ffmpeg
-  `-hwaccel` — that is a DECODE flag and does nothing for our rawvideo input.
+  already ARE the spatial and momentum densities. Past `DIAG_ROWS_MAX` = 7 the
+  column splits in two and the panels pay for it in width (`diag_layout`); the
+  panel states the resulting count and pixel size and warns about thumbnails.
+  Both refusals live in `routers/export.py` and not in the schema, because what
+  is available depends on the session's ndim, which the request body does not
+  carry — and both name what IS available.
+  **The frame RENDER, not the encode, is the bottleneck**, so export renders
+  frames across a **spawn** `ProcessPoolExecutor` (`WIGNERF_EXPORT_WORKERS`,
+  auto = min(cpu, 8)) while this thread feeds ORDERED frames to one ffmpeg —
+  a sliding window of ≤w+2 futures consumed FIFO, so workers run ahead with
+  memory bounded. Spawn, NOT fork: the backend initializes CUDA and forking
+  after that inherits a broken context; spawn workers only touch
+  matplotlib/numpy. A small job (`< max(2·w, POOL_MIN_FRAMES=16)`) renders
+  serially in-process to skip the ~1-2 s warmup. Encoder via
+  `choose_encoder`/`WIGNERF_EXPORT_ENCODER`: auto uses the GPU **`h264_nvenc`
+  ENCODER** if a one-shot runtime probe passes (`_nvenc_ok`, cached — it can be
+  built-in yet fail with no driver), else `libx264 -preset veryfast -crf 18`.
+  NB that is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel`, which is a DECODE
+  flag and does nothing for our rawvideo input.
   Two passes: a scan collects the E/ΔX·ΔP/γ series, the per-variant FIXED colour
   scale (no brightness flicker), the fixed marginal amplitudes and the widest
   window any record used, and proves every record is still retained before
   ffmpeg starts; then one figure update per frame. Only VALUE scales are
   export-wide — the SPATIAL axes follow each record's own geometry
   (`_apply_geom`, which also re-captures the blit background since ticks are
-  static art), exactly as the SPA follows the painted frame; freezing them at
-  the union rendered every frame before an auto-expansion as a stamp in the
-  corner of its panel, and the union now only labels the metadata block. The
-  figure is built ONCE and BLITTED (static background + ~15 animated artists):
-  465 → ~17-80 ms/frame measured at FHD (~320 ms at 4K, 4 variants), the
-  difference between minutes and half an hour for a 1000-frame export.
+  static art), exactly as the SPA follows the painted frame. The figure is built
+  ONCE and BLITTED (static background + ~15 animated artists), the difference
+  between minutes and half an hour for a 1000-frame export.
   Sizes offered: FHD / QHD / 4K UHD. The figure is always 19.2×10.8 in and
-  the RESOLUTION RIDES ON THE DPI (`FrameFigure.REF_WIDTH`) — font sizes
-  are in points, so a fixed dpi would render every label at half its
-  relative size at 4K. The downloaded name is descriptive
-  (`wignerf-QN-QR-CN-CR-41rec-3840x2160-20260722-0107.mp4`, via
-  `Content-Disposition`) while the on-disk path keeps session+job ids: two
-  exports of the same range in one minute must not collide, least of all
-  while one is being downloaded. Frame content mirrors the SPA (panels +
-  marginals + series with a time cursor, variant colours/dashes from
-  `lib/variants.ts`, the shader's symmetric bwr scale) plus a metadata
-  block. The SPA carries the same cursor at the PAINTED frame's t
-  (`SeriesPlot.vue`, `.wf-tcursor`): a DOM element in uPlot's `over` layer,
-  moved by one transform write per frame — a canvas artist would cost a full
-  `u.redraw()` (re-pathing every series) at display rate, and `over` clips
-  it when a zoom scrolls it out of view.
-  The video must READ like the screen: every plot title comes from
-  `core/axes.py`, the same source `lib/axes.ts` mirrors for
-  `SeriesPlot.vue`/`MarginalsPlot.vue` (γ keeps the UI's
-  "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²; ⟨Lz⟩ got the
-  `axes.lz_title` the backend had been missing, restoring the three-way
-  mirror), field labels match the Setup panel (ℏ, "batch"), and the series
-  y-window + tick decimals reproduce that component's `scales.y.range` rule
-  (`render_mpl.series_ylim`) — matplotlib's own autoscale renders a 2e-5 purity
-  drift as a dramatic dive with a "×10⁻⁵+1" offset where the UI shows a flat
-  line at 1.000000, from byte-identical data. The "grid lines on plots" toggle
-  rides along in `ExportSpec.show_grid` and governs EVERY plot in the frame —
-  charts get uPlot's grid stroke (`--wf-chart-grid`, so it follows the theme
-  like the rest of the chrome; see the Theming bullet), the W panels get
-  `GridOverlay.vue`'s theme-INDEPENDENT rgba(120,120,120,.28/.55-at-zero) drawn
-  AFTER the image (matplotlib puts the axes grid under it, which is why the
-  heatmaps first had none; the lines are animated artists ordered behind the
-  images in `_dynamic`). Mirror any change to those rules on both sides.
-  The block carries U(x), parameters, the IC as an analytic expression
-  (`core/describe.py`; cat states print ψ(x,0), the compact complete form),
-  and any live parameter change inside the range (`session.param_log`) —
-  so one frame documents the whole run; the same facts go into the mp4
-  `comment` tag as JSON. It is anchored at `FrameFigure.META_TOP` with
-  `va="top"` and grows DOWNWARD, so nothing stopped it running off the bottom
-  edge: at 8 pt and linespacing 1.6 a line advances 0.016461 of the height, so
-  **11 lines fit**. `param_lines` grows by one line per live parameter change
-  plus the float32 PREVIEW line, and a 4-variant cat run with 4 live changes
-  measures **10 lines in float64, 11 in float32** — a realistic export sat
-  exactly at the edge and one more change clipped in silence. `_meta_fontsize`
-  now shrinks to fit (one size for BOTH columns, so they stay matched, derived
-  from `get_figheight()` so a non-16:9 export keeps the full 8 pt), and past a
-  5 pt floor `_meta_fit` elides with "… +N more lines — full detail in the mp4
-  comment tag", an honest pointer because `describe.config_json` really does
-  carry all of it. Static art, baked into the blit background: no per-frame cost.
+  the RESOLUTION RIDES ON THE DPI (`FrameFigure.REF_WIDTH`) — font sizes are in
+  points, so a fixed dpi would render every label at half its relative size at
+  4K. The downloaded name is descriptive (via `Content-Disposition`) while the
+  on-disk path keeps session+job ids: two exports of the same range in one
+  minute must not collide, least of all while one is being downloaded.
+  **The video must READ like the screen**: every plot title comes from
+  `core/axes.py`, the same source `lib/axes.ts` mirrors (γ keeps the UI's
+  "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²), field labels
+  match the Setup panel, and the series y-window + tick decimals reproduce that
+  component's `scales.y.range` rule (`render_mpl.series_ylim`) — matplotlib's
+  own autoscale renders a 2e-5 purity drift as a dramatic dive with a "×10⁻⁵+1"
+  offset where the UI shows a flat line at 1.000000, from byte-identical data.
+  The "grid lines on plots" toggle rides along in `ExportSpec.show_grid` and
+  governs EVERY plot in the frame — charts get uPlot's grid stroke, the W panels
+  get `GridOverlay.vue`'s theme-INDEPENDENT lines drawn AFTER the image
+  (matplotlib puts the axes grid under it, which is why the heatmaps first had
+  none). Mirror any change to those rules on both sides.
+  The metadata block carries U(x), parameters, the IC as an analytic expression
+  (`core/describe.py`), and any live parameter change inside the range
+  (`session.param_log`) — so one frame documents the whole run; the same facts
+  go into the mp4 `comment` tag as JSON. It is anchored at `FrameFigure.META_TOP`
+  with `va="top"` and grows DOWNWARD, and **11 lines fit at 8 pt**; a realistic
+  4-variant run sits at the edge, so `_meta_fontsize` shrinks to fit (one size
+  for BOTH columns, derived from `get_figheight()`) and past a 5 pt floor
+  `_meta_fit` elides with a pointer to the comment tag, an honest one because
+  `describe.config_json` really does carry all of it. `describe.IC_SRC_MAX`
+  caps an IC expression against the same budget, in PHYSICAL lines and measured
+  — see its comment. Static art, baked into the blit background: no per-frame
+  cost.
   Progress: `export` events on the session WS plus a REST poll; the file lives
   in `WIGNERF_EXPORT_DIR` until downloaded, TTL (30 min), session close or
   shutdown. The header button stays ENABLED while computing (a disabled button
   explained only by a tooltip is how this feature first read as broken): the
   panel states the gate and "Pause & render" pauses, waits for the server to
   confirm and re-seeds an untouched range before posting. Rendering continues
-  while the popover is CLOSED (the poll and the WS events keep updating), so the
-  button IS the notification — "⤓ export 42%" while running, emerald "⤓ export
-  ready" (red "failed") when finished, and reopening it collects the file; a
-  finished job survives reopening and is dropped only by a new render or a
-  session change (a restart deletes the old session's files). The panel re-reads
-  the extent from `GET /sessions/{id}` when it opens — the streamed status lags
-  a frame burst by up to seconds after a pause, and seeding the range from it
-  silently exported half the history.
+  while the popover is CLOSED, so the button IS the notification — "⤓ export
+  42%" while running, emerald "⤓ export ready" (red "failed") when finished. The
+  panel re-reads the extent from `GET /sessions/{id}` when it opens — the
+  streamed status lags a frame burst by up to seconds after a pause, and seeding
+  the range from it silently exported half the history.
+  **The mp4 export follows the UI theme** (`ExportSpec.theme`, defaulted from
+  the app every time the Export panel opens and overridable per job — never
+  persisted, or it would stop tracking). Its schema default is `light`, matching
+  the SPA's. It threads the same path `show_grid` does, down to
+  `render_mpl.FrameFigure(theme=)`, which resolves `PALETTE[theme]` once.
+  `render_mpl`'s `PALETTE`/`VARIANT_COLORS` MIRROR the `--wf-*` values (it
+  cannot read our stylesheet) — change a colour on one side and change it on the
+  other.
 - **Theming (light/dark)**: a header button (`☀ light` / `☾ dark`) flips the
   whole UI; **light is the DEFAULT** and the choice persists in
-  `localStorage.wignerf.theme`, a sibling of `wignerf.layout`/`wignerf.grid`
-  and so untouched by "Reset setup to defaults". **CSS is the single source of
-  truth**: `frontend/src/style.css` defines every colour once per theme as
-  `--wf-*` on `:root` (light) and `.dark`, and a Tailwind 4 `@theme inline`
-  block turns them into semantic utilities (`bg-panel`, `text-fg-3`,
-  `border-line`, `text-warn`, …). **`inline` is load-bearing** — a plain
-  `@theme` copies the VALUE in at build time and a runtime override then
-  changes nothing. There are ~15 roles, not 200 literals: the migration
-  replaced 217 hard-coded `neutral-*`/accent utilities with them, so
-  `grep -rn 'neutral-\|#[0-9a-f]\{6\}' frontend/src` should now only find the
-  legitimate remainder (below).
+  `localStorage.wignerf.theme`, a sibling of `wignerf.layout`/`wignerf.grid` and
+  so untouched by "Reset setup to defaults". Details and the migration numbers
+  are in `notes/ui-notices.md`.
+  **CSS is the single source of truth**: `frontend/src/style.css` defines every
+  colour once per theme as `--wf-*` on `:root` (light) and `.dark`, and a
+  Tailwind 4 `@theme inline` block turns them into semantic utilities
+  (`bg-panel`, `text-fg-3`, `border-line`, `text-warn`, …). **`inline` is
+  load-bearing** — a plain `@theme` copies the VALUE in at build time and a
+  runtime override then changes nothing. There are ~15 roles, not 200 literals.
   State lives in `frontend/src/lib/theme.ts` — a module-singleton `ref`, NOT a
-  prop like `showGrid`, because the uPlot option builders need it too and
-  half a dozen components read it at once. `chartPalette()` reads the
-  `--wf-chart-*` properties back off the document, so JS duplicates no value;
-  it must run AFTER the root class is applied, hence a function called per
-  chart build (one `getComputedStyle`, never per frame) with literal fallbacks
-  for the DOM-less unit tests. That ordering is why `setTheme`/`toggleTheme`
-  apply the root class SYNCHRONOUSLY as well as from the watch: `chartPalette`
-  CACHES per theme name, so one read taken before the class landed would pin
-  the wrong palette for the life of the page — not a one-frame glitch. The
-  watch alone happens to win that race (a watcher created outside a component
-  has no job id, so its pre-flush job sorts ahead of the components'), but
-  nothing should rest on a Vue scheduler detail, and `apply` is idempotent.
-  **The charts destroy+rebuild** on a theme change
-  — uPlot takes axis/grid/series colours at construction only — by widening the
-  watch the grid-lines toggle already had (`[() => props.showGrid, theme]` in
-  `SeriesPlot`/`MarginalsPlot`, `watch(theme, …)` in `PotentialEditor`; all
-  three re-apply their existing data to the new chart rather than re-fetching
-  it — `PotentialEditor` from `result.samples`, or the U(x) trace blanks for a
-  round-trip on every flip). The
-  theme is deliberately NOT in `SimulatorView`'s `plotsKey`, for the reason the
-  note there gives: a flip must never remount/blank the W panels.
-  `index.html` applies the stored class in a **blocking inline script**,
-  because `main.ts` is a deferred module and a dark user would otherwise get a
-  white flash on every load; it also declares `color-scheme`, which fixes a
-  standing dark-mode bug (native `<select>`/`<input type=range>` widgets were
-  rendering in the OS's LIGHT style over the dark UI).
+  prop like `showGrid`, because the uPlot option builders need it too.
+  `chartPalette()` reads the `--wf-chart-*` properties back off the document, so
+  JS duplicates no value; it must run AFTER the root class is applied, hence a
+  function called per chart build (one `getComputedStyle`, never per frame) with
+  literal fallbacks for the DOM-less unit tests. That ordering is why
+  `setTheme`/`toggleTheme` apply the root class SYNCHRONOUSLY as well as from
+  the watch: `chartPalette` CACHES per theme name, so one read taken before the
+  class landed would pin the wrong palette for the life of the page — not a
+  one-frame glitch. Nothing should rest on a Vue scheduler detail, and `apply`
+  is idempotent.
+  **The charts destroy+rebuild** on a theme change — uPlot takes axis/grid/
+  series colours at construction only — by widening the watch the grid-lines
+  toggle already had; all of them re-apply their existing data to the new chart
+  rather than re-fetching it. The theme is deliberately NOT in `SimulatorView`'s
+  `plotsKey`: a flip must never remount/blank the W panels.
+  `index.html` applies the stored class in a **blocking inline script**, because
+  `main.ts` is a deferred module and a dark user would otherwise get a white
+  flash on every load; it also declares `color-scheme`, which fixes native
+  `<select>`/`<input type=range>` widgets rendering in the OS's LIGHT style.
   **What does NOT follow the theme, on purpose**: the bwr heatmap LUT
-  (`lib/colormaps.ts`, `Colorbar.vue`, mpl `cmap="bwr"`) — blue-white-red with
-  W = 0 at white is the physics convention — and therefore everything drawn ON
-  the heatmap rather than on the page: `GridOverlay.vue`'s
-  `rgba(120,120,120,.28/.55)` lines and grey glyphs, `Colorbar.vue`'s
-  `bg-black/70 text-white` chrome, `WignerPanel`/`PanelGrid`'s `bg-black/75`
-  overlay labels, and `ICEditor`'s IC-marker rings. Saturated filled action
-  buttons (`bg-sky-700`, `bg-pink-800` Solve, `bg-emerald-700`, `bg-red-800`,
-  white text) also stay put — they read correctly on white. What DOES change
-  and is easy to miss: **variant curve colours**
-  (`lib/variants.ts` `VARIANT_COLORS`, Tailwind `*-400` on dark → `*-600` on
-  light, because `#fbbf24` amber on white is unreadable) via `variantColor()`,
-  and the Timeline readouts' halo (`--wf-label-shadow` inverts, or it smears
-  the text instead of separating it from the bar).
-  **The mp4 export follows the UI theme** (`ExportSpec.theme`, defaulted from
-  the app every time the Export panel opens and overridable per job — it is
-  never persisted, or it would stop tracking). Its schema default is `light`,
-  matching the SPA's: the panel always sends the field, so that default is only
-  what a direct API call gets, and it should get what a first-time browser
-  does. It threads the same path
-  `show_grid` does: `ExportPanel` → `protocol.ExportSpec` →
-  `videoexport._worker_init`/`_render_serial` → `render_mpl.FrameFigure(theme=)`,
-  which resolves `PALETTE[theme]` once into `self.pal` and passes it to
-  `_style_axes`. `render_mpl`'s `PALETTE`/`VARIANT_COLORS` MIRROR the `--wf-*`
-  values (it cannot read our stylesheet) — change a colour on one side and
-  change it on the other. Two module-level style blocks moved into
-  `style.css` in the process, `.wf-num` (was inside `ICEditor.vue`, styles every
-  input in three components) and `.wf-plot .u-*` (was inside `MarginalsPlot.vue`,
-  styled all three charts).
+  (blue-white-red with W = 0 at white is the physics convention) and therefore
+  everything drawn ON the heatmap rather than on the page — `GridOverlay.vue`'s
+  grey lines, `Colorbar.vue`'s chrome, the panels' overlay labels, `ICEditor`'s
+  IC-marker rings. Saturated filled action buttons stay put too; they read
+  correctly on white. What DOES change and is easy to miss: **variant curve
+  colours** (`lib/variants.ts`, `*-400` on dark → `*-600` on light, because
+  `#fbbf24` amber on white is unreadable) via `variantColor()`, and the
+  Timeline readouts' halo (`--wf-label-shadow` inverts).
+  **A data trace gets its OWN role, never a borrowed one.** `--wf-wave-re/im/abs`
+  are three roles for three series precisely so that adjusting the time cursor
+  cannot silently repaint |ψ|² in a chart it has nothing to do with.
 - **Parameter policy**: U, c, mass, hbar_eff, tol, dt_sign, auto_expand
   apply live at the frontier; **ndim**/grid/IC/variant-set and the whole COMPUTE
   group (precision, device, history_mb — the Setup panel's third section)
   require a session restart, because each is fixed at worker construction (FFT
   plan dtype, `ArrayBackend` device, `FrameHistory` cap). Auto-expand moves the
   LIVE grid; the Setup panel shows it and offers "adopt" to copy it into the
-  form. ndim is the most restart-only of them all — it decides the array rank —
-  and switching it in the form rebuilds the grid and the IC (`config.setNdim`,
-  mirroring each component's second dimension on its first, i.e. the separable
-  product of what was there) and replaces U **only if it was still the default**,
-  since `x^2/2` cannot silently become a two-variable expression and a
-  hand-written potential must never be discarded.
+  form. **The panel's own layout arithmetic and the UI archaeology behind these
+  rules are in `notes/ui-notices.md`** — including why COMPUTE is the one
+  section with labels above its controls, and why the column is 320px.
+  ndim is the most restart-only of them all — it decides the array rank — and
+  switching it in the form rebuilds the grid and the IC (`config.setNdim`,
+  mirroring each component's second dimension on its first) and replaces U
+  **only if it was still the default**, since `x^2/2` cannot silently become a
+  two-variable expression and a hand-written potential must never be discarded.
+  The same rule governs the two IC EXPRESSION drafts, with one extra condition:
+  "still at the other ndim's default" is a good proxy for "untouched" only on an
+  EXPLICIT switch, so `conformICExprToNdim` takes the set of drafts the caller
+  was just handed and never repoints those (`DEFAULT_IC_EXPR[1].psi` is itself a
+  legal 2D expression, so on a page load or an import the proxy discarded text
+  the user had typed, or the document had carried).
   **The BOX follows the same "only if untouched" rule, and for a sharper
-  reason**: a still-default box is replaced by the TARGET ndim's default, because
-  carrying [-6,6] into 2D reproduces exactly what `DEFAULT_AXES[2]` was widened
-  to [-8,8] to avoid — the edge band is max(4, N/32) CELLS, so at N=64 the 4-cell
-  floor makes it 0.750 a.u. wide, only 4.60σ from the default packet at x0=2, and
-  a FRESH 2D default tripped its own boundary warning on the first Restart
-  (measured 3.78e-06 band mass against the 1e-6 trigger; analytic tail 2.15e-06 —
-  real mass and a CORRECT warning, not detector noise; at [-8,8] the same band
-  sits at 7.07σ and reads 2.12e-12). A box the user CHOSE still carries over
-  untouched: silently widening someone's domain is worse than a warning. **N
-  lands inside the TARGET's own select list**: their own choice when it is
-  offerable there, capped at that ndim's default (a 1D 1024 would be 1.1e12 cells
-  at ndim=2), and the target's DEFAULT when it is not — never the list's floor,
-  which would quarter the resolution of anyone who started at the 1D default
-  (1024², since 2026-08-01) and merely looked at 2D. See the
-  `WIGNERF_MAX_GRID_2D` row for the hole that carrying a 2D 64 into 1D left in
-  the select. Pinned in `config.test.ts`.
+  reason**: a still-default box is replaced by the TARGET ndim's default,
+  because carrying [-6,6] into 2D reproduces exactly what `DEFAULT_AXES[2]` was
+  widened to [-8,8] to avoid — the edge band is max(4, N/32) CELLS, so at N=64
+  the 4-cell floor makes it only 4.60σ from the default packet, and a FRESH 2D
+  default tripped its own boundary warning on the first Restart. A box the user
+  CHOSE still carries over untouched: silently widening someone's domain is
+  worse than a warning. **N lands inside the TARGET's own select list**: their
+  own choice when it is offerable there, capped at that ndim's default, and the
+  target's DEFAULT when it is not — never the list's floor, which would quarter
+  the resolution of anyone who started at the 1D default and merely looked at
+  2D. Pinned in `config.test.ts`.
   **Every restart-only field goes amber when it disagrees with the session**,
   COMPUTE included — a form reading `cuda:0` over a session on `cuda:1` is the
   same trap as one reading float64 over a float32 run. `precision` gets it via
   `LiveRun`, but `device` and `history_mb` cannot: the form holds a REQUEST
   (`''` = the host's pool, `0` = its ceiling) while `status` reports what was
-  GRANTED (a resolved device list, a clamped cap). So `SetupPanel` resolves the
-  request the way the server would — `''` against the pool from `/api/device`'s
-  `devices` (hence `hostPool`, distinct from `choices`), a bare `cuda` to
-  `cuda:0` to match `resolve_devices`, and `history_mb` clamped to
-  `history_mb_max` so asking for 999999 on a 110000 host is not a "difference" —
-  and only then compares. One amber line names what is running, and only while
-  something differs.
-  **Each section's summary line covers its OWN fields.** `precision` lives in
-  `LiveRun` because that is where `status` carries it, but it is a COMPUTE
-  control: it triggers and is named by COMPUTE's line, and is deliberately absent
-  from `runStale` and from the RUN line's text. It used to be in both, so a plain
-  float64 → float32 switch raised THREE amber notes instead of two — the third
-  announcing "running: interactive (no t₂), Δt rec = 0.05" at a user who had
-  changed neither, which reads as the form having quietly moved something else.
-  The steady-state facts are NOT repeated in the panel: the devices and the
-  history cap ride the timeline's own `hist 0.1 / 107 GiB · dev: cuda:1, cuda:0`
-  readout, which is drawn anyway.
-  **The panel's column is 320px (`w-80`), and its grids are shaped to it.**
-  PHYSICS is `grid-cols-7`: m + c + ℏ on one row, tol + t dir on the next, with
-  c taking 3 of the 7 because it is the only field holding a long number
-  (137.035999 truncates at an equal third) and tol taking 4 because its LABEL
-  grows by " ≥1e-5" in float32. COMPUTE is `grid-cols-3` — precision, device,
-  history in one row — and is the ONE section that puts its label ABOVE the
-  control rather than beside it: those three labels are words, and a third of
-  320px does not fit "precision" plus a select reading "float64". Stacked it is
-  two lines where three full-width rows were three. history keeps its unit to
-  the RIGHT of the field; the "(0 = host max N)" that used to sit beside it
-  moved into `historyHelp`, the tooltip, which had to name that number anyway.
-  Verify layout changes here at the real width — headless Chrome, screenshot
-  the `<aside>`, and assert nothing's rect exceeds it (see the UI-debugging
-  note above); every field fits today with zero overflow.
+  GRANTED. So `SetupPanel` resolves the request the way the server would — `''`
+  against `/api/device`'s pool, a bare `cuda` to `cuda:0` to match
+  `resolve_devices`, `history_mb` clamped to `history_mb_max` — and only then
+  compares. One amber line names what is running, and only while something
+  differs. **Each section's summary line covers its OWN fields**: `precision`
+  lives in `LiveRun` because that is where `status` carries it, but it is a
+  COMPUTE control, and is deliberately absent from `runStale` and the RUN line.
+  The steady-state facts are NOT repeated in the panel — the devices and the
+  history cap ride the timeline's own readout, which is drawn anyway.
   `apply_params` echoes a fresh `status` right after its `params_applied`,
   exactly as play/pause do — the periodic one is only every `STATUS_PERIOD`
-  (1 s) and that check sits at the top of the sender's tick, so a field the form
-  marks amber against `status` could stay amber for a second or more after the
+  (1 s), so a field the form marks amber could stay amber for a second after the
   "✓ applied" flash had confirmed the change. Pinned by
-  `test_params_applied_is_followed_by_a_fresh_status`; measured in a browser at
-  256² while computing, click → `params_applied` is 12 ms, status 1 ms later.
+  `test_params_applied_is_followed_by_a_fresh_status`.
   `apply_params` compares against what is LIVE and drops the fields that did not
   change — no worker command, no `param_log` entry, no `params_applied`, and
   nothing at all if the whole message is a no-op (the UI sends complete fields;
@@ -553,56 +483,41 @@ source) is what keeps startup fast. See `README.md`.
   changes that never happened and an export's "how to reproduce this" block lied
   about its own frames). Entries carry `before` as well as `applied`, so the
   block renders "ℏ 1 → 2" and `describe.state_at` rewinds the header physics to
-  the FIRST exported record instead of quoting the values the run ended with.
-  Live changes are visible in the UI: the header flashes "✓ applied …", and any
-  live-appliable field whose form value differs from `status` renders amber — the
-  numeric Physics fields (which apply on blur/Enter) via `pending()`, and the
-  U(x) input via `PotentialEditor.isPending`.
+  the FIRST exported record. Live changes are visible in the UI: the header
+  flashes "✓ applied …", and any live-appliable field whose form value differs
+  from `status` renders amber.
   **U(x) is a LIVE-appliable parameter and has exactly ONE button.** It used to
-  have two, "Use at restart" beside "Apply live", both confusing for the same
-  reason: the draft was local to the editor, so the FORM did not mean what it
-  showed until you pressed the first one — while every other setting in the panel
-  is bound straight to `cfg`. The draft now auto-commits to `cfg.potential` from
-  `compile()`'s success path, gated on the server's verdict (a half-typed `x^2/`
-  must never reach `cfg`, which is persisted to localStorage and is what a
-  restart computes from) and on the response still describing the CURRENT text.
-  So U(x) no longer marks the session restart-dirty at all: it applies live, so
-  "restart to apply" was a false claim no successful Apply live could clear.
+  have two, both confusing for the same reason: the draft was local to the
+  editor, so the FORM did not mean what it showed until you pressed one — while
+  every other setting in the panel is bound straight to `cfg`. The draft now
+  auto-commits to `cfg.potential` from `compile()`'s success path, gated on the
+  server's verdict (a half-typed `x^2/` must never reach `cfg`, which is
+  persisted and is what a restart computes from) and on the response still
+  describing the CURRENT text. So U(x) no longer marks the session
+  restart-dirty at all.
   **Solve carries the form's U(x).** `SimulatorView.sendCommand` pushes
   `set_params {U: cfg.potential}` before a `play` whose action is `solve`,
-  whenever the form's (validated) U differs from `status.potential`. Without it
+  whenever the form's validated U differs from `status.potential`. Without it
   the form was authoritative for nothing: measured 369 records computed under
   `x^2/2` behind a form reading `x^2/2 + 5*x^4`, the only signal being an amber
   input in a panel that can be hidden. Playback is excluded — it computes
   nothing. So "Apply live" is gated on `status.computing`, NOT on `live` and NOT
   on `running`: while nothing computes there is no live run to reach and Solve
-  does the job, and an enabled button there invites a click that is at best
-  redundant and reads as the only way to make the new U count. The button exists
-  for the one case Solve cannot serve — a computation already in flight, which
-  you would otherwise pause. `computing`, because `running` is true during pure
-  PLAYBACK too (`running and not stop_at_frontier`), where the button's own
-  tooltip ("push this U(x) into the computation already in progress") would be
-  false; it is the same field batch mode dims the display on. Bonus:
-  `useSession`'s optimistic transport flip touches only `running`, so the button
-  stays briefly DISABLED after a Solve click rather than briefly enabled, the
-  safer direction to be wrong in. What is left is one emerald "Apply live",
-  disabled unless the session is COMPUTING AND the draft is valid AND it differs
-  from `status.potential`, with the reason in its `title` and **no standing
-  paragraph** — the old "already the live U(x) — edit it to enable …" line was on
-  screen at every page load, because that IS the steady state (see
-  [no-mystery-disabled-controls]: marker + tooltip + amber on the transition,
-  never permanent prose).
+  does the job. `computing`, because `running` is true during pure PLAYBACK too,
+  where the button's own tooltip would be false. What is left is one emerald
+  "Apply live", disabled unless the session is COMPUTING AND the draft is valid
+  AND it differs from `status.potential`, with the reason in its `title` and **no
+  standing paragraph** (see [no-mystery-disabled-controls]).
   The setup form gates the transport: while the potential draft is invalid for
   the active variant families or the IC preview errors, Solve (button AND Space)
   is disabled and "Apply live" is greyed — a computation must never run behind a
   visibly broken form.
-  **Every saturated action button carries `.wf-solid`** (`style.css`): Solve/
-  Play, Restart session, Apply live, Render. It supplies `color: #fff` — those
-  buttons never set a text colour, they INHERITED the shell's light text, which
-  went invisible ("black on blue") the moment the shell could be light — and a
-  disabled state that drops to the neutral raised surface, because
-  `disabled:opacity-40` over a saturated fill is pale colour under equally pale
-  text, unreadable in either theme.
+  **Every saturated action button carries `.wf-solid`** (`style.css`): it
+  supplies `color: #fff` — those buttons never set a text colour, they INHERITED
+  the shell's light text, which went invisible ("black on blue") the moment the
+  shell could be light — and a disabled state that drops to the neutral raised
+  surface, because `disabled:opacity-40` over a saturated fill is pale colour
+  under equally pale text, unreadable in either theme.
 - **Run modes: `interactive` vs `batch`** (SessionCreate `mode`; `batch`
   requires `t2`). Both start paused. INTERACTIVE computes until paused and
   streams a coalesced live preview (the newest complete record) so you can
@@ -642,22 +557,32 @@ source) is what keeps startup fast. See `README.md`.
   Setup persists in browser localStorage; "↺ defaults" (IC editor) and
   "Reset setup to defaults" (Setup panel) restore defaults in the form and
   mark the session restart-dirty.
-- **Potentials** (`core/potential.py`): tokenize-screen (security boundary)
-  → sympy parse → per-family validity. The Bopp arguments are REAL
-  (q_i ∓ ħθ_i/2, complex dtype only): quantum needs U real+finite on the
-  extended BOX (per spatial axis, [q1 − πħ/(2dk), q2 + πħ/(2dk)] with the
-  CONJUGATE axis's spacing; Abs is quantum-valid); classical needs EVERY
-  partial ∂U/∂q_i DiracDelta-free (Heaviside steps are quantum-only). At
-  ndim=2 the symbols are (x, y) and `grad_exprs` is the gradient tuple; `y` is
-  in the tokenizer's namespace at every ndim on purpose, so a 1D session that
-  types `x*y` gets the free-symbol message naming what IS allowed rather than a
-  tokenizer refusal that reads like a typo. **The numeric probe lattice uses an
-  ODD count per axis and forces an exact 0.0 onto any axis straddling the
+- **Potentials** (`core/potential.py`, on `core/expr.py`): tokenize-screen
+  (THE security boundary, shared with the two expression IC kinds — one screen,
+  three kinds of user expression; `potential.py` keeps the per-family VALIDITY
+  model, which is a potential's alone). The parser's vocabulary is the same for
+  every kind and only the free symbols and complex-ness differ, which is the
+  `y`-at-every-ndim rule applied consistently: `I*x` in a U is refused as "U(x)
+  must be a real expression", not "name 'I' is not allowed", because the user
+  knows what I means and the real check was never the tokenizer anyway
+  (`sqrt(-1)` evaluates to an explicit I without naming it). `hermite` is
+  whitelisted and its ORDER is capped — it is a Function in the unevaluated
+  parse, so the power screen cannot see it, and the evaluated parse materialises
+  the polynomial. Suppressing that needs BOTH `parse_expr(evaluate=False)` and
+  the `sp.evaluate(False)` CONTEXT: the keyword alone stops arithmetic
+  evaluation but not function application, so the screen received the expanded
+  polynomial it exists to refuse. Then: tokenize-screen → sympy parse →
+  per-family validity.
+  The Bopp arguments are REAL (q_i ∓ ħθ_i/2, complex dtype only): quantum needs
+  U real+finite on the extended BOX (per spatial axis, with the CONJUGATE axis's
+  spacing; Abs is quantum-valid); classical needs EVERY partial ∂U/∂q_i
+  DiracDelta-free (Heaviside steps are quantum-only). At ndim=2 the symbols are
+  (x, y) and `grad_exprs` is the gradient tuple. **The numeric probe lattice uses
+  an ODD count per axis and forces an exact 0.0 onto any axis straddling the
   origin**: the poles that matter in 2D sit on the axes and at the origin
   (`1/sqrt(x^2+y^2)`, `1/x`, `log(x)`) and an even lattice steps straight over
   them — and sympy's `singularities` is one-dimensional, so past ndim=1 the
-  lattice is most of the guard (the symbolic scan pins the other variables at a
-  few sample values, best effort).
+  lattice is most of the guard.
   **The preview endpoint's PLOT window and its VALIDITY boxes are two different
   things and must not be conflated.** `POST /api/preview/potential` takes
   `x1/x2` (and `y1/y2`) as what to SAMPLE — the editor zooms them, and zooming
@@ -673,13 +598,11 @@ source) is what keeps startup fast. See `README.md`.
   **At ndim=2 the editor draws the two axis cuts on TWO charts, not two traces**
   (`PotentialEditor.vue`): uPlot's `AlignedData` has ONE shared abscissa and
   these cuts do not share one — U(x, 0) is indexed by x over the zoom window,
-  U(0, y) by y over the grid's own y extent. Overlaid, the y cut was drawn at the
-  x sample positions, i.e. rescaled by (x2−x1)/(y2−y1) — invisible on the
-  isotropic default box, which is exactly why it looked right. Each chart's title
-  also names the coordinate its cut was actually TAKEN at (`nearestZero` picks
-  the sample closest to the origin, and a window zoomed away from it has none),
-  so `U(x, 0.4)` rather than a false `U(x, 0)`. 1D is untouched: one chart, one
-  trace.
+  U(0, y) by y over the grid's own y extent. Overlaid, the y cut was drawn at
+  the x sample positions, i.e. rescaled by (x2−x1)/(y2−y1) — invisible on the
+  isotropic default box, which is exactly why it looked right. Each chart's
+  title also names the coordinate its cut was actually TAKEN at (`nearestZero`),
+  so `U(x, 0.4)` rather than a false `U(x, 0)`. 1D is untouched.
 - **ICs** (`core/initial.py`): Gaussian mixtures (independent σ per axis) and
   cat states (analytic pairwise cross-Wigner; σ_k derived = ħ/(2σ_q) per
   dimension). **BOTH FACTORISE OVER DIMENSIONS, which is why 2D needed no new
@@ -691,6 +614,13 @@ source) is what keeps startup fast. See `README.md`.
   dimension — and because those cores are 2D arrays, only their product is ever
   full size, which is why the 2D IC preview measures LESS per cell than the 1D
   one (56 B/cell for a cat, 32 for a mixture, against 88 in 1D).
+  **TWO FURTHER KINDS ARE EXPRESSIONS** (2026-08-04): `wexpr`, an arbitrary
+  analytic W on the phase space, and `psi`, an arbitrary complex ψ on
+  configuration space from which W comes by the Wigner transform. Both
+  auto-normalise, both work at either ndim, and `core/expr.py` — the token
+  screen lifted out of `potential.py` — is now the ONE security boundary all
+  three kinds of user expression go through. See the expression-IC gotcha below
+  before touching `psi_wigner`.
 
 - **Purity** γ = (2πℏ_eff)^ndim ∫W² over the whole phase space (= Tr ρ²; so
   2πℏ∬W²dxdp in 1D and (2πℏ)²⨌W²dxdydpxdpy in 2D — the power per dimension is
@@ -703,141 +633,129 @@ source) is what keeps startup fast. See `README.md`.
   property of the TOTAL W (γ ≤ 1 necessary), never of its components.
 
 ## GPU
+`WIGNERF_DEVICE=auto|cpu|cuda:N|comma list` (config.py) names a device POOL.
+`core/xp.resolve_devices` expands it fastest-first (`auto` = all CUDA devices
+ranked by SM count; an explicit list is trusted as written) and
+`core/session.assign_devices` spreads variant workers over it: costliest
+variants (relativistic, then quantum) and the larger share go to the fastest
+card; each worker owns its own `ArrayBackend`, so no propagator code is
+device-aware. `core/xp.py` pins `CUDA_DEVICE_ORDER=PCI_BUS_ID` so indices match
+nvidia-smi (RTX 3090 = cuda:1, the display-driving 2080 Ti = cuda:0 here).
 
-`WIGNERF_DEVICE=auto|cpu|cuda:N|comma list` (config.py) names a device
-POOL. `core/xp.resolve_devices` expands it fastest-first (`auto` = all
-CUDA devices ranked by SM count; an explicit list like `cuda:1,cuda:0` is
-trusted as written) and `core/session.assign_devices` spreads variant
-workers over it: costliest variants (relativistic, then quantum) and the
-larger share go to the fastest card; each worker owns its own
-`ArrayBackend`, so no propagator code is device-aware. `core/xp.py` pins
-`CUDA_DEVICE_ORDER=PCI_BUS_ID` so indices match nvidia-smi (RTX 3090 =
-cuda:1, the display-driving 2080 Ti = cuda:0 on the main workstation).
-GPU deps: `cupy-cuda13x[ctk]` — the `[ctk]` extra is REQUIRED (cupy
-JIT-compiles kernels at runtime via NVRTC — never nvcc — and needs the
-PyPI CUDA headers/libs; NO system CUDA Toolkit anywhere, only the
-driver). Note: CUDA 13 dropped Maxwell/Pascal/Volta — the dev
-workstation's GTX 1060 (Pascal) needs `cupy-cuda12x[ctk]` instead.
-RTX 3090: ~2400 steps/s at 512², ~550 at 1024², ~134 at 2048²; 2080 Ti:
-~390 at 1024²; CPU (pyfftw): ~75 at 512². Measured 4-worker lockstep at
-1024²: 135 steps/s all-on-3090 vs 191 split 2+2 across the pair (+41%,
-and 2+2 beats 3+1's 181 — the even chunk is right); 2 workers: 270 vs
-376 (+39%).
+GPU deps: `cupy-cuda13x[ctk]` — the `[ctk]` extra is REQUIRED (cupy JIT-compiles
+kernels at runtime via NVRTC, never nvcc, and needs the PyPI CUDA headers/libs;
+NO system CUDA Toolkit anywhere, only the driver). CUDA 13 dropped
+Maxwell/Pascal/Volta, so the dev workstation's GTX 1060 needs
+`cupy-cuda12x[ctk]` instead.
+
+Throughput, RTX 3090: ~2400 steps/s at 512², ~550 at 1024², ~134 at 2048²;
+2080 Ti ~390 at 1024²; CPU (pyfftw) ~75 at 512². Multi-GPU is worth it:
+4-worker lockstep at 1024² measured 135 steps/s all-on-3090 against 191 split
+2+2 (+41%, and 2+2 beats 3+1's 181 — the even chunk is right).
+
 **WHETHER A 2D SESSION STARTS IS DECIDED BY ASKING THE DRIVER, not by a cell
-count** (`routers/sessions._fit_error`) — **and since M3 (2026-08-01) the same
-question is asked again whenever auto-expand wants to DOUBLE the grid.** The
-arithmetic behind both lives in `core/fit.py` so the two cannot drift; the
-messages do not, because the create-time advice ("drop a variant, change
-device") is unavailable mid-run. See the 2D-auto-expand gotcha for the
-regrid-time inequality and the measured transient factor it carries. **Its refusal describes the POOL, and
-the ROOMIEST device decides which of two stories it tells** — it used to name
-whichever assigned device sorted first and always close with "pick a device with
-more room", which on the real pair said *"cuda:0 has 8.9 GiB free … pick a device
-with more room"* for a 128×128×128×64 grid: the small card named, a roomier one
-implied, and the 3090's 23.6 GiB unable to hold one 22.0 GiB worker either (its
-budget is 20.97). The honest reading of that is "so what, I have cuda:1", and it
-is wrong. So: if the per-worker footprint exceeds EVERY device's budget it says
-*no device in the pool can hold even one*, names the roomiest with its
-free/installed figures, and states that dropping a variant or changing device
-will not help — because neither will, and only the grid is left. Otherwise a worker does fit somewhere,
-which makes it a DISTRIBUTION problem: it names the over-subscribed device and
-points at the one with room, with a count ("set device to cuda:1, which has room
-for 2 of them"). Pinned by
-`test_the_fit_refusal_describes_the_POOL_not_the_first_device`. `WIGNERF_MAX_CELLS_2D` is only a rail
-(see its table row); the operative check runs `assign_devices` to learn which
-devices this session's workers land on, counts the workers per device, and
-compares `n·cells·BYTES_PER_CELL_2D + CONTEXT_BYTES` (300 MiB of CUDA context +
-cuFFT plan cache, per process per device) against `xp.device_free_bytes(dev)` ×
-`FIT_MARGIN` (0.9 — free memory is a moving target and, unlike the IC preview, a
-session has no CPU fallback to drop to). Free memory comes from the driver
-(`mem_info`), or from `MemAvailable` for `cpu`, so whatever else is on the card
-— another session, another process — is already counted. Two properties are
-load-bearing: **the SMALLER card binds**, which no per-session cell count can
-express (4 variants at 2+2 is refused by the 11 GiB half of the pair, not by the
-24 GiB half); and **unknown free memory does NOT refuse** — there the rail is the
-only guard and guessing would be worse. Skipped at ndim=1, where `WIGNERF_MAX_GRID`
-already bounds a 2D array to 4096² ≈ 2.7 GiB/worker. Pinned by
+count** (`routers/sessions._fit_error`) — **and since M3 the same question is
+asked again whenever auto-expand wants to DOUBLE the grid.** The arithmetic
+behind both lives in `core/fit.py` so the two cannot drift; the messages do not,
+because the create-time advice ("drop a variant, change device") is unavailable
+mid-run. `WIGNERF_MAX_CELLS_2D` is only a rail: the operative check runs
+`assign_devices` to learn which devices this session's workers land on, counts
+the workers per device, and compares
+`n·cells·BYTES_PER_CELL_2D + CONTEXT_BYTES` (300 MiB of CUDA context + cuFFT
+plan cache, per process per device) against `xp.device_free_bytes(dev)` ×
+`FIT_MARGIN` (0.9). Free memory comes from the driver (`mem_info`), or from
+`MemAvailable` for `cpu`, so whatever else is on the card is already counted.
+Two properties are load-bearing: **the SMALLER card binds**, which no
+per-session cell count can express; and **unknown free memory does NOT refuse**,
+because there the rail is the only guard and guessing would be worse. Skipped at
+ndim=1, where `WIGNERF_MAX_GRID` already bounds a worker. Pinned by
 `test_the_device_fit_check_is_the_operative_2d_guard`.
+
+**Its refusal describes the POOL, and the ROOMIEST device decides which of two
+stories it tells.** If the per-worker footprint exceeds EVERY device's budget it
+says *no device in the pool can hold even one*, names the roomiest with its
+free/installed figures, and states that dropping a variant or changing device
+will not help — because neither will, and only the grid is left. Otherwise a
+worker does fit somewhere, which makes it a DISTRIBUTION problem: it names the
+over-subscribed device and points at the one with room, with a count. It used to
+name whichever assigned device sorted first and always close with "pick a device
+with more room", which on the real pair implied a roomier card that could not
+hold one worker either. Pinned by
+`test_the_fit_refusal_describes_the_POOL_not_the_first_device`.
+
 **The IC preview is BOUNDED the same two ways** — by `protocol.grid_limit_error`
 (the shared rail: a grid a session would refuse is one the preview must not
-allocate either) and, before the CPU fallback, by `preview._cpu_fit_error`, which
-asks `xp.device_free_bytes("cpu")` the question `_fit_error` asks of a card. Both
-are needed, because the preview builds the FULL state at the requested grid and
-fires on every form change, long before anyone presses Restart — while
-`_fit_error` runs only at session creation and so never sees it. It had no bound
-at all until 2026-07-26, when a form grid of 256⁴ (4.3e9 cells — ONE dims switch
-away from the 1D default, before any Restart) found no GPU with room, fell
-through to the CPU path below and allocated 34 GiB arrays until the kernel
-OOM-killed the server on a 125 GiB host. The GPU path was never the hazard:
-`_pick_device` simply declines. The CPU fallback is the one that needed the
-check, which is why the rail has to be at the door AND the fallback has to
-measure — the rail alone was enough only while it was tight enough to double as
-a memory bound, and it is deliberately not that any more.
-**The IC preview runs on a GPU too, and hands the VRAM straight
-back** (`routers/preview.py`). It used to be CPU-only "to keep the GPU free
-for sessions", which was the right instinct and the wrong trade: the preview
-is built at the SESSION's grid, so at 8192² it is the same 67M-cell array the
-solver evolves — measured **25.9 s on the CPU vs 0.50 s on the 3090**, paid on
-every page reload AND every IC edit, while the main W panel showed the
-identical array in 1.4 s because a GPU worker built it. (That asymmetry is the
-tell if it ever regresses: big panel instant, small IC panel slow, and — since
-`preview.py` owns its own float64 CPU backend — identical at either session
-precision.) What matters is the transient PEAK, not the steady state:
-**88 bytes per grid cell** (0.34 GiB at 2048², 1.38 at 4096², 5.50 at 8192²;
-64 for one cat component, plateauing at 88 from three up, since `cat_wigner`
-reuses its temporaries per pair). So `_pick_device` takes the CUDA device with
-the most FREE VRAM and only if the build fits with 1.4× headroom — free memory
-as reported by the driver, which already accounts for running sessions and
-other processes — GPU previews are serialized (`_gpu_lock`) so two peaks cannot
-stack, and ANY failure (OOM above all, since a session can claim the card
-between the check and the build) falls back to the CPU, which is slow but
-always correct. The release works only because `_build_frame` keeps every
-device array in its own frame, so they die on return before `free_all_blocks()`
-— measured back to **0.000 GiB** after each call. Workers release CuPy
-pool blocks back to the driver on session close (nvidia-smi "used" while
-running is pool recycling, not a leak).
+allocate either) and, before the CPU fallback, by `preview._cpu_fit_error`,
+which asks `xp.device_free_bytes("cpu")` the question `_fit_error` asks of a
+card. Both are needed, because the preview builds the FULL state at the
+requested grid and fires on every form change, long before anyone presses
+Restart — while `_fit_error` runs only at session creation. The GPU path was
+never the hazard (`_pick_device` simply declines); the CPU fallback is the one
+that needed the check, which is why the rail has to be at the door AND the
+fallback has to measure. **`/preview/wavefunction` is behind the same rail**,
+and its φ quadrature is chunked (`initial._phi_along`, `PHI_KERNEL_BYTES`)
+because an (N_k × N_q) kernel written in one piece is quadratic in the grid.
 
-Two things about that release are load-bearing and both were wrong until
-2026-07-25. **The preview allocates from its OWN pool** (`_pool`, installed with
-`cupy.cuda.using_allocator`, which is thread-local — previews run in starlette's
-threadpool, workers own their own threads). `free_all_blocks()` acts on whichever
-pool it is handed, and there is no per-backend allocator anywhere, so releasing
-the process DEFAULT pool also returned the running workers' cached blocks to the
-driver — on every IC keystroke, the exact opposite of what the free-VRAM check
-above is for. Isolation is free: a cold 1 GiB allocation measured 3.1 ms against
-2.6 ms pool-warm, and the release empties the pool after every preview anyway, so
-every preview was already cold. **And the failure path needs a SECOND release,
-after the `except` handler has exited.** While an exception propagates its
-traceback still references `_build_frame`'s frame and every device array in it,
-so the `finally`'s `free_all_blocks()` frees nothing (measured at 128 MiB:
-`finally` alone left all of it reserved, `finally` plus the later call left none)
-— and a release *inside* the handler is no better, the exception is live for the
-whole handler. Untreated, a preview that OOMs at 8192² parks GiB on the card
-until the next SUCCESSFUL preview, starving the solver the fallback exists to
-protect. Related: that handler logs `traceback.format_exc()` and deliberately
-NOT `exc_info=True`, because a LogRecord built with `exc_info` stores the
-traceback, and any handler that retains records (pytest's log capture does) then
-pins the frame past the release.
+**The IC preview runs on a GPU too, and hands the VRAM straight back**
+(`routers/preview.py`). CPU-only was the right instinct and the wrong trade: the
+preview is built at the SESSION's grid, so at 8192² it is the same 67M-cell
+array the solver evolves — measured **25.9 s on the CPU against 0.50 s on the
+3090**, paid on every page reload AND every IC edit. (That asymmetry is the tell
+if it regresses: big panel instant, small IC panel slow.) What matters is the
+transient PEAK, so `_pick_device` takes the CUDA device with the most FREE VRAM
+and only if the build fits with 1.4× headroom, GPU previews are serialized
+(`_gpu_lock`) so two peaks cannot stack, and ANY failure falls back to the CPU.
+The release works only because `_build_frame` keeps every device array in its
+own frame, so they die on return before `free_all_blocks()`.
 
+**Two things about that release are load-bearing and both were wrong until
+2026-07-25.** **The preview allocates from its OWN pool** (`_pool`, installed
+with `cupy.cuda.using_allocator`, which is thread-local — previews run in
+starlette's threadpool, workers own their own threads). `free_all_blocks()` acts
+on whichever pool it is handed and there is no per-backend allocator, so
+releasing the process DEFAULT pool also returned the running workers' cached
+blocks to the driver — on every IC keystroke, the exact opposite of what the
+free-VRAM check is for. Isolation is free (measured 3.1 ms cold against 2.6 ms
+pool-warm, and the release empties the pool after every preview anyway).
+**And the failure path needs a SECOND release, after the `except` handler has
+exited.** While an exception propagates, its traceback still references
+`_build_frame`'s frame and every device array in it, so the `finally`'s
+`free_all_blocks()` frees nothing — and a release *inside* the handler is no
+better, the exception is live for the whole handler. That is why a client error
+caught there (`initial.ICError`) records `failed` and re-raises AFTER the
+release rather than raising from inside the handler. Untreated, a preview that
+OOMs at 8192² parks GiB on the card until the next SUCCESSFUL preview.
+Related: that handler logs `traceback.format_exc()` and deliberately NOT
+`exc_info=True`, because a LogRecord built with `exc_info` stores the traceback,
+and any handler that retains records (pytest's log capture does) then pins the
+frame past the release.
+
+Measurements — the per-cell footprint tables, the 88 B/cell preview figure and
+the free/reserved readings behind every claim here — are in
+`notes/memory-and-devices.md`.
 ## Configuration (environment variables, read by backend/config.py)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and an enforced POLICY**: `SessionCreate.device` (Setup → Compute, restart-only) may narrow it per session but never widen it — a spec outside `xp.devices_allowed(WIGNERF_DEVICE)` (the pool **plus cpu**) is a 422 naming the pool, as is a malformed or absent one. It used to check only that the spec parsed and the card existed, so a host pinned to `cuda:1` (or to `cpu`, to keep its cards free) could be overridden by any client. `GET /api/device` returns BOTH `devices` (the pool) and `choices` — and `choices` IS `devices_allowed`, the same list the validator uses, so the Setup select can never offer a device the API refuses. That endpoint is where every HOST fact the form needs before it can create anything lives: the device lists, `WIGNERF_PRECISION`, and the per-ndim grid ceilings (`max_grid`, `max_cells`, `bytes_per_cell_2d` — see the `WIGNERF_MAX_GRID_2D` row for why those cannot come off `status`). Those three sit OUTSIDE `_probe_backend`'s `lru_cache`, so they follow a monkeypatched `config` and ride the probe's error path too. CPU is always a legal target but never appears in an `auto` pool on a CUDA host, which is why it is appended. `resolve_devices` returns CANONICAL specs (a bare `cuda` → `cuda:0`), without which that membership test would reject a device the host does offer. |
+| `WIGNERF_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda:N` \| comma list (`cuda:1,cuda:0`). Names the device pool; sessions spread variant workers across it. `auto` = all CUDA devices fastest-first if cupy imports, else CPU; a list's order IS the speed ranking. Indices are PCI order (match nvidia-smi). The **host default and an enforced POLICY**: `SessionCreate.device` (restart-only) may NARROW it per session but never widen it — a spec outside `xp.devices_allowed(WIGNERF_DEVICE)` (the pool **plus cpu**) is a 422 naming the pool, as is a malformed or absent one. It used to check only that the spec parsed and the card existed, so a host pinned to `cuda:1` (or to `cpu`, to keep its cards free) could be overridden by any client. `GET /api/device` returns BOTH `devices` (the pool) and `choices` — and `choices` IS `devices_allowed`, the same list the validator uses, so the Setup select can never offer a device the API refuses. That endpoint is where every HOST fact the form needs before it can create anything lives: the device lists, `WIGNERF_PRECISION`, and the per-ndim grid ceilings (`max_grid`, `max_cells`, `bytes_per_cell_2d`). Those sit OUTSIDE `_probe_backend`'s `lru_cache`, so they follow a monkeypatched `config` and ride the probe's error path. CPU is always a legal target but never appears in an `auto` pool on a CUDA host, hence the append. `resolve_devices` returns CANONICAL specs (a bare `cuda` → `cuda:0`), without which that membership test would reject a device the host does offer. |
 | `WIGNERF_PORT` | `8010` | Backend port (8000 belongs to urantia-library). Used by start.sh; `uvicorn --port` otherwise. |
-| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (`SessionCreate.precision`, restart-only). float32 is a PREVIEW mode — measured 3.3-3.8× faster in 1D but only **1.5-2.6× in 2D**, and ~54-55% of the working set on CUDA, **nothing on CPU** — and it refuses auto-expand and `tol < 1e-5`. See the float64/float32 gotcha for exactly what it costs; do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING for that reason, and an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`, which is `Optional` and **resolved in `_check`, not by a `default_factory`** — a hard-coded literal there once made this var decorative, advertised by `/api/device` and applied by nothing, and a factory once collided with the (now retired) M1 gate by refusing 2D sessions over a value the client never sent: a gate must refuse what was ASKED FOR. An omitted precision now resolves to the host default at **every** ndim, so a float32 host gives a 2D session float32, which is where the memory saving actually matters. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the precision control — or an IMPORT supplies one — the create payload OMITS the field, so the host decides and the answer comes back in `status` (which the form then syncs to). That is what makes the `/device` probe non-load-bearing — it only seeds the displayed default and `resetToDefaults`, so a probe that fails or times out costs a device list, never the wrong precision. Sending the form's placeholder as though it were a decision is precisely how a float32 host got silently overridden. Two exceptions, both deliberate. An **imported** setup document or mp4 marks the precision CHOSEN (`importConfig` → `markPrecisionChosen`): it is the run someone exported, and reproducing it is what the document is for — without it the import silently ran at the host default and left the form showing a float32 that never happened, behind a "restart to apply" no restart could clear (`status.precision` never CHANGES, so the sync watcher never fires). And a form with **auto-expand on** sends `float64` explicitly rather than deferring, because auto-expand is float64-only, so asking for it IS asking for float64 — deferring on a float32 host asks for a pair the schema refuses and 422s every create. (Belt and braces with the backend resolution above: the backend keeps a non-SPA client working, the SPA keeps the payload saying what the form shows, and the exported setup document then records the precision the run actually had.) |
-| `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS (32 GB RAM shared with urantia-library, Open WebUI, …) set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` (Setup → Compute) may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
+| `WIGNERF_PRECISION` | `float64` | Default spectral working precision (`float64` \| `float32`); the Setup form's **Compute** section overrides it per session (restart-only). float32 is a PREVIEW mode — see the float64/float32 gotcha and `notes/precision.md`. Do not make this `float32` on a host where anyone might read a result off it (setting it logs a WARNING; an unrecognized value falls back to float64 with one too). It reaches sessions through `SessionCreate.precision`, which is `Optional` and **resolved in `_check`, not by a `default_factory`** — a hard-coded literal there once made this var decorative, and a factory once refused sessions over a value the client never sent: a gate must refuse what was ASKED FOR. An omitted precision resolves to the host default at **every** ndim. **The SPA defers rather than guesses** (`lib/config.precisionForPayload`): until the user operates the control — or an IMPORT supplies one — the payload OMITS the field, so the host decides and the answer comes back in `status`. That is what makes the `/device` probe non-load-bearing. Two deliberate exceptions: an **imported** setup document marks the precision CHOSEN (`markPrecisionChosen`), because reproducing the run is what the document is for and without it the form showed a float32 that never happened behind a "restart to apply" no restart could clear; and a form with **auto-expand on** sends `float64` explicitly, because auto-expand is float64-only, so asking for it IS asking for float64. |
+| `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
-| `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long 1440p exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
-| `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` encoder if a runtime probe succeeds (dedicated encoder block, ~3× faster at 4K, frees CPU for the render pool), else `libx264 -preset veryfast`. `cpu` forces libx264, `nvenc` forces the GPU. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to our rawvideo input). The host default; `ExportSpec.encoder` (the Export panel's encoder select) overrides it per JOB, which is the right granularity — the best choice depends on what else is competing for cores at that moment. |
-| `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering a frame (matplotlib/Agg) dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` (spawn, not fork: the backend has CUDA up) while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`) uses all of these; a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
-| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema sanity rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, so a host at 128 still gets a usable select — and `setNdim` asks the same function, so a dims switch cannot land N over a lowered ceiling either). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`, the same instrument as the 2D row): **192 B/cell in float64 and 104 in float32** since M7 dropped the second exponent slot (was 224/120) — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², and 0.10 / 0.41 / 1.63 / 6.50 in float32 (~4× per doubling), plus ~300 MiB of CUDA context + cuFFT plan cache per process per device. **These are HIGHER than the step-loop figures this row used to quote** (160 MiB / 672 MiB / 2.7 / 10.0 GiB) and that is not a regression: a step loop misses `adjust_step`'s transient and the frame build, exactly as the 2D row warns, so the old numbers under-reported a real worker. Workers spread over the pool, so what matters is the per-card share: 4 variants at 4096² is ~6.0 GiB/card at 2+2 (fits both the 3090 and the 2080 Ti); at 8192² it is ~24 GiB/card, which does **not** fit even the 3090 — cap by variant count, not just by grid. In a **float32** session those peaks fall to ~54%, so 4 variants at 8192² is ~13 GiB/card at 2+2 — comfortable on the 3090, still too much for the 2080 Ti. float32 moves that line; it does not remove it. At the cap the session warns and keeps computing (moves still allowed). |
-| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all (128⁴ = 268M cells is ~44 GiB per worker while every axis sits inside a 128 rail). What actually binds is the per-device fit check, `routers/sessions._fit_error` — see the GPU section. **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree for as long as a switch waits for its restart. Reading them off `status` broke the panel in both directions (measured 2026-07-27): over a live 1D session a 2D form offered N up to 4096 against this 128 ceiling AND rendered no footprint line at all (`bytes_per_cell` is null at ndim=1 — the number that says whether a 2D session can start, missing exactly before the first 2D restart), and over a live 2D session a 1D form's N select collapsed to one option (cap 128, 1D list starting at 256, loop body never entered). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted for that reason: both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling** (1D 256…`WIGNERF_MAX_GRID`, 2D 32…`WIGNERF_MAX_GRID_2D`; verified in a headless DOM at 256…8192 and 32…128 on a host whose `wignerf.env` sets 8192). **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis (the edge band would cover a quarter of the axis), so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API and through an imported config, which the select keeps listed. **`AXIS_N_FLOOR` is shared with `setNdim`, and that is the whole point of it being a constant**: a dims switch lands N *inside the target's list* — their own choice when it is offerable, else that ndim's DEFAULT (`DEFAULT_AXES`, 1024² in 1D and 64⁴ in 2D), everything clamped by the target's cap so a host at 128 is not pushed over its own ceiling. Capping from ABOVE alone was wrong in the other direction: 1D → 2D → 1D brought the 2D choice back with it, so the select rendered `64, 256, 512, …` **with a hole in it** and a 1D session ran at 64², a resolution the panel does not offer. Falling back to the FLOOR would be its quieter twin — 256² for a user who started at the 1D default and only looked at 2D. What a round trip cannot do, since the two lists do not overlap on a default host, is preserve a 2D 32 across 1D; that needs a per-dimensionality memory in the form. Pinned in `config.test.ts` (`a dims round trip leaves no value off its own list`, the round-trip-lands-on-the-default case, the lowered-cap case, and the small-choice case the `min()` still serves). |
-| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values (a dims switch that carried N over would mean 1024⁴ = 1.1e12 cells from the 1D default, which is why `setNdim` caps it at the target's own), and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3 (2026-08-01)** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, far past any card here. A fixed cell count cannot do that job — it is wrong in both directions, refusing 128×128×64×64 (11.0 GiB, one worker) on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one — so the real check asks the driver (`_fit_error`, GPU section). Measured on an RTX 3090 with `scripts/bench.py --ndim 2 --footprint`, which runs a whole worker record (the exponent slot, an `adjust_step` pass, a frame build) rather than a step loop — a step loop misses half of it, which is why that mode had to be written before M1 could set a number. **176 B/cell in float64 and 96 in float32 (55%), both flat across sizes and both identical for the relativistic variants** — float64 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ against float32's 0.09 / 0.47 / 1.50 / 3.66. So 4 variants at 64⁴ split 2+2 is ~5.5 GiB/card in float64 (fits both the 3090 and the 2080 Ti) and ~3.0 in float32, and **80⁴ is reachable only in float32** (7.3 GiB/card against float64's 13.4, and the 2080 Ti's 10.6 is what binds). **The STATE is only 5% of that** — W is real, so float64 = 8 B/cell, 0.12 GiB at 64⁴; the rest is the step's machinery at full shape, `adjust_step`'s transient (80 B/cell) largest among it since M7 removed the second exponent slot. float32 lands at 55% rather than 50% because `dU_im`/`dT_im` stay float64. `config.BYTES_PER_CELL_2D` carries the measured stage-by-stage breakdown and is **keyed by precision** — `config.bytes_per_cell(ndim, precision)` — because `_fit_error` reads it: a flat float64 figure there would refuse precisely the grids float32 makes affordable. M7 (2026-08-02) took it from 208/112 by dropping the second exponent slot. Throughput on the same card: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run** (~0.23 s per record at 8 substeps). Both the rail's refusal and the fit check's quote the estimate, and `/api/device`'s `bytes_per_cell_2d` feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart — from `/device` and not from `status`, or the line is absent on the one path that reaches 2D (see the `WIGNERF_MAX_GRID_2D` row). |
+| `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
+| `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` ENCODER if a runtime probe succeeds, else `libx264 -preset veryfast`. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to rawvideo input). The host default; `ExportSpec.encoder` overrides it per JOB, which is the right granularity — the best choice depends on what else is competing for cores at that moment. |
+| `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`); a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
+| `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, and `setNdim` asks the same function). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`): **192 B/cell in float64 and 104 in float32** since M7 — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², plus ~300 MiB of CUDA context per process per device. These are HIGHER than step-loop figures and that is not a regression: a step loop misses `adjust_step`'s transient and the frame build. Workers spread over the pool, so what matters is the per-card share — 4 variants at 8192² is ~24 GiB/card at 2+2, which does **not** fit even the 3090, so cap by variant count and not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
+| `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all. What actually binds is the per-device fit check, `routers/sessions._fit_error` (see the GPU section). **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree until the restart. Reading them off `status` broke the panel in BOTH directions (a 2D form offering N up to 4096 with no footprint line at all, and a 1D form's select collapsing to one option). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted for that reason, since both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling.** **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis, so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API. **`AXIS_N_FLOOR` is shared with `setNdim`, and that is the whole point of it being a constant**: a dims switch lands N *inside the target's list* — their own choice when offerable, else that ndim's DEFAULT, everything clamped by the target's cap. Capping from ABOVE alone was wrong the other way: 1D → 2D → 1D brought the 2D choice back, so the select rendered with a HOLE in it and a 1D session ran at 64². Falling back to the FLOOR is its quieter twin. Pinned in `config.test.ts`. |
+| `WIGNERF_MAX_CELLS_2D` | `2**27` (134M) | **Total-cell** RAIL for ndim=2 — a cheap deterministic stop for absurd values, and the only guard on a host where free memory cannot be read. **Checked on an auto-expand DOUBLING as well as at create time since M3** — it was stored on the session and consulted by the planner nowhere, which was the accounting that milestone's gate had been hiding. It is deliberately NOT the operative limit: at the default it permits 22.0 GiB per worker, far past any card here, and a fixed cell count is wrong in both directions (refusing 128×128×64×64 on a 24 GiB card while permitting 5.5 GiB × 2 workers on an 11 GiB one). The real check asks the driver. Measured with `bench.py --ndim 2 --footprint`, which runs a whole worker record rather than a step loop: **176 B/cell in float64 and 96 in float32 (55%)**, both flat across sizes and both identical for the relativistic variants — 0.17 / 0.87 / 2.75 / 6.71 GiB at 32⁴ / 48⁴ / 64⁴ / 80⁴ in float64. So 4 variants at 64⁴ split 2+2 is ~5.5 GiB/card in float64, and **80⁴ is reachable only in float32**. **The STATE is only 5% of that** — W is real, so float64 = 8 B/cell — and the rest is the step's machinery at full shape. `config.BYTES_PER_CELL_2D` carries the stage-by-stage breakdown and is **keyed by precision** (`config.bytes_per_cell(ndim, precision)`) because `_fit_error` reads it: a flat float64 figure there would refuse precisely the grids float32 makes affordable. Throughput on the 3090: 610 steps/s at 32⁴, 130 at 48⁴, 35.1 at 64⁴, 13.8 at 80⁴ — so **32⁴ is for exploration and 64⁴ is a serious run**. Both the rail's refusal and the fit check quote the estimate, and `/api/device`'s `bytes_per_cell_2d` feeds the Setup panel's footprint line so a grid that cannot start says so BEFORE the restart. |
 
 ## Commands
 
 ```sh
+# CLAUDE.md budget — the file stops being loaded around 150k characters, and
+# has crossed that line twice. Overflow goes to notes/, never deleted.
+wc -c CLAUDE.md          # keep under 130000
+
 # backend tests (GPU tests auto-skip without cupy/CUDA)
 cd backend && .venv/bin/pytest
 
@@ -948,36 +866,28 @@ without the release and 0 with it.
    (one exponent slot, −32 B/cell at both dimensionalities), leaving M5 and M6.
 
 ## 2D follow-up milestones (deferred from the first 2D cut, 2026-07-26)
+**M1-M4 and M7 have all landed, and nothing in the codebase refuses anything on
+the grounds of `ndim == 2` any more.** What each cost is in its gotcha below;
+the full retrospectives are in `notes/2d-milestones.md`. What is left (M5, M6)
+are enhancements that simply do not exist yet at either dimensionality — no
+refusal to relax, no half-feature to mistake for a working one.
 
-**These are not optional extras — they are all wanted, and each is out of the
-first 2D cut only so the physics core lands verified.** **EVERY GATE IS NOW
-GONE**: M1 (float32, 2026-07-27), M2 (relativistic, -27), M4 (mp4, -28) and M3
-(auto-expand, 2026-08-01) have all landed, and nothing in the codebase refuses
-anything on the grounds of `ndim == 2`; what each cost is in its gotcha below.
-**M7 landed 2026-08-02** — not a gate either, an enhancement, and the first of
-these to be finished at BOTH dimensionalities at once. What is left (M5, M6) are
-enhancements that simply do not exist yet at either dimensionality — no refusal
-to relax, no half-feature to mistake for a working one.
+Three lessons from retiring those five, kept because the next milestone will
+need them: **the verification is the work and the gate removal is a few lines**
+(the physics core was already generic every time, and M1's measurement
+contradicted its prediction in both directions at once); **look for the
+accounting the gate was hiding**, since each milestone's real work turned out to
+be a constant nobody had listed (`BYTES_PER_CELL_2D`, `RangeStats.scale`,
+`session.max_cells`, and M7's `fit.REGRID_PEAK`, which got RELATIVELY worse as
+the worker got smaller) — but expect false positives there too, and settle them
+by measuring at the point the code actually runs, not by reasoning from two
+documented measurements; and **a gate can carry a stale REASON**, so re-measure
+the claim it rests on and not only the risk it names.
 
-Three lessons from retiring those four, kept because the next milestone will
-need them (the full retrospectives are in `notes/2d-milestones.md`):
-**the verification is the work and the gate removal is a few lines** — the
-physics core was already generic every time, and M1's measurement contradicted
-its prediction in both directions at once; **look for the accounting the gate
-was hiding**, since each milestone's real work turned out to be a constant
-nobody had listed (`BYTES_PER_CELL_2D`, `RangeStats.scale`, `session.max_cells`,
-and M7's `fit.REGRID_PEAK`, which got RELATIVELY worse as the worker got smaller)
-— but expect false positives there too, and settle them by measuring at the
-point the code actually runs, not by reasoning from two documented measurements;
-and **a gate can carry a stale REASON**, so re-measure the claim it rests on and
-not only the risk it names.
-
-| # | Milestone | v1 gate | What it needs |
-|---|---|---|---|
-| M5 | **Cuts / slices** | the wire reserves a per-plane `mode` byte; only `mode=0` (projection) is defined | Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime. A cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
-| M6 | **FFT fusion** | — | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, which changes numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass in both 1D and 2D. |
-| ~~M7~~ | ~~**One exponent slot instead of two**~~ | — | **DONE 2026-08-02.** `worker._advance` divides each record into `ceil(rem/dt)` EQUAL substeps instead of walking at `dt` and clamping a straggler, so the second exponent slot that straggler needed is gone. Measured **208 → 176 B/cell in 2D and 224 → 192 in 1D** (float32 112 → 96 and 120 → 104), i.e. −32 B/cell everywhere and −15.4%, NOT the −22% this row used to claim — see the one-exponent-slot gotcha below for why that figure was stale and what else had to move. |
-
+| # | Milestone | What it needs |
+|---|---|---|
+| M5 | **Cuts / slices** | The wire already reserves a per-plane `mode` byte and only `mode=0` (projection) is defined. Projections are EXACT for separable states but average away fringe contrast for entangled ones, which is precisely the interesting 2D regime; a cut at fixed (y, py) keeps the interference. Purely additive to protocol v4 — no version bump, no new reduction cost (a cut is cheaper than a projection). |
+| M6 | **FFT fusion** | The trailing inverse transform of step *n* and the leading forward transform of step *n+1* are inverses; staying in λ-space across step boundaries and merging the two half-`expT`s removes 4 of the 12 one-dimensional sweeps per 2D step, i.e. **+50%**. Not free: the per-step `real()` projection becomes per-record, which changes numerics (and `test_time_reversal`'s ~1e-9 residue budget), so it needs its own verification pass in both 1D and 2D. |
 ## Conventions / gotchas
 
 - Do not reference the old project website domain anywhere in wignerf —
@@ -1044,173 +954,134 @@ not only the risk it names.
   fftshift bookkeeping — the likeliest porting error after the shift pairing.
 - **RELATIVISTIC 2D (`qr`/`cr`, M2)**: the physics core was already generic —
   `_kinetic()` builds T = c√(Σkᵢ² + m²c²) and its gradient at any ndim, and the
-  streaming/observables/frame paths never cared. Four rules survive it; the
-  measurements are in `notes/2d-milestones.md`.
+  streaming/observables/frame paths never cared. Four rules survive it;
+  measurements in `notes/2d-milestones.md`.
   **SEPARABILITY IS UNAVAILABLE HERE, and the natural test would fail against
   correct code.** `test_separable_run_equals_two_1d_runs` needs T separable as
   well as U, and c√(px²+py²+m²c²) is not a sum — a 2D relativistic run is
-  genuinely NOT the outer product of two 1D relativistic runs. Since separability
-  is what validates the 4D pipeline against trusted 1D code, the replacement is
-  `test_relativistic_matches_an_independent_schroedinger_run` (the same TDSE
-  reference as the Bopp anchor, with the square-root Salpeter T applied exactly
-  in the Fourier basis), and what it asserts is the **dt RATIO**: 4.58 at c = 10,
-  falling to 3.46 at c = 5 and 2.65 at c = 3 as the residual meets the same
-  dt-independent ~1.5e-5 GRID floor the non-relativistic anchor hits below
-  dt = 0.005. Do not lower c to make it "more relativistic".
+  genuinely NOT the outer product of two 1D relativistic runs. Since
+  separability is what validates the 4D pipeline against trusted 1D code, the
+  replacement is `test_relativistic_matches_an_independent_schroedinger_run`,
+  and what it asserts is the **dt RATIO**. Do not lower c to make it "more
+  relativistic" — the residual meets a dt-independent ~1.5e-5 GRID floor.
   **Never assert quantum ≡ classical for qr/cr**: the Moyal corrections vanish
   for a quadratic U, but T is not quadratic in k, so the kinetic Bopp difference
   and the gradient genuinely differ. ⟨Lz⟩ DOES transfer — T depends on the
-  momenta only through |k|, so rotational symmetry holds and
-  `test_angular_momentum` extends unchanged; it is the one existing 2D anchor
-  that does.
-  **The mc² cancellation does NOT worsen in 4D** — absolute error flat at
-  3.6e-12 (1D) to 4.2e-12 (2D), because it is m²c²·eps, a couple of ulps, and
-  that does not care how many momentum components enter the sum. There is no
-  float32 version of it to measure: exponent construction stays double at every
-  ndim, verified bitwise. **And relativistic is FREE in memory and in time**, so
-  `BYTES_PER_CELL_2D` did not move — a √ over meshes that already exist costs
-  nothing and the FFTs are still the whole cost. The uncertainty-shear diagnostic
-  works, at **c = 10 and not c = 137** (shear goes as 1/c⁴, so 137.036 needs
-  ~1200 steps to clear the noise, which at 57 ms/step over 32⁴ is not a test).
+  momenta only through |k| — and `test_angular_momentum` extends unchanged; it
+  is the one existing 2D anchor that does.
+  **The mc² cancellation does NOT worsen in 4D** (it is m²c²·eps, a couple of
+  ulps, and that does not care how many momentum components enter the sum), and
+  exponent construction stays double at every ndim, verified bitwise.
+  **Relativistic is FREE in memory and in time**, so `BYTES_PER_CELL_2D` did not
+  move — a √ over meshes that already exist costs nothing and the FFTs are still
+  the whole cost. The uncertainty-shear diagnostic works at **c = 10 and not
+  c = 137** (shear goes as 1/c⁴, so 137.036 needs ~1200 steps, which at 32⁴ is
+  not a test).
 - **2D mp4 EXPORT (M4): the frame is a SELECTION, real subscripts are FREE, and
-  the blit decides where static art may live.** **Read `notes/2d-milestones.md`
-  before editing `core/render_mpl.py`** — it carries the measurements behind all
-  of this. The rules:
-  **MATHTEXT IS USED, and the note that once forbade it was backwards.** In
-  isolation a mathtext artist is 1.83× a plain one, but the figure BLITS, so
-  every title and axis label is a STATIC artist baked into the background once
-  and in situ it measures as noise. `axes.sub_math` typesets the two-letter axis
-  names as `$p_x$` and everything else — ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ — stays the same
-  Unicode the screen uses, so the two cannot drift and 1D (single-letter names)
-  is untouched at the byte level; every title function takes a `math=` flag, the
-  counterpart of its frontend mirror's `html=`. **usetex is NOT used**: 12×, plus
-  it needs a LaTeX install (the VPS has none), cannot render our Unicode without
-  a THIRD spelling of every string, and is global — the metadata block's
-  user-supplied U(x) would go through LaTeX too. **And it has to be the WHOLE
-  frame** (`geom_line`, `_extents`, the panel list, `diagnostic_label`,
-  `describe.ic_expression`), because half the job reads worse than none: the same
-  axis then appears twice on one screen in two spellings.
+  the blit decides where static art may live.** **Read `notes/export.md` before
+  editing `core/render_mpl.py`** — it carries the measurements. The rules:
+  **MATHTEXT IS USED**, because the figure BLITS, so every title and axis label
+  is a STATIC artist baked into the background once and costs nothing in situ.
+  `axes.sub_math` typesets the two-letter axis names as `$p_x$` and everything
+  else — ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ — stays the same Unicode the screen uses, so the
+  two cannot drift and 1D is untouched at the byte level. **usetex is NOT used**
+  (12×, needs a LaTeX install the VPS lacks, cannot render our Unicode, and is
+  global — the user's own U(x) would go through it). **And it has to be the
+  WHOLE frame**, because half the job reads worse than none: the same axis would
+  otherwise appear twice on one screen in two spellings.
   **The metadata block is WRAPPED PLAIN and typeset afterwards** (`_emit`) —
-  `$p_x$` is five characters that draw as two glyphs, so which characters land on
-  which line has to be decided by the plain text. **And it must not break a line
-  MID-FACT** (`px ∈ [-7, 7]`, `(6 planes × 1 variant = 6)`, the units figure):
-  each group is joined with `_NB` and `_emit` restores real spaces after
-  wrapping, which has to be a character `textwrap` cannot see as whitespace at
-  all — a Unicode NBSP is `\s`, so it does not work. A test for this must check
-  **per line**: joining a column with " " is exactly what reconstitutes a group
-  that was split (`test_the_metadata_block_never_breaks_a_line_mid_fact`).
+  `$p_x$` is five characters that draw as two glyphs, so which characters land
+  on which line has to be decided by the plain text. **And it must not break a
+  line MID-FACT**: each group is joined with `_NB` and `_emit` restores real
+  spaces after wrapping, which has to be a character `textwrap` cannot see as
+  whitespace at all (a Unicode NBSP is `\s`, so it does not work). A test for
+  this must check **per line**. `_wrap` also passes `break_on_hyphens=False`,
+  which is the same rule for a break `_NB` cannot reach: a minus sign is not a
+  hyphen, and textwrap severed `exp(-x^2/2)` right after the minus.
   **U(x,y) is typeset by a LEXICAL rewrite of the user's own string**
-  (`describe.potential_math`), NOT via `sympy.latex`, which parses cleanly and is
-  still wrong twice over: it CANONICALISES (`x^2/2 + 0.3*x^4` → `0.3x^4 + x^2/2`;
-  `exp(0.5)` evaluated to 1.64872127070013) where this block's job is "how to
-  reproduce this run" and the source string is what you paste back into the U(x)
-  box, and it emits `\frac`, which is TALL where the block advances by a fixed
-  `META_LINESPACING`. **A typeset line built from USER input cannot be the only
-  line of defence** — a mathtext parse error raises at DRAW time and would take
-  the export down — so every candidate goes through `render_mpl.mathtext_ok`
-  (matplotlib's own parser, per `$…$` span, cached) and falls back to plain per
-  line. `describe.config_json` and the setup document stay plain either way.
+  (`describe.potential_math`), NOT via `sympy.latex`, which CANONICALISES (so
+  the block would stop being "the text you paste back") and emits tall `\frac`.
+  **A typeset line built from USER input cannot be the only line of defence** —
+  a mathtext parse error raises at DRAW time — so every candidate goes through
+  `render_mpl.mathtext_ok` and falls back to plain per line.
+  **AN IC EXPRESSION IS NEVER TYPESET AT ALL**, and says so by returning `None`
+  from `describe.ic_expression(math=True)` rather than a copy of the plain line.
+  `_emit` only skips substitution on its single-fragment branch, so identical
+  strings looked equivalent and were not: the moment the line wrapped it ran
+  `sub_math_text` on every fragment and a user's literal `px` became `$p_x$`
+  after all — measured on a 126-character 2D wexpr, well inside every cap, and
+  invisible at ndim=1 where the axis names are single letters. `None` is the
+  signal `_emit` already had for "there is no typeset twin".
   **The header readout and the block deliberately DISAGREE**: the header's
   geometry follows the PAINTED record as the SPA does, while the block's is
-  labelled "at record k0" and stays there, because a per-frame rewrite would make
-  "what this video is" a moving target — the union is quoted on its own line.
-  They diverge only across an auto-expand regrid, pinned at 1D by
-  `test_the_header_follows_the_painted_record_and_the_block_does_not` and at 2D
-  by `test_the_header_and_block_diverge_in_2d_too`.
+  labelled "at record k0" and stays there.
   **THE BLIT DECIDES WHERE STATIC ART MAY LIVE.** `update()` restores the static
   background and then `draw_artist`s the images on top, so anything static drawn
   INSIDE the axes box is painted over every frame — which is why the panel grid
   lines are in `_dynamic` and ordered after the images, and why the per-panel
-  scale caption (used past `CBAR_MAX_CELLS` = 8 panels, where a colorbar is a
-  ~9 px strip) lives in the panel's `loc="right"` TITLE, outside the axes box and
-  therefore still static and free. Its first version sat in the corner of the
-  heatmap and rendered as NOTHING. Pinned by
-  `test_a_dense_grid_states_its_scales_in_the_titles_not_over_the_heatmap`.
-  **COST: 2D is CHEAPER per frame than 1D, not dearer** — 6.4 fps for the full
-  24-panel matrix against 1D's ~9–10 for 4 panels, because a 2D plane is at most
-  128×128 where a 1D W is up to 4096², so the `imshow` upsampling that dominates
-  a 1D frame barely registers. `POOL_MIN_FRAMES` and the w+2 window needed no
-  change, and the metadata block did not overflow (worst realistic case 10 lines
-  against the 11 that fit at 8 pt).
+  scale caption (used past `CBAR_MAX_CELLS` = 8 panels) lives in the panel's
+  `loc="right"` TITLE, outside the axes box. Its first version sat in the corner
+  of the heatmap and rendered as NOTHING.
+  **COST: 2D is CHEAPER per frame than 1D**, 6.4 fps for the full 24-panel
+  matrix against 1D's ~9-10 for 4 panels, because a 2D plane is at most 128×128
+  where a 1D W is up to 4096².
 - **AUTO-EXPAND IN 2D (M3): the orchestration was free and the GUARD is the
   whole feature.** `core/fit.py` is the create-time check asked again mid-run,
   SHARED with `routers/sessions._fit_error` so the two cannot drift (each writes
   its own message: at create time the advice is "drop a variant, change device"
-  and mid-run none of that is available). Five things that must not be undone —
-  **read `notes/2d-milestones.md` before editing `fit.py`,
-  `worker._apply_regrid` or `Propagator.set_grid`**, which has the measurements:
+  and mid-run none of that is available). **Read `notes/2d-milestones.md` before
+  editing `fit.py`, `worker._apply_regrid` or `Propagator.set_grid`** — it has
+  the measurements. Five things that must not be undone:
   the per-device inequality is `n·per_new·REGRID_PEAK ≤ (F + n·per_old)·
   FIT_MARGIN`, and **the `+ n·per_old` term is load-bearing, not a refinement**
-  (it is what correctly allows a single-worker 64⁴ doubling on the 2080 Ti —
-  5.50 GiB of new footprint against ~6.4 free on a card that is ALREADY holding
-  the 2.75 GiB worker wanting to grow, which `F` alone refuses: 6.05 needed
-  against 5.81, and 8.28 once its own worker is counted. The figures moved with
-  M7 and the shape did not; recompute them, do not carry them);
+  — it is what correctly allows a single-worker 64⁴ doubling on a card that is
+  ALREADY holding the worker wanting to grow, which `F` alone refuses (the
+  figures moved with M7 and the shape did not; recompute them, do not carry
+  them);
   **it is asked of a DOUBLING and of nothing else** — for a pure window shift
-  `per_new == per_old` and the same expression demands `0.222·n·per_old` free to
-  slide a window that allocates nothing, so `fit.regrid_shortfall` returns `[]`
-  for any non-growing window BEFORE it reads the driver (pinned by
-  `test_a_pure_move_is_never_refused_for_memory` and
-  `test_a_window_slides_even_when_the_device_is_full`), and the reading is taken
+  `per_new == per_old` and the same expression would demand free memory to slide
+  a window that allocates nothing, so `fit.regrid_shortfall` returns `[]` for
+  any non-growing window BEFORE it reads the driver, and the reading is taken
   ONCE per attempt because a re-read between candidates could accept a plan
   neither reading allows;
   **release before allocate** in `worker._apply_regrid` (exponent slots first,
   then the state through a one-element box so `_run`'s local does not pin it,
-  then `set_grid` dropping meshes, FFT plans and this thread's cuFFT plan cache
-  and freeing the pool before rebuilding) — this is what makes `REGRID_PEAK` =
-  1.10 honest, and it is ALLOCATION ORDER ONLY, so ndim=1 stays bitwise
-  unaffected;
+  then `set_grid` dropping meshes, FFT plans and this thread's cuFFT plan cache)
+  — this is what makes `REGRID_PEAK` = 1.10 honest, and it is ALLOCATION ORDER
+  ONLY, so ndim=1 stays bitwise unaffected;
   **what the guard cannot see is ACCEPTED** — another process, a sibling session
-  whose committed plan has not landed, and the bigger unguarded transients
+  whose committed plan has not landed, the bigger unguarded transients
   elsewhere; `FIT_MARGIN` does not cover them and must not be read as if it did.
   What makes that acceptable is the failure mode: a lost race is a cupy OOM
   inside `_apply_regrid`, fatal by design, so the session pauses LOUDLY with a
-  traceback (pinned by
-  `test_a_failed_regrid_stops_the_run_instead_of_going_quiet` — the day that goes
-  silent the limitation stops being acceptable). Both the refusal and the accept
-  path log the reading and the ask, which is what makes such an OOM diagnosable;
+  traceback (pinned by `test_a_failed_regrid_stops_the_run_instead_of_going_
+  quiet` — the day that goes silent the limitation stops being acceptable);
   and **`no_room` is its own boundary ACTION with a `limit` FIELD**, not a
   flavour of `capped`. `capped` = the per-axis `WIGNERF_MAX_GRID` ceiling,
   `no_room` = the guard made us give a doubling up, and their remedies are
-  opposite (a smaller grid vs a bigger card or fewer variants). It carries
-  `denied` and `applied`, because a denied doubling can still leave a shift to
-  commit and one sentence for both reads as a self-contradiction beside the ⤢
-  flash. `limit` ∈ {`device`, `cells`} because `_afford_regrid`'s two guards have
-  nothing in common — against the `WIGNERF_MAX_CELLS_2D` rail, freeing the card
-  does nothing and neither does float32 (a cell count is precision-independent),
-  and a rail denial once told the user to free a card with 100+ GiB spare
-  (`test_a_cell_rail_denial_does_not_blame_the_card`). It is a MESSAGE latch,
+  opposite. It carries `denied` and `applied`, because a denied doubling can
+  still leave a shift to commit. `limit` ∈ {`device`, `cells`} because against
+  the `WIGNERF_MAX_CELLS_2D` rail, freeing the card does nothing and neither
+  does float32 (a cell count is precision-independent). It is a MESSAGE latch,
   like `_capped_posted`, and NOT a scheduling gate like `_invalid_posted`: as a
-  gate, one refusal switched auto-expand off for the rest of the run — the
-  tripped axes that reset it never clear on their own — including the pure shifts
-  that were never the problem (`test_a_denial_does_not_disable_auto_expand_for_
-  the_rest_of_the_run`). A plan that commits with nothing denied clears it, so a
-  LATER denial is announced rather than swallowed. Do not re-propose gating
-  `SUPPORT_EPS` on the 2D noise floor: measured and refuted, the planner scanning
-  only TRIPPED axes.
+  gate, one refusal switched auto-expand off for the rest of the run, including
+  the pure shifts that were never the problem. Do not re-propose gating
+  `SUPPORT_EPS` on the 2D noise floor: measured and refuted.
 - **FLOAT32 IN 2D (M1): choose it for MEMORY, not for speed, and know that it
   raises the boundary warning on a contained state at 32⁴.** The mixed scheme
-  (float64 meshes and `qd()` evaluations, complex64 only for the spectral array
-  and the exponent phases — see the float64/float32 gotcha) has no
-  dimension-aware line in it and holds BITWISE at 4 axes, which had to be checked
-  because the multi-D Bopp shift moves every spatial argument of U together;
-  pinned by `test_exponent_construction_stays_double`, parametrized over ndim.
-  **MEMORY: 96 B/cell against float64's 176** — 55%, flat across 32⁴–80⁴,
-  identical for the relativistic variants, and better than the ~58% predicted
-  from 1D. 2.75 → 1.50 GiB/worker at 64⁴, and 80⁴ becomes reachable at all.
-  (Those are post-M7 figures; M1 measured 3.25 → 1.75 at 208/112 B/cell.)
-  **SPEED: 1.48× at 64⁴, not the ~3.4× predicted** (2.63× at 32⁴, 2.09 at 48⁴,
-  1.64 at 80⁴) — and not the machine, since the 1D control on the same card in
-  the same session gave 3.29× at the SAME 16.8M cell count. The 2D step
-  transforms two axes of a 4D array at a time where 1D transforms one axis of a
-  2D array, and cuFFT's single-precision advantage for that strided layout is far
-  smaller. Do not quote the 1D figure for 2D. **`TOL_MIN_F32` did NOT move**: the
-  `adjust_step` residual floor SATURATES rather than growing with cells (2D
-  2.0–2.5e-6 flat from 32⁴ to 64⁴, 4× margin against 1e-5).
+  has no dimension-aware line in it and holds BITWISE at 4 axes, which had to be
+  checked because the multi-D Bopp shift moves every spatial argument of U
+  together; pinned by `test_exponent_construction_stays_double`, parametrized
+  over ndim. **MEMORY: 96 B/cell against float64's 176** — 55%, flat across
+  32⁴–80⁴, identical for the relativistic variants, and 80⁴ becomes reachable at
+  all. **SPEED: 1.48× at 64⁴, not the ~3.4× predicted from 1D** — the 2D step
+  transforms two axes of a 4D array where 1D transforms one axis of a 2D array,
+  and cuFFT's single-precision advantage for that strided layout is far smaller.
+  Do not quote the 1D figure for 2D. **`TOL_MIN_F32` did NOT move**: the
+  `adjust_step` residual floor SATURATES rather than growing with cells.
   **At 32⁴ it puts REAL mass in the edge band and latches the boundary warning
-  within ~7 s** — 1.0e-3 of the integral after 12000 steps on the shipping 2D
-  default, a fully contained state, against **3.1e-5 for the IDENTICAL state in
-  float64**; 48⁴ stays clear and 64⁴ flickers, so it is the COARSE grid that
+  within ~7 s** — 1.0e-3 of the integral against 3.1e-5 for the IDENTICAL state
+  in float64; 48⁴ stays clear and 64⁴ flickers, so it is the COARSE grid that
   cannot carry single precision, not 2D as such. **No threshold was moved for
   this**, deliberately: the mass is genuinely there, it GROWS with step count so
   any fixed threshold is outrun by a long enough run, and one high enough to be
@@ -1218,8 +1089,93 @@ not only the risk it names.
   WORDS — `SimulatorView.boundaryTitle` names single precision as a cause in a
   float32 2D session, because the standing remedy ("restart with a larger
   domain") is the one thing that cannot help here. Pinned by
-  `test_float32_in_2d_moves_real_mass_to_the_edge_band`; full numbers in
+  `test_float32_in_2d_moves_real_mass_to_the_edge_band`; numbers in
   `notes/2d-milestones.md`.
+- **EXPRESSION INITIAL CONDITIONS (`wexpr`, `psi`, 2026-08-04): the transform is
+  four lines and every trap is in what the diagnostics CANNOT see.** Full
+  measurements in `notes/expression-ics.md`; `core/expr.py` is the ONE security
+  boundary all three kinds of user expression go through.
+  `initial.psi_wigner` builds W(q,k) = (1/2π)^n ∫dⁿθ ψ*(q + ħθ/2) ψ(q − ħθ/2)
+  e^{ik·θ} on the θ lattice `Grid` already owns. Per momentum axis: multiply by
+  the ramp e^{i k₀ θ}, inverse DFT, multiply by (−1)^m, scale by 1/d[k].
+  **THE RAMP IS NOT OPTIONAL AND NOT A NON-SYMMETRIC-BOX SPECIAL CASE** — k₀ is
+  `float(grid.v[a][0])`, the first LATTICE value (not `lo`, which can differ by
+  an ulp on a regridded axis), and it is never 0 for a box straddling the
+  origin. Dropped, the relative error is **1.0** on a symmetric box while the
+  norm stays exactly 1.000000, so only a cell-by-cell comparison against the
+  analytic form can see it (`test_the_momentum_ramp_is_not_optional`).
+  **THE MOMENTUM BOX CANNOT PRODUCE A NORM DEFICIT, AND NOTHING ELSE SEES IT
+  EITHER.** The transform is exactly N_k-periodic in the momentum index, so
+  content outside the box ALIASES back in rather than being lost. Measured on a
+  packet at p₀ = +2 with the momentum box [−10, −2], which excludes its mean
+  momentum entirely: norm 1.0000000000, purity 1.000000, edge band 6.5e-06 —
+  every scalar diagnostic perfect on a completely wrong state, while
+  `_psi_lattice`'s direct-quadrature **momentum mass** reads 4.8e-16. It is the
+  only detector there is; do not remove it because "the edge band covers that".
+  **ψ IS NORMALISED OVER THE EXTENDED SPATIAL BOX**, so ∫W dμ is the in-box mass
+  fraction and the norm deficit keeps the meaning it has for the Gaussian kinds;
+  normalising over the visible box makes it a structural zero. The extension is
+  capped at `NORM_PAD_MAX` box widths per side because the Bopp half-width is
+  ħπ/(2dk) and GROWS as the momentum axis is refined — at 1D 4096² it is 402
+  against a box of 8, and the φ quadrature's kernel asked for 13.7 GB.
+  **THE NORMALIZER IS BOUNDED FROM BOTH SIDES, AND THE UPPER BOUND IS THE ONE
+  THAT IS EASY TO FORGET.** Every sample can be finite while the total is not —
+  `exp(-x^2/2)*exp(360)` overflows only when SQUARED — and dividing by inf was
+  silent in both directions: a `wexpr` came out identically ZERO (blank panel,
+  ∫W = 0, no warning) and a `psi` came out all-NaN, which **no diagnostic can
+  see either, because every one of them is a `>` comparison and NaN fails all of
+  them** (measured: an all-NaN state produces `warnings: []`). Reachable in
+  eighteen characters, precisely because these kinds auto-normalise. The lower
+  test is RELATIVE for the same reason — an absolute floor refused
+  `1e-15*exp(-x^2-p^2)`, a perfectly good state, with a sentence claiming it had
+  no positive total. `psi_wigner` also checks `isfinite(W)` as `wexpr_wigner`
+  does: `_psi_lattice` validates ψ only on the CAPPED lattice while the build
+  evaluates it over the full extended reach.
+  **THE PROBE DTYPE MUST BE THE ONE THE BUILD USES, and the two kinds differ.**
+  ψ is evaluated at complex-dtype arguments inside the transform, so `sqrt` of a
+  negative real is a finite branch value there; a W is sampled on
+  `grid.nat_mesh`, which is float64. Probing a W complex accepted
+  `sqrt(x)*exp(-p^2)`, and `POST /sessions` then answered 200 and killed four
+  worker threads — the exact failure compiling at the door prevents.
+  **A ψ IS NEVER ACCUSED OF NOT BEING A QUANTUM STATE.** A wavefunction always
+  defines a valid pure state, so γ > 1 there can only mean the grid is aliasing
+  it — same detector, different sentence, the move `boundaryTitle` already makes
+  for float32. Its tolerance is looser too (1e-4 against 1e-6).
+  **BOTH BUILDS ARE BLOCKED AGAINST FIXED BYTE BUDGETS**, which is what lets
+  `PREVIEW_BYTES_PER_CELL` stay one number per ndim: an arbitrary expression's
+  unblocked transient grows with its own tree width, so there is no honest
+  constant for it.
+  **`initial.ICError` is its own class** so `routers/preview.py` can tell a
+  client error from a cupy OOM. Most of these are only knowable once W exists,
+  so they are raised from inside the build — where the CPU fallback would
+  otherwise retry them, fail identically and surface as a 500. That means the
+  GPU handler must defer its pool release to `failed` like the OOM path does
+  (a release inside a live `except` frees nothing) and must NOT fall through to
+  the CPU. Tests assert the CLASS and COUNT the builds, or neither property is
+  pinned.
+  The IC is compiled ONCE in the router and threaded through
+  (`session.compiled_ic`), like `compiled_potential`: `worker._run` runs per
+  variant, so compiling there is four threads parsing one string through sympy's
+  global caches — and a bad expression must be a 422 at the door. **The GRID
+  rail is checked first**, in both routers, so one body cannot get two different
+  errors depending on which endpoint it reached (the property
+  `grid_limit_error`'s docstring is about) and an over-the-rail grid does not
+  pay for a sympy parse and a 33⁴ probe first.
+  **CARRYING BOTH SHAPES IS LEGAL, AND THE FOREIGN ONE IS NORMALISED AWAY
+  RATHER THAN REFUSED.** The editor holds a default for every tab at once —
+  that is what makes switching tabs non-destructive — so a form on the `wexpr`
+  tab genuinely has Gaussian components behind it, and so does every stored
+  config, setup document and mp4 comment tag written before `expr` existed.
+  `ICSpec._check` therefore requires the kind's own field and DROPS the other,
+  which keeps the dead one out of `describe.setup_document` and off
+  `SessionCreate`'s per-component ndim loop with one rule in one place.
+  `lib/config.icPayload` sends only the active kind's shape too; that is belt
+  and braces, and the schema is the belt. **Refusing the foreign field instead
+  was shipped and immediately broke a cold start** — with local data cleared,
+  selecting the W(x,p) or ψ(x) tab answered *"an IC of type 'wexpr' is one
+  expression and carries no Gaussian components (got 1)"*, a schema telling a
+  client its own defaults were invalid. A rule that only holds once every client
+  has been rewritten is not a schema rule; normalise at the door instead.
 - **MASSLESS (m = 0) relativistic runs lose purity to the |k| KINK, and it is
   the GRID not the step.** m = 0 became reachable in 2D only with M2 (the schema
   requires exclusively relativistic variants there, since non-relativistic
@@ -1258,188 +1214,103 @@ not only the risk it names.
   picks the SPECTRAL working dtype. float32 must never be the default and never
   the setting a physics claim is made from; the UI badges it permanently and
   every exported mp4 says so on its own metadata line.
-  - **What it costs.** complex64 stepping destroys the diagnostics this project
-    navigates by: over 2000 steps at 256², Δpurity −2.4e-4 and ΔE +9.4e-4, both
-    SECULAR — exactly the boundary-wrap signature in the gotcha below, from a
-    perfectly contained state — with ΔX·ΔP noise of 1.3e-3, 150× the ~7e-6
-    relativistic shear that `test_relativistic_uncertainty_shear` pins. (float64
-    for comparison: +6.7e-13, bounded +4.2e-5, +5.1e-8.)
-  - **What it buys, measured 2026-07-25 with `scripts/bench.py --precision both`
-    on the real propagator, RTX 3090: 3.84× at 1024², 3.39× at 2048², 3.29× at
-    4096².** NOT the "~5×" this file used to quote, and there is no "4.8×" —
-    reproduce it from the repo rather than citing a session log. The 2080 Ti
-    lands in the same 3.3-3.7× band. **Those are 1D figures and they do NOT
-    carry to 2D — see the float32-in-2D gotcha, where the same card gives
-    1.5-2.6×.** **On CPU it buys nothing**: pyFFTW through
-    the `builders` API `fft_pair` actually uses measures 6.01 ms (c128) vs
-    5.80 ms (c64) at 1024². This is a CUDA feature.
-  - **It is a MIXED scheme, and that is not a compromise — it is required and
-    it is free.** Only the spectral working array and the exponent PHASES are
-    single; the grid meshes, both `qd()` evaluations, `dU_im`/`dT_im` and `H`
-    stay float64. Required, because relativistic `dT` built in float32 has max
-    abs error 455 against max |dT| = 228 (200%: mc² cancels inside a difference
-    of ~1.9e4-magnitude terms) — and because keeping construction double is what
-    lets `_rate_mesh`'s 1e-13 gate and the frozen-lattice regrid arithmetic stay
-    exact with no dtype-scaled tolerances anywhere. Free, because the FFTs are
-    the cost: mixed measures 3.72/3.62/3.22× against 3.80/3.69/3.27× for float32
-    everywhere. `test_precision.py` asserts the rate meshes are BITWISE
-    identical between the two modes, relativistic variants included.
-  - **Two failure modes are invisible in results, so they are pinned by DTYPE
-    assertions.** A complex64 array handed to a complex128 pyFFTW plan is
-    silently upcast by `auto_align_input` (correct answer, complex128 speed);
-    and `B *= expT` with B complex64 and expT complex128 is legal in both numpy
-    and cupy (correct answer, via a full complex128 temporary). No physics
-    assertion can catch either. Hence `fft_pair` takes an explicit dtype and
-    `exponents()` casts.
-  - **Memory drops to ~54%, not 50%** — `dU_im`/`dT_im` stay float64 and are
-    irreducible. Measured per-worker arena on the 3090 with `bench.py
-    --footprint` (float64 → float32, post-M7): 768 → 420 MiB at 2048²,
-    3.00 → 1.63 GiB at 4096², 12.0 → 6.5 GiB at 8192², i.e. **192 vs 104
-    B/cell** — 224 vs 120 before M7 dropped the second exponent slot. Note the
-    frame history is NOT affected: it is already uint16 via `core/quantize.py`,
-    so `WIGNERF_HISTORY_MB` buys the same record count either way.
+  **Read `notes/precision.md` before touching any of this** — it carries the
+  bench figures, the mixed-scheme derivation and the two invisible failure
+  modes behind every rule below.
+  - **What it costs**: complex64 stepping destroys the diagnostics this project
+    navigates by — over 2000 steps at 256², Δpurity −2.4e-4 and ΔE +9.4e-4, both
+    SECULAR from a perfectly contained state, i.e. the boundary-wrap signature.
+  - **What it buys**: 1D **3.3-3.8× on CUDA**, 2D only **1.5-2.6×** (see the
+    float32-in-2D gotcha — do not quote the 1D figure for 2D), and **nothing at
+    all on CPU**. Memory ~54%, not 50%.
+  - **It is a MIXED scheme and that is REQUIRED, not a compromise.** Only the
+    spectral working array and the exponent PHASES are single; the grid meshes,
+    both `qd()` evaluations, `dU_im`/`dT_im` and `H` stay float64. Relativistic
+    `dT` built in float32 has 200% error (mc² cancels inside a difference of
+    ~1.9e4-magnitude terms), and keeping construction double is what lets
+    `_rate_mesh`'s 1e-13 gate and the frozen-lattice regrid arithmetic stay
+    exact with no dtype-scaled tolerances anywhere. It is also FREE — the FFTs
+    are the cost. `test_precision.py` asserts the rate meshes are BITWISE
+    identical between the two modes.
+  - **Two failure modes are invisible in RESULTS, so they are pinned by DTYPE
+    assertions**: a complex64 array handed to a complex128 pyFFTW plan is
+    silently upcast, and `B *= expT` across dtypes silently allocates a
+    complex128 temporary. Both give the right answer at the wrong speed, so no
+    physics assertion can catch either. Hence `fft_pair` takes an explicit dtype
+    and `exponents()` casts.
   - **float32 REFUSES auto-expand, and `tol` below 1e-5** (`protocol.py`
     `MSG_EXPAND_F32` / `MSG_TOL_F32`, enforced at create AND on the live
-    ParamChange path, because both fields are reachable live). Auto-expand,
-    because single-precision noise passes its own detector: measured at 256²
-    with a coherent state parked at the ORIGIN (true band mass ~1e-15), edge
-    mass climbs 1.8e-15 → 6.1e-7 (step 200) → 1.6e-6 (step 600, TRIGGERED),
-    while the 1e-8 support scan reads the WHOLE axis by step 200 against an
-    exact [43, 214) in float64 — so the planner would size a new domain from
-    noise. Detection still WARNS, on a raised threshold
-    (`boundary.EDGE_THRESHOLD_BY_PRECISION`, 1e-4 for float32; at that band
-    mass the mass actually at the seam is still ~1e-6, so it remains an early
-    warning). `tol`, because `adjust_step`'s full-step-vs-two-half-steps
-    residual has a measured float32 floor of ~7.4e-7 (flat in dt, and larger at
-    larger grids) against 1.6e-15 in float64 — below that the controller shrinks
-    dt through all 15 tries every 20 steps and never converges.
-    **Both refusals are also enforced in the FORM, not just answered with a
-    422**: `lib/config.applyPrecisionInvariants` clears `auto_expand` and raises
-    `tol` to `TOL_MIN_F32` (the frontend mirror of `protocol.TOL_MIN_F32` — move
-    both together), and the Setup panel disables the checkbox and lowers the tol
-    input's `min`. The config-level invariant is the load-bearing half: the panel
-    can be unmounted, and `probeHost`/`mergeConfig` reach the same combinations
-    from outside it. **How the gates are EXPLAINED is a settled three-part
-    pattern, and a standing paragraph is not part of it** — two permanent notes
-    beside controls you are not allowed to change were crowding the actual
-    controls out of a narrow column. Instead: a compact permanent marker in the
-    label that costs no line ("auto-expand (f64)", "tol ≥1e-5"; there was a
-    "(1D)" marker beside auto-expand until M3 retired the 2D gate on
-    2026-08-01); the full reason in the control's `title`;
-    **`:disabled` on the control itself** wherever the value is not merely
-    discouraged but overridden — the precision select was left enabled at ndim=2
-    and `applyNdimInvariants` put its value back in `payload()`, so picking
-    float32 lit an amber "restart to apply" against a value no restart could
-    send, and on a fresh session made `syncFreshSessionToForm` build TWO of them
-    (its loop re-reads the form after `restart()`, which had moved it back); and
-    the reason ONCE in amber
-    (`f32Applied`, recorded at the moment of the switch so it names only what
-    actually changed — a form already at tol = 0.01 had nothing raised) while
-    `runDiffers('precision')` holds, so "Restart session" clears it and the
-    header badge carries the one permanent fact from then on. The amber note is
-    not garnish: it is the only path on a touch device, which has no hover.
-    But it renders ONLY when `f32Applied` is non-empty, and it no longer opens
-    with "single precision mode" — that phrase said nothing the precision
-    select, its `title` and the header's float32 badge do not already say, and
-    it appeared even when the switch had changed nothing else, which is the
-    common case (a form already at tol ≥ 1e-5 with auto-expand off). Measured
-    on the real panel: a float64 → float32 switch after a 399-record run used
-    to raise THREE amber paragraphs and now raises one, the COMPUTE line naming
-    what is running.
+    ParamChange path, because both fields are reachable live). Auto-expand
+    because single-precision noise passes its own detector and the planner would
+    size a new domain from it; `tol` because `adjust_step`'s residual has a
+    float32 floor of ~7.4e-7 against float64's 1.6e-15, below which the
+    controller never converges. Detection still WARNS, on a raised threshold
+    (`boundary.EDGE_THRESHOLD_BY_PRECISION`, 1e-4).
+    **Both refusals are also enforced in the FORM**:
+    `lib/config.applyPrecisionInvariants` clears `auto_expand` and raises `tol`
+    to `TOL_MIN_F32` (the frontend mirror of `protocol.TOL_MIN_F32` — move both
+    together), and the Setup panel disables the checkbox and lowers the tol
+    input's `min`. The config-level invariant is the load-bearing half: the
+    panel can be unmounted, and `probeHost`/`mergeConfig` reach the same
+    combinations from outside it.
+    **How the gates are EXPLAINED is a settled three-part pattern**: a compact
+    permanent marker in the label that costs no line ("auto-expand (f64)",
+    "tol ≥1e-5"); the full reason in the control's `title`; `:disabled` on the
+    control itself wherever the value is not merely discouraged but overridden;
+    and the reason ONCE in amber (`f32Applied`) while `runDiffers('precision')`
+    holds. **A standing paragraph is not part of it** — see
+    [no-mystery-disabled-controls].
     Clearing `auto_expand` in the form is NOT enough on its own, because it
-    applies LIVE — `SimulatorView` watches `cfg.precision` and sends
+    applies LIVE: `SimulatorView` watches `cfg.precision` and sends
     `auto_expand: false` to a running session, since the status→form watcher
     cannot (`status.auto_expand` does not CHANGE, so it never fires) and the
-    checkbox is by then disabled, which left a session quietly expanding behind
-    an unchecked, unreachable box. **`cfg.grid.ndim` was in that key too until
-    M3 (2026-08-01)**, and it mattered more there than precision does: 2D
-    refused auto-expand, `applyNdimInvariants` cleared the form, and `dims` is
-    restart-only — so the old 1D session could go on regridding for as long as
-    the switch waited for its restart, far longer than the float32 case ever
-    lasts. That gate is gone, so precision is the whole condition again.
+    checkbox is by then disabled.
     **And the invariants must be applied SYNCHRONOUSLY at the point of change,
     never from a watcher.** `SetupPanel`'s precision select calls
-    `onPrecisionChange` directly, because a watcher is too late: a child's setup
-    runs during the parent's render, so `SimulatorView`'s own `cfg.precision`
-    watcher holds a lower id and its pre-flush job runs FIRST — and on a fresh
-    session it restarts (`syncFreshSessionToForm`) inside that same flush,
-    serializing a config the panel had not fixed up yet. Symptom: picking
-    float32 with auto-expand on 422'd immediately in BOTH run modes (both start
-    fresh, so both take the auto-restart path). `payload()` therefore calls
-    `applyPrecisionInvariants` too — the form must be self-consistent before it
-    is serialized, and that is the last place it can be guaranteed regardless of
-    which watcher ran first.
+    `onPrecisionChange` directly: a child's setup runs during the parent's
+    render, so `SimulatorView`'s own `cfg.precision` watcher holds a lower id and
+    runs FIRST — and on a fresh session it restarts inside that same flush,
+    serializing a config the panel had not fixed up yet. `payload()` therefore
+    calls `applyPrecisionInvariants` too, as the last place self-consistency can
+    be guaranteed regardless of which watcher ran first.
   - **Do NOT "optimize" `exponents()` by casting the ANGLE instead of the
     result.** `exp(1j*θ).astype(complex64)` is safe for any finite θ because the
     modulus is 1; `exp(1j*θ.astype(float32))` is NaN for θ ~ 1e91, which a steep
     U on the extended Bopp range reaches at large grids — and `worker._finite`
     checks the float64 rate meshes, so nothing would see it.
-- The exponent generators dU, dT are EXACTLY purely imaginary (max|Re| = 0
-  in all four variants), so they are stored as the real rate meshes
-  `dU_im`/`dT_im` and `exponents()` rebuilds the phase — half the bytes,
-  bitwise-identical results. `Propagator._rate_mesh` REFUSES a generator whose
-  real part exceeds 1e-13 relative to its imaginary part, rather than
-  truncating it: a real part means |expU| ≠ 1, an evolution that quietly
-  gains or loses norm.
 - **ONE exponent slot, because every committed substep inside a record is the
-  same size (M7, 2026-08-02) — and the CACHED PLAN is what makes that true.**
-  `worker._advance` used to walk a record at the full `dt` and clamp the last
-  substep onto τ_k; that straggler was a different dt, so it needed a second
-  slot (`_exp_odd`) beside `_exp_main`, 4 complex meshes = 64 B/cell, the
-  largest single item in the 4D working set. `_substep` now divides what is
-  left of the record into `n = ceil(|rem|/|dt|)` EQUAL steps of `rem/n`. `ceil`
-  rounds UP after a one-ulp quotient correction, so the step never materially
-  exceeds `dt` and the schedule is never less accurate than the one it replaced.
-  (The 8-entry dict THAT replaced kept seven dead pairs alive — 1781 → 904 MiB
-  at 4 workers, 1024² — because dt is re-tuned every 20 steps so old entries
-  were never asked for again.)
-  **Adaptive retuning is a NON-COMMITTING boundary probe.** `adjust_step`
-  selects the cap before a record, but its trial state is dropped; the whole
-  record then runs on `_substep`'s quotient. A cadence reached mid-record is
-  latched and probed at the next target, rather than splitting the record into
-  two production sizes.
-  **`_substep` caches its plan against `t_tgt`, and that is not an
-  optimization — without it the milestone backfires.** `rem` shrinks as the
-  record is walked, so recomputing `rem/n` at every substep returns sizes that
-  differ in the last ulps: nominally identical, but DISTINCT float keys, so the
-  one slot misses on nearly every step. Measured without the cache: **5 distinct
-  sizes across 12 substeps and 22 rebuilds over three records**, against the
-  two-slot scheme's one cached production pair per record. A stale plan is as
-  wrong as a stale exponent, so `_exp_clear` drops both together — every site
-  that invalidates one must invalidate the other.
-  **And because the size is cached, `_advance` iterates on the substep COUNT and
-  must never go back to summing toward τ_k.** The pre-M7 loop could exit on
-  `|τ_k − t| > eps` because its last step was clamped to `min(|dt|, |rem|)` and
-  therefore self-correcting; a cached size has no such step. Once n accumulations
-  of `rem/n` land further than `eps = 1e-12·max(1, |τ_k|)` from the target — n
-  ~ 25000 at t ~ 5, which two maximal `adjust_step` contractions reach — the loop
-  takes ANOTHER full substep, marches PAST τ_k and never returns, since dts keeps
-  its sign. Measured on the residual loop at dt = record_dt/50000 from t = 5:
-  **11.5 million substeps for a record wanting 50000**, still going when a
-  watchdog stopped it — an unkillable spin with no error and no emitted record,
-  where the old scheme was merely slow. Pinned by
-  `test_a_record_that_needs_many_substeps_still_terminates`.
-  **The production rebuild COUNT is at most one per record**, because
-  τ_k − τ_(k−1) normally changes the quotient's float key. The controller's
-  temporary probe pairs are separate and dropped before that production pair is
-  built. So M7 buys MEMORY, not speed; do not let the halved slot count imply a
-  halved rebuild rate. Measured 208 → 176 B/cell in 2D and 224 → 192 in 1D
-  (float32 112 → 96, 120 → 104) — a flat −32 B/cell at both dimensionalities,
-  −15.4% and −14.3%. The row that promised −22% predated M1's measurement of the
-  208 it was a fraction OF.
-  **`adjust_step`'s returned state and pair are DROPPED, not stored.** It
-  selects the cap from a trial state; no trial becomes a production substep, so
+  same size (M7) — and the CACHED PLAN is what makes that true.** `_substep`
+  divides what is left of a record into `n = ceil(|rem|/|dt|)` EQUAL steps of
+  `rem/n`, so the straggler that needed a second slot is gone: −32 B/cell at
+  both dimensionalities. Four rules, measurements in `notes/2d-milestones.md`:
+  **Adaptive retuning is a NON-COMMITTING boundary probe** — `adjust_step`
+  selects the cap before a record and its trial state and pair are DROPPED, so
   the cached pair always belongs to `_substep`'s quotient. Storing the pair, as
-  the old code did for free, would be the second slot resurrected once per
-  adjust.
+  the old code did for free, is the second slot resurrected once per adjust.
+  **`_substep` caches its plan against `t_tgt`, and without it the milestone
+  BACKFIRES**: `rem` shrinks as the record is walked, so recomputing `rem/n`
+  returns sizes differing in the last ulps — distinct float keys, so the one
+  slot misses on nearly every step (measured 5 sizes and 22 rebuilds over three
+  records, against one cached pair per record). A stale plan is as wrong as a
+  stale exponent, so `_exp_clear` drops both together; every site that
+  invalidates one must invalidate the other.
+  **Because the size is cached, `_advance` iterates on the substep COUNT and
+  must never go back to summing toward τ_k.** The pre-M7 loop could exit on
+  `|τ_k − t| > eps` because its last step was clamped and therefore
+  self-correcting; a cached size has no such step, so once n accumulations land
+  further than eps from the target the loop takes ANOTHER full substep and
+  marches past τ_k forever — measured 11.5 million substeps for a record wanting
+  50000, an unkillable spin with no error and no emitted record. Pinned by
+  `test_a_record_that_needs_many_substeps_still_terminates`.
+  **M7 buys MEMORY, not speed** — the production rebuild count is at most one
+  per record either way; do not let the halved slot count imply a halved rebuild
+  rate.
   **What the physics suite cannot see**: `test_propagator*.py` and
   `test_precision.py` drive `Propagator` directly through a private fixed-dt
   `evolve()` helper, so they never enter `_advance` — all 72 items were bitwise
   unchanged by M7 and would be just as unchanged by a scheduler that never
-  landed on τ_k. `tests/test_substep.py` exists for that gap: one size per
-  record, the step within one ulp of `dt`, one cached production pair per
-  record, boundary-only probes, both time directions, and O(dt²) convergence
-  (measured ratio 4.51). It caught the missing plan cache.
+  landed on τ_k. `tests/test_substep.py` exists for that gap, and it caught the
+  missing plan cache.
 - **`close()` must tear the streamer down, or the whole FrameHistory leaks.**
   The `ws_endpoint` coroutine holds `s` (hence its entire history) as a local;
   `close()` pops the session from `SESSIONS` and stops its workers but the
@@ -1463,270 +1334,255 @@ not only the risk it names.
   mid-replay drop is diagnosable from the journal.
 - **A departing browser must free its session PROMPTLY, not on the idle TTL.**
   A tab close / reload / navigate sends NO `DELETE` (Vue's `onBeforeUnmount`
-  does not run on a real unload, and its awaited DELETE would not complete):
-  the backend learns only via the WS close, whose `finally` merely *pauses +
-  detaches* (`ws_attached=False`, `set_running(False)`, stamp `last_seen`) —
-  it never calls `close()`. So the session lingers in `SESSIONS` with
-  alive-but-idle workers holding the full `FrameHistory` (RSS) and each
-  worker's CuPy pool + cuFFT cache + exponent meshes (VRAM) until the idle
-  sweeper reaps it. A reload creates a NEW session at once, so it competes
-  with its own just-orphaned twin for the same RAM/VRAM (worker OOM = the
-  "denied computation" symptom). THREE-part fix: (1) the frontend fires a
-  `keepalive` `DELETE` on `pagehide` (`useSession.beaconDestroy`, registered
-  in `SimulatorView.vue`; skips `event.persisted` bfcache) so a genuine
-  departure frees resources promptly — this is safe against `recover()`, which
-  is a live-tab `sock.onclose`, never a pagehide. The `DELETE` path
-  (`delete_session`) drops its own `s` local (`del s`) and calls
-  `_collect_closed()` right after `close()` so the history's cyclic garbage is
-  gc'd + `malloc_trim`'d promptly instead of waiting up to a sweep cadence; it
-  is a sync endpoint so that runs in a threadpool thread, off the event loop.
+  does not run on a real unload): the backend learns only via the WS close,
+  whose `finally` merely *pauses + detaches* — it never calls `close()`. So the
+  session lingers in `SESSIONS` with alive-but-idle workers holding the full
+  `FrameHistory` (RSS) and each worker's CuPy pool + cuFFT cache + exponent
+  meshes (VRAM) until the sweeper reaps it, and a reload creates a NEW session
+  at once, so it competes with its own just-orphaned twin. THREE-part fix:
+  (1) the frontend fires a `keepalive` `DELETE` on `pagehide`
+  (`useSession.beaconDestroy`; skips `event.persisted` bfcache) — safe against
+  `recover()`, which is a live-tab `sock.onclose`, never a pagehide. The
+  `DELETE` path drops its own `s` local (`del s`) and calls `_collect_closed()`
+  right after `close()`, off the event loop.
   **The `del s` and the arm-until-freed logic are not optional** — a closed
   session is a cycle, so `gc.collect()` frees NOTHING while any live reference
-  roots it, and at DELETE time there are two: the handler's own `s` local (hence
-  `del s`) and, if a client was attached, the `ws_endpoint` streamer coroutine
-  still unwinding on the event loop (its teardown is bounded at 3 s and races
-  the threadpool DELETE). So `_collect_closed` keeps `_closed_since_sweep`
-  ARMED while any `weakref` in `_closed_refs` is still alive, and only clears it
-  once the cycle is actually gone. Clearing it unconditionally — the original
-  DELETE-path call did — meant a collect that ran a beat before the streamer
-  released left the flag down, the 5 s sweeper then no-op'd, and the multi-GB
-  history sat resident until a chance gen-2 gc (the observed "RSS stuck at
-  13.2 GB, nothing in the logs"). Now it frees at once when nothing else roots
-  it, else the sweeper retries within ~5 s. Pinned by
+  roots it, and at DELETE time there are two: the handler's own local and, if a
+  client was attached, the `ws_endpoint` streamer coroutine still unwinding.
+  So `_collect_closed` keeps `_closed_since_sweep` ARMED while any `weakref` in
+  `_closed_refs` is still alive. Clearing it unconditionally meant a collect
+  that ran a beat before the streamer released left the flag down and the
+  multi-GB history sat resident until a chance gen-2 gc (the observed "RSS stuck
+  at 13.2 GB, nothing in the logs"). Pinned by
   `test_collect_stays_armed_while_a_closed_session_is_rooted`. VRAM comes back
-  at worker-join inside `close()` (a worker finishes its in-flight record before
-  seeing the stop flag, so a mid-compute large-grid quit takes a few seconds).
-  (2) `WS_IDLE_TTL` is 20 s
-  (down from 120), swept every 5 s (down from 15), so the crash/kill fallback
-  is bounded at ~20-25 s; 20 s stays well above `recover()`'s ~1.5 s reattach,
-  so a transient drop on a live tab still re-shields (`ws_attached=True`)
-  before the sweep. (3) `start.sh` PINS `--ws-ping-interval/timeout 20` (these
-  MATCH uvicorn's current defaults) so a HALF-OPEN drop (kill -9, laptop
-  sleep, network partition — no TCP FIN) is detected by the keepalive and
-  closed, running the `finally` (detach) instead of `receive_text()` blocking
-  on the dead socket forever; that bounds the case at ~60 s. Explicit only so
-  the keepalive can't silently regress (a `--ws` impl swap, a future default
-  change). The 20 s grace is pinned by
+  at worker-join inside `close()`.
+  (2) `WS_IDLE_TTL` is 20 s, swept every 5 s, so the crash/kill fallback is
+  bounded at ~20-25 s and still well above `recover()`'s ~1.5 s reattach.
+  (3) `start.sh` PINS `--ws-ping-interval/timeout 20` (matching uvicorn's
+  current defaults) so a HALF-OPEN drop — kill -9, laptop sleep, network
+  partition, no TCP FIN — is detected by the keepalive and closed, running the
+  `finally` instead of `receive_text()` blocking forever; that bounds the case
+  at ~60 s. Explicit only so the keepalive cannot silently regress. The 20 s
+  grace is pinned by
   `test_detached_session_swept_after_grace_attached_is_shielded`.
 - **The BROWSER'S WebSocket receive path is the large-grid wall, and it
   degrades with MESSAGE SIZE — not the server, not painting, not pacing.**
-  Measured 2026-07-23, 4096² (32 MiB/record), Chrome + RTX 2080 Ti:
-  `__wfPerf` reported 3.5 records/s and 112 MiB/s with `queue_drops: 0` and
-  `fanout` 8.7 ms/frame — i.e. the client could paint ~115 fps and was idle,
-  waiting on delivery — while the SAME server fed a raw Python client on the
-  same machine at 402 MiB/s (14.8 rec/s). Two runs of different length
-  reported 110.91 and 112.77 MiB/s: a hard ceiling, not a loop settling.
-  32 MiB ÷ 112 MiB/s = 285 ms = the 3.5 fps observed. But it is NOT a fixed
-  bandwidth: at 2048² (8 MiB/record) the same browser sustains 60 fps ⇒
-  ≥480 MiB/s, 4× better, so the cost is per-message and grows sharply with
-  payload size. This is the measurement that makes display-downsampling the
-  only real fix for interactive 4096²/8192² (1024² display frames are 2 MiB;
-  the same ceiling then allows ~56 rec/s), and it is why no pacing policy can
-  help: the pacer targets paint time (8.7 ms), 33× off the real constraint.
-  Related, also measured: a full-speed replay makes server RSS hump ~3 GB
-  over 120 records at 4096² and then drain back to baseline (the sender
-  running ahead into the in-flight send queue plus allocator churn —
-  transient, not a leak; backpressure to a genuinely SLOW reader is bounded
-  at ~4 records). `pack_frame` costs 28 ms/record at 4096² ON THE EVENT LOOP
-  (two full copies: `tobytes()` then `b"".join`), capping replay at ~35 rec/s
-  server-side before the transport is even involved.
-- **`free_all_blocks()` frees only what is FREE — drop the worker's own arrays
-  first.** `_release_gpu_pool` runs in `run()`'s `finally`, where `_run`'s
-  locals (W, prop) are gone but ATTRIBUTES are not: the two exponent slots
-  still hold 4 complex128 meshes, so the release left exactly that behind —
-  256 MiB at 2048², 1.0 GiB at 4096², 4.0 GiB at 8192², per worker. Those
-  returned to the pool only when the worker was collected (session↔worker
-  cycle ⇒ needs gc) and to the DRIVER only at some LATER worker's
-  `free_all_blocks()`, which is why VRAM used to come back on the SECOND
-  "Restart session" and not the first. `self._exp_clear()` now runs before
-  the GPU guard (on CPU those meshes are host RAM, held just as long), and
-  the worker's own cuFFT plan cache (per thread AND device) is cleared in the
-  same place. Measured at 2048², one QN worker, gc disabled: release went
-  `used 256 → 256 MiB` before, `256 → 0` after; steady-state process VRAM
-  1094 → 838 MiB, and the two-restart staircase became one step.
+  Measured at 4096² (32 MiB/record): the client reported 3.5 records/s with
+  `queue_drops: 0` and 8.7 ms/frame of fan-out — i.e. it could paint ~115 fps
+  and was idle, waiting on delivery — while the SAME server fed a raw Python
+  client on the same machine at 402 MiB/s. Two runs of different length reported
+  110.91 and 112.77 MiB/s: a hard ceiling, not a loop settling. But it is NOT a
+  fixed bandwidth — at 2048² the same browser sustains ≥480 MiB/s, 4× better —
+  so the cost is per-message and grows sharply with payload size. **This is the
+  measurement that makes display-downsampling the only real fix for interactive
+  4096²/8192², and why no pacing policy can help**: a pacer targets paint time
+  (8.7 ms), 33× off the real constraint. Also measured: a full-speed replay
+  makes server RSS hump ~3 GB and drain back (the sender running ahead into the
+  in-flight send queue — transient, not a leak), and `pack_frame` costs 28 ms/
+  record at 4096² ON THE EVENT LOOP. Numbers in `notes/session-lifecycle.md`.
 - **Two more things kept a closed session's RAM resident, both found only by
-  measuring RSS across a Restart (2026-07-23).** (1) `ttl_sweeper` iterated
-  `SESSIONS` inline, and a `for` target outlives its loop — so the sweeper
-  held the LAST session it examined across its sweep sleep, and FOREVER once
-  SESSIONS emptied, because an empty loop never rebinds the name. 3.2 GB
-  survived DELETE + explicit `gc.collect()` at 4096²/100 records; tens of GB
-  at 8192². The loop now lives in `_sweep_idle`, whose frame dies on return
-  (pinned structurally by `test_ttl_sweeper_never_binds_a_session_in_its_own_
-  frame`). (2) glibc's mmap threshold is DYNAMIC — 128 KiB initially,
-  ratcheting up to the size of each freed mmap'd block, capped at 32 MiB. A
-  4096² record is 32.03 MiB (just over the cap, always mmap'd, self-returning)
-  but a 2048² record is 8.02 MiB, so after the ratchet those come from the
-  arena and `free()` never lowers RSS: 1459 MiB still held at 2048²/300
-  records, 964 MiB of it recovered by `malloc_trim(0)`, which
-  `_collect_closed` now calls. **Record size decides which of these you
-  see**, so test memory at more than one grid — 4096² looked clean while
-  2048² sat at ~9.8 GB after two Restarts.
+  measuring RSS across a Restart.** (1) `ttl_sweeper` iterated `SESSIONS`
+  inline, and a `for` target outlives its loop — so the sweeper held the LAST
+  session it examined across its sweep sleep, and FOREVER once SESSIONS emptied,
+  because an empty loop never rebinds the name. The loop now lives in
+  `_sweep_idle`, whose frame dies on return (pinned structurally by
+  `test_ttl_sweeper_never_binds_a_session_in_its_own_frame`). (2) glibc's mmap
+  threshold is DYNAMIC — 128 KiB initially, ratcheting up to the size of each
+  freed mmap'd block, capped at 32 MiB — so records just under that cap come
+  from the arena and `free()` never lowers RSS; `_collect_closed` calls
+  `malloc_trim(0)`. **Record size decides which of these you see**, so test
+  memory at more than one grid: 4096² looked clean while 2048² sat at ~9.8 GB
+  after two Restarts. Figures in `notes/session-lifecycle.md`.
 - **A closed session's history is CYCLIC garbage — freeing it needs the
-  collector, not refcounting.** `SimSession.workers` holds each
-  `SolverWorker` and `worker.session` holds the session back, so after
-  `close()` the pair (and the whole `FrameHistory` hanging off it) is
-  unreachable but not refcount-free. On an otherwise idle server a gen-2
-  collection may not run for many minutes, so tens of GB stay resident long
-  after Restart and look EXACTLY like a leak. `session._collect_closed()`
-  makes it deterministic: `close()` sets `_closed_since_sweep` and the TTL
-  sweeper does one `gc.collect()` per sweep that had a close (off the event
-  loop; collection cost scales with tracked CONTAINERS, not with the bytes
-  they point at, so a multi-GB history is cheap to reap). Pinned by
-  `test_closed_history_needs_the_cyclic_collector`, which asserts BOTH
-  halves — the history survives `close()` + `del`, and dies on
-  `_collect_closed()`. If the back-reference is ever removed, that test
-  fails loudly rather than silently keeping a now-pointless collect.
+  collector, not refcounting.** `SimSession.workers` holds each `SolverWorker`
+  and `worker.session` holds the session back, so after `close()` the pair (and
+  the whole `FrameHistory` hanging off it) is unreachable but not refcount-free.
+  On an otherwise idle server a gen-2 collection may not run for many minutes,
+  so tens of GB stay resident long after Restart and look EXACTLY like a leak.
+  `session._collect_closed()` makes it deterministic: `close()` sets
+  `_closed_since_sweep` and the TTL sweeper does one `gc.collect()` per sweep
+  that had a close (off the event loop; collection cost scales with tracked
+  CONTAINERS, not with the bytes they point at). Pinned by
+  `test_closed_history_needs_the_cyclic_collector`, which asserts BOTH halves —
+  the history survives `close()` + `del`, and dies on `_collect_closed()` — so
+  if the back-reference is ever removed that test fails loudly rather than
+  silently keeping a now-pointless collect.
 - **Do not chase "leaked" objects with `gc.get_referrers` alone — it cannot
-  see frame locals.** The 2026-07-23 hunt for stray `SimSession`s (a sweeper
-  diagnostic listing live-but-unregistered sessions and their referrer
-  types) reported `{'list': 2, 'dict': 1}` and was wrong twice over: the two
-  lists were the diagnostic's OWN `live`/`leaked` locals, and the one dict
-  was a `SolverWorker.__dict__` — i.e. the ordinary cycle above, still
-  uncollected because the diagnostic never ran `gc.collect()` first. Verified
-  by reproducing the exact signature with `gc.disable()`; every real
-  lifecycle path (create/delete, reconnect churn, delete-while-streaming,
-  abandoned-then-closed) leaks nothing once collected. Two traps to remember:
-  a referrer snapshot must exclude its own containers, and in CPython 3.12
-  `gc.get_referrers` does NOT report an object held by a plain local
-  variable (fast locals are invisible unless `f_locals` was materialized) —
-  so "no coroutine frame holds it" is a conclusion that instrument can never
-  support. Use a `weakref` + explicit `gc.collect()` to decide whether
-  something leaked, and thread stacks (`sys._current_frames()`) to find who
-  is still running.
+  see frame locals.** A referrer snapshot must exclude its OWN containers, and
+  in CPython 3.12 `gc.get_referrers` does NOT report an object held by a plain
+  local variable (fast locals are invisible unless `f_locals` was materialized)
+  — so "no coroutine frame holds it" is a conclusion that instrument can never
+  support. Use a `weakref` + explicit `gc.collect()` to decide whether something
+  leaked, and thread stacks (`sys._current_frames()`) to find who is still
+  running. The 2026-07-23 hunt that established this is in
+  `notes/session-lifecycle.md`; every real lifecycle path leaks nothing once
+  collected.
 - **The boundary warning is ONE SHORT LINE, and the cells it names are
   drawable.** It can clear again within a couple of records as a state drifts
-  back out of the band, so the old sentence — which also explained periodicity
-  and offered a remedy — was regularly gone before it had been read. What
-  survives is only what cannot be got elsewhere: `⚠ W(x,y,px,py,t) has reached
-  the px edge — 1.3e-4 of its integral is in the outer 4 cells.` ("integral",
-  not "probability": the quantity is ∫W over the band, and W is signed.) The
-  reasoning and the remedy moved into the span's `title` (`boundaryTitle`), which
-  a hover holds still. The cell COUNT comes from the server (`band` in the
+  back out of the band, so a sentence that also explained periodicity and
+  offered a remedy was regularly gone before it had been read. What survives is
+  only what cannot be got elsewhere: `⚠ W(x,y,px,py,t) has reached the px edge —
+  1.3e-4 of its integral is in the outer 4 cells.` ("integral", not
+  "probability": the quantity is ∫W over the band, and W is signed.) The
+  reasoning and the remedy moved into the span's `title` (`boundaryTitle`),
+  which a hover holds still. The cell COUNT comes from the server (`band` in the
   boundary payload, per axis) rather than being re-derived, because it must be
-  the width the mass was actually measured with. **`lib/cells.ts` mirrors
-  `boundary.edge_band` separately, for DRAWING only** — a second "cells" toggle
-  (`wignerf.cells`, its own key, so "Reset setup to defaults" leaves it alone)
-  paints the computed lattice faintly on the W panels and the IC preview with the
-  edge-band cells brighter, so the number in that warning points at something
-  visible. The mirror exists because the overlay follows the PAINTED frame, which
-  during a scrub across an auto-expand boundary is not the live window the
-  server's `band` describes. Ticks and cells are INDEPENDENT layers
-  (`showTicks`/`showCells`), and the lattice is dropped when more than ~200 of
-  its lines would land in the visible window — a COUNT not a pixel test, so
-  zooming in brings it back, which is what makes it usable at 1D's 4096
-  (measured: N=64 draws 110 lattice + 20 band lines; N=1024 draws 0 + 132).
-  **The three toggles share ONE row** (`flex`, natural widths, labels
-  "auto-expand", "grid", "cells"), which is what pays for the third control in a
-  320px column: verified at the real width, one line and `scrollWidth ===
-  clientWidth` at ndim=1, ndim=1/float32 and ndim=2. That budget is also why the
-  auto-expand gate marker is `(1D)` / `(f64)` rather than a spelled-out clause —
-  it stays permanent and visible, which is the load-bearing half, and the full
-  reason is in the tooltip. Cell lines are deliberately NOT in `ExportSpec`: the
-  mp4 is a finished artefact, and this is a diagnostic you reach for.
-  **And the edge finding is stated ONCE.** The IC-preview check and the runtime
-  watch describe the same thing — record 0 IS the IC — so an IC sitting at the
-  edge produced two amber messages, a header line and a paragraph under the IC
-  plot, with the same number in both. `preview_warnings` now takes an
-  `edge_axes` out-list: given one it puts `(axis, band_mass)` pairs there and
-  keeps the sentence OUT of `warnings` (given none it still returns the full
-  prose, so no other caller changes), `from_spec` returns it, and
-  `routers/preview._respond` sends it as **`X-Wignerf-Edge: axis:mass,…`** — its
-  own header precisely so the client is not pattern-matching a sentence.
-  `ICEditor.edgeNotice` then renders the SET DIFFERENCE against the session's
-  tripped axes. Differencing rather than simply deleting the IC-side
-  message is the point: it keeps the one case the header cannot cover — an IC you
-  have EDITED but not yet restarted into, whose new axes the running session
-  knows nothing about. Verified: form == session shows exactly one line; editing
-  the IC out to the py edge leaves the header on x and adds "this IC reaches the
-  py edge" alone.
-  **What it differences against must SURVIVE A DISMISSAL**, hence
-  `session.boundary?.axes ?? status.boundary?.axes`: the first is the transient
-  event, and the header's own `×` sets it to null — so differencing against it
-  alone meant dismissing the header made this line appear instead, i.e. the one
-  fact stated twice after all, just sequentially. `status.boundary` is the
-  session's standing `boundary_state`, always present and untouched by the ×; the
-  event stays first only because it is fresher than the 1 s status cadence.
+  the width the mass was actually measured with.
+  **`lib/cells.ts` mirrors `boundary.edge_band` separately, for DRAWING only** —
+  a second "cells" toggle (`wignerf.cells`, its own key, so "Reset setup to
+  defaults" leaves it alone) paints the computed lattice faintly on the W panels
+  and the IC preview with the edge-band cells brighter, so the number in that
+  warning points at something visible. The mirror exists because the overlay
+  follows the PAINTED frame, which during a scrub across an auto-expand boundary
+  is not the live window the server's `band` describes. Ticks and cells are
+  INDEPENDENT layers, and the lattice is dropped when more than ~200 of its
+  lines would land in the visible window — a COUNT not a pixel test, so zooming
+  in brings it back. **The three toggles share ONE row** (`flex`, natural
+  widths, labels "auto-expand", "grid", "cells"), which is what pays for the
+  third control in a 320px column. Cell lines are deliberately NOT in
+  `ExportSpec`: the mp4 is a finished artefact, and this is a diagnostic you
+  reach for.
+  **The edge finding is stated ONCE, IN ONE PLACE, AND THE TIME ARGUMENT SAYS
+  WHICH STATE IT IS ABOUT.** The detector runs on the IC preview and on the live
+  record, and at record 0 those are the SAME state, so the fact was genuinely
+  duplicated. Reporting it twice in two sentences and suppressing one by
+  DIFFERENCING the axis sets was worse than the duplication it fixed: the
+  survivor flickered between two places as the live axes changed and read as two
+  problems. Now the header says it, once, and `wOf` writes **`W(x,p,0)`** while
+  nothing has been computed past the Cauchy data and `W(x,p,t)` after — one
+  sentence whose argument distinguishes the initial condition from the evolved
+  state. `preview_warnings`'s `edge_axes` out-list and the `X-Wignerf-Edge:
+  axis:mass,…` header still exist and are still the right shape (structured, so
+  the client never pattern-matches a sentence); `ICEditor` EMITS the finding
+  upward instead of rendering it. The one case the session cannot cover — an IC
+  you have edited but not restarted into — is `SimulatorView.icEdgeText`, gated
+  on `restartNeeded` so it can never compete with the session's own reading.
+  **The × dismisses BY TEXT.** Clearing `session.boundary` cannot dismiss this:
+  the sentence may come from `icEdgeText` or from the standing `status.boundary`,
+  neither of which that touches, and even for the transient event `sticky` keeps
+  displaying the last value for its dwell. The button was inert on screen while
+  looking perfectly wired in the source. Keyed on the text, so dismissing one
+  warning never hides the next, different one.
+  **DISPLAY-ONLY STATE THAT ADDRESSES AN AXIS MUST FOLLOW ndim DOWN.**
+  `ICEditor.cutAxis` is not in `cfg` (it changes nothing computed) and its
+  select is inside `v-if="ndim > 1"`, so a stale 1 at ndim=1 was both
+  unreachable and unrecoverable — and not inert, because the ψ/φ titles fall
+  back to it whenever the response is null, which is exactly when a 2D ψ stops
+  compiling at ndim=1. The fallback then read `ψ(p)` and `φ(x)`.
+  **A REQUEST SEQUENCE MUST BE BUMPED ONLY WHEN A REQUEST IS ACTUALLY SENT, AND
+  EVERY INDEPENDENT REQUEST NEEDS ITS OWN KEY AS WELL AS ITS OWN COUNTER.**
+  `ICEditor.refresh` incremented `seq` before the body de-dup could return, so
+  every successful commit re-fired the deep watch, declined to repeat the
+  request, and silently invalidated the responses still in flight from the one
+  it had just declined to repeat. The ψ/φ traces were the casualty. The
+  wavefunction call has its own counter AND its own `lastWaveBody`, because it
+  depends on `cutAxis` and the W preview does not: sharing one key made the 2D
+  cut selector INERT — the W body was byte-identical, `refresh` returned at the
+  de-dup, and `refreshWave` below it was never reached. **And a de-dup key must
+  be cleared when the request FAILS**, or a transient error is permanent: the
+  identical body de-dups out and nothing can retry it.
+  **And a failed ψ sample SAYS SO.** It gates nothing (the W response owns the
+  Solve gate) but it must not blank two charts in silence. Their titles are
+  built from the CUT rather than from the response for the same reason — a title
+  that degrades whenever the data does turns a failed request into apparent rot.
+  **A failed W preview must also CLEAR what the previous one left**: the
+  warnings, the deficit, the norm readout and the emitted edge finding all
+  describe a state that no longer exists, and leaving them put a stale ⚠ above
+  the compile error and an edge claim in the HEADER about an IC that does not
+  compile.
+- **EVERY TRANSIENT NOTICE IS AN OVERLAY AND HAS A MINIMUM DWELL. This is a
+  RULE, not a fact about the header** — it was written down for the header alone
+  and then broken the next time a panel grew a conditional line, which is
+  exactly what a rule stated as a special case invites.
+  A notice derived from live state comes and goes at the rate that state
+  changes, not at the rate a person reads, so:
+  **(1) it must not occupy layout** — anchor it `absolute left-0 right-0
+  top-full z-*` to a `relative` parent, overlaying the top of whatever follows.
+  **(2) it must stay long enough to be read** — `lib/sticky`, MIN_DWELL_MS =
+  5 s, holding the last non-empty value after the condition clears. A
+  REPLACEMENT is never delayed (a newer message beats an older one and restarts
+  the clock); only the clearing is. Display only, so the transport, the Solve
+  gate and every test still see the instantaneous state.
+  The steady READOUTS are the exception and stay in flow — the norm deficit, the
+  normalisation scale — because they change only when the form does, which is
+  the user's own doing and already a relayout. The IC editor's ⚠ strip is
+  steady for the same reason and deliberately has NO dwell.
+  **Three traps, all of which shipped once:**
+  **An `overflow-hidden` ancestor deletes the strip from the screen and leaves
+  it in the DOM.** The IC preview needs that class to keep the heatmap inside
+  its rounded border, and it also clips any absolutely-positioned child hanging
+  BELOW the box — which is where `top-full` puts one. Hence two nested boxes: an
+  outer `relative` anchor and an inner clipping one. Do not merge them.
+  **"Nothing moved" and "the text is in the DOM" together do NOT prove the
+  message is still visible.** Assert that it is PAINTED:
+  `document.elementFromPoint` inside the notice's own rect must land on the
+  notice. Same discipline as the WebGL-canvas rule above, in the other
+  direction: there a screenshot lies, here the DOM does.
+  **When several lines share one strip, the flickering one gets its OWN timer.**
+  `sticky(() => a || b)` over two independent sources is not a dwell: losing `a`
+  still leaves a non-empty value, which `sticky` correctly reads as a
+  REPLACEMENT and applies at once — so the two sentences alternate at the rate
+  the flickering one changes, and the × looks inert because dismissing one
+  substitutes the other in the same flush. One `sticky` per source, combined
+  afterwards. This shipped in `SimulatorView`'s header and is now pinned by
+  `sticky.test.ts` ("ONE sticky over two joined sources has no dwell at all").
+  Measurements and the browser reproductions are in `notes/ui-notices.md`.
 - **The header's TRANSIENT notices are an absolute overlay, not flow content —
   the W panels must never move because a message arrived.** `restartNeeded`,
-  `boundaryText`, `paramFlash` and `regridFlash` come and go while you are
-  watching the heatmaps, and the header is `flex-wrap` above a `flex-1` main: as
-  inline children, each arrival wrapped the header to a second line and moved
-  the panels down 32 px at 1280 px wide, then back up when it cleared (measured
-  `HEADER HEIGHTS SEEN: 38,70` / `PANEL TOPS SEEN: 46,78`). They now live in a
+  `boundaryText`, `paramFlash` and `regridFlash` live in an
   `absolute left-0 right-0 top-full z-30` strip anchored to the `relative`
-  header, so they are out of the vertical flow in BOTH layouts — verified with a
-  warning toggling 43× in 24 s: `hdr`, `panTop`, `panH` and `plotsTop` each take
-  exactly one value, landscape and portrait. The trade is deliberate: the strip
-  OVERLAYS the top ~24 px of the columns, i.e. it briefly hides the panel's label
-  chip and the first plot's title — chrome, never data — which is much cheaper
-  than relaying out the thing being watched, and it is dismissible. Full width so
-  no message has to be truncated to fit a header row. **The float32 badge stays
-  inline on purpose** (a permanent property of the session, set before there is
-  anything to watch), and so does `createError` — but it must be inline INSIDE
-  the header (`basis-full`, its own flex-wrap line), not after it. Outside, it
-  landed at exactly the y the `top-full` strip is anchored to, and the amber
-  "setup changed — restart to apply" was painted straight OVER the error text.
-  That pairing is not exotic: **every restart that 422s sets both**, because the
-  form still differs from the session it failed to create. Measured on
-  128×128×128×64 — the fit refusal was on screen the whole time and unreadable.
-  Do not "tidy" these back into the header row, and do not move `createError`
-  back out of the header.
+  header, so they are out of the vertical flow in BOTH layouts; as inline
+  children each arrival wrapped the header and moved the panels 32 px. The trade
+  is deliberate: the strip OVERLAYS the top ~24 px of the columns, i.e. briefly
+  hides a panel's label chip and the first plot's title — chrome, never data —
+  which is much cheaper than relaying out the thing being watched, and it is
+  dismissible. Full width so no message has to be truncated to fit.
+  **The float32 badge stays inline on purpose** (a permanent property of the
+  session, set before there is anything to watch), and so does `createError` —
+  but INSIDE the header; see the failed-restart bullet. Do not "tidy" these back
+  into the header row. Measurements in `notes/ui-notices.md`.
 - **A FAILED restart leaves the app session-less, and three things used to hide
-  that.** `useSession.create` calls `destroy()` BEFORE it posts, so a 422 deletes
-  the old session and leaves `info`/`status` null with the form intact. Found on
-  a 2D grid of 128×128×128×64: (1) the server's refusal was rendered but painted
-  over by the transient strip (above); (2) the header read **"connecting…"**
-  forever, a false progress report on a socket that will never open — it is now
-  suppressed while `createError` is set; and (3) the transport button stayed pink
-  "Solve" and ENABLED, doing nothing on click, because `solveBlocked` only knew
-  about an invalid setup — `ControlBar.noSession` (`!props.status`) now disables
-  it and says so in the title. Being briefly disabled just after a create is the
-  safe direction, the same argument the "Apply live" button's `computing` gate
-  makes.
-  **And the Setup panel's 2D footprint line now says when a grid cannot fit at
-  all.** `GET /api/device` reports each pool device's `total_bytes` (added
-  `xp.device_total_bytes`); the panel compares its per-device estimate against
-  the SMALLEST of them — the workers spread, so the smaller card binds, the same
-  property `_fit_error` rests on — and turns red with "will not fit this host".
-  TOTAL, not free, deliberately: total is static, so the panel needs no polling
-  and can never contradict the server, whose live-free refusal is a strict
-  superset. Before this the line was plain grey at **26.00 GiB/device on a host
-  whose largest card is 24** — the same grid reads 22.00 since M7, still far past
-  the 10.6 GiB card that actually binds — and `WIGNERF_MAX_CELLS_2D` did not
-  cover it either — 128×128×128×64 is 134,217,728 cells, EXACTLY 2²⁷, so the
-  `>` rail is not tripped. At the cap and far past the hardware, and reading as
-  fine.
+  that.** `useSession.create` calls `destroy()` BEFORE it posts, so a 422
+  deletes the old session and leaves `info`/`status` null with the form intact.
+  Three consequences, all fixed and all easy to reintroduce: the server's
+  refusal was rendered but PAINTED OVER by the transient strip; the header read
+  **"connecting…"** forever, a false progress report on a socket that will never
+  open (now suppressed while `createError` is set); and the transport button
+  stayed pink "Solve" and ENABLED, doing nothing on click
+  (`ControlBar.noSession` now disables it and says so in the title).
+  **`createError` must be inline INSIDE the header** (`basis-full`, its own
+  flex-wrap line), not after it — outside, it landed at exactly the y the
+  `top-full` strip is anchored to and the amber "setup changed — restart to
+  apply" was painted straight over it. That pairing is not exotic: **every
+  restart that 422s sets both.** See `notes/ui-notices.md`.
+  **And the Setup panel's 2D footprint line says when a grid cannot fit at
+  all.** `GET /api/device` reports each pool device's `total_bytes`; the panel
+  compares its per-device estimate against the SMALLEST of them — the workers
+  spread, so the smaller card binds, the same property `_fit_error` rests on —
+  and turns red. TOTAL, not free, deliberately: total is static, so the panel
+  needs no polling and can never contradict the server, whose live-free refusal
+  is a strict superset.
 - **A marginal's NEGATIVE part measures the noise floor its edge-band mass is
   read against, and on a coarse grid that floor is ABOVE the trigger.** ρ(x) is
   a probability density, so any negative value in it is pure numerical error —
   which makes `(|ρ|−ρ)/2` summed over the axis a free, self-calibrating error
-  bar (elementwise only, so it costs one reduction on numpy and cupy alike; no
-  boolean indexing, no extra device sync). It has to be used, because the floor
-  is the Nyquist truncation of the state's own Fourier tail,
-  `exp(−(πσ_q/dx)²/2)` — measured 2026-07-26 on a coherent state parked at
-  |q| = 2, nowhere near an edge: **N=32 predicted 5.17e-5 / measured 5.35e-5;
-  N=48 2.27e-10 / 1.66e-10; N=64 7.15e-18 / 2.29e-13** (below ~1e-13 other
-  error sources take over). At 32⁴ — a size this project *recommends* for
-  exploration — that is 50× the 1e-6 trigger, so the band mass IS noise:
-  negative in 96 of 204 readings, sign flipping every record or two. Ungated
-  that produced **79 boundary state changes in 201 records, and 243 WS events
-  in 25 s in a browser**, each rewriting the header warning — which wraps the
-  `flex-wrap` header and so moved the W panels 32 px at 1280 px wide, on and
-  off, for the whole run. That is what "the heatmaps jump while computing" was,
-  in both interactive and batch mode (compute-linked, hence absent in
-  playback), and it was neither the scrollbar nor the time cursor. Fix:
-  `EdgeState` carries `noise` and an axis trips only above
+  bar (elementwise only, so it costs one reduction on numpy and cupy alike). It
+  has to be used, because the floor is the Nyquist truncation of the state's own
+  Fourier tail, `exp(−(πσ_q/dx)²/2)`: at 32⁴ — a size this project *recommends*
+  for exploration — that is 50× the 1e-6 trigger, so the band mass IS noise,
+  sign-flipping every record or two, and ungated it produced 79 boundary state
+  changes in 201 records. That is what "the heatmaps jump while computing" was.
+  Fix: `EdgeState` carries `noise` and an axis trips only above
   `max(threshold, EDGE_NOISE_MARGIN·noise)`, plus `session._confirm_edge`
-  requires `EDGE_CONFIRM` consecutive records in BOTH directions. 8×/4 measured
-  zero false announcements against a real approach still announced at record 3;
-  see boundary.py for the full sweep. Three properties are load-bearing: the
-  gate is **inert wherever the detector already worked** (1D N=256..4096 and 2D
-  from N=48 have floors three orders under the trigger, so 1e-6 alone still
-  decides — 1D behaviour is untouched); a **ratio-only** gate is not enough,
-  because a state genuinely over the edge rings in proportion (band/noise 11
-  there against 4.2 for the worst noise blip, which is why the margin is 8 and
-  not 12); and the **first reading per slot is exempt**, or an IC that starts at
-  the edge — a paused session with exactly one record — would never warn.
+  requires `EDGE_CONFIRM` consecutive records in BOTH directions.
+  Three properties are load-bearing: the gate is **inert wherever the detector
+  already worked** (1D N=256..4096 and 2D from N=48 have floors three orders
+  under the trigger, so 1D behaviour is untouched); a **ratio-only** gate is not
+  enough, because a state genuinely over the edge rings in proportion (band/
+  noise 11 there against 4.2 for the worst noise blip, which is why the margin
+  is 8 and not 12); and the **first reading per slot is exempt**, or an IC that
+  starts at the edge — a paused session with exactly one record — would never
+  warn. Sweep in `boundary.py`; measurements in `notes/ui-notices.md`.
 - **Secular E drift + slow purity decay = boundary wrap, not a solver
   bug.** The spectral domain is a torus: when a state's orbit + ~5σ tails
   reach the x or p edge, mass wraps through the seam and the run faithfully
