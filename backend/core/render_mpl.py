@@ -132,8 +132,35 @@ def key_of_vid(vid):
     return ("q" if vid & 1 else "c") + ("r" if vid & 2 else "n")
 
 
-def dequantize_plane(pf):
-    """One PlaneFrame -> float32 (N[b], N[a]) in natural order, for imshow.
+def plane_step(pf, px):
+    """Decimation to draw this plane at, for a panel `px` pixels across.
+
+    THE PANEL CANNOT SHOW MORE SAMPLES THAN IT HAS PIXELS, and matplotlib's
+    per-frame cost is set by the array it is handed, not by the figure: measured
+    2247 ms/frame/worker for a 4096^2 plane against 80 ms for a 256^2 one, while
+    1080p and 4K differ by 3%. So the export reads the same mip pyramid the
+    stream does (core/pyramid) and hands over the coarsest level that still
+    covers the panel.
+
+    Never BELOW the panel's own resolution — the level is chosen so
+    N/step >= px — so this is not a quality trade: the pixels that reach the
+    video are the pixels that would have reached it anyway, arrived at by
+    averaging rather than by matplotlib's own resampling of 16x the data.
+    """
+    if px <= 0:
+        return 1              # "no figure to fit" means the whole plane
+    n = min(pf.wq.shape)
+    step = 1
+    while step*2 <= pf.max_step and n//(step*2) >= px:
+        step *= 2
+    return step
+
+
+def dequantize_plane(pf, px=0):
+    """One PlaneFrame -> float32 (nb, na) in natural order, for imshow.
+
+    `px` is the panel's width in device pixels; 0 keeps the full plane (what
+    the tests and any caller without a figure want).
 
     The transpose puts the plane's FIRST axis horizontal and its second
     vertical, which is the same rule WignerRenderer.ts follows on screen — at
@@ -143,7 +170,8 @@ def dequantize_plane(pf):
     No unshift here: `frame.build` hands out natural order (it has to, so a crop
     cannot straddle the fftshift seam), so this used to unshift an already
     unshifted plane and put every export's W back on the torus's far side."""
-    W = pf.wmin + pf.wq.astype(numpy.float32)*(
+    wq = pf.level(plane_step(pf, px)) if px else pf.wq
+    W = pf.wmin + wq.astype(numpy.float32)*(
         numpy.float32((pf.wmax - pf.wmin)/65535.0))
     return W.T
 
@@ -581,6 +609,16 @@ class FrameFigure:
                     FuncFormatter(lambda v, _pos: "%.2g" % v))
             self.images.append((axp, im, cell))
 
+        # How many device pixels a panel is actually across, from the axes'
+        # own figure-fraction box — the number `plane_step` decimates to. Taken
+        # once, here, because the layout is fixed for the life of the figure
+        # and `get_position()` needs no renderer. The LARGEST panel wins: they
+        # are all the same size in every layout panel_grid produces, and
+        # rounding up can only ever ask for more detail than needed.
+        self._panel_px = max(
+            (int(axp.get_position().width*self.width) for axp, _im, _c
+             in self.images), default=0)
+
         # ---- diagnostics column(s), same order as PlotsColumn
         self.marg_axes, self.marg_lines = {}, {}
         self.series_axes, self.cursors = {}, []
@@ -815,7 +853,8 @@ class FrameFigure:
         if geom != self._geom:      # first record, or an auto-expand regrid
             self._apply_geom(geom)
         for _axp, im, cell in self.images:
-            im.set_data(dequantize_plane(vframes[cell.vi].planes[cell.pi]))
+            im.set_data(dequantize_plane(vframes[cell.vi].planes[cell.pi],
+                                         self._panel_px))
         for (a, key), line in self.marg_lines.items():
             line.set_data(self._abscissa[a],
                           vframes[self.variants.index(key)].marg[a])

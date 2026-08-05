@@ -373,25 +373,49 @@ def test_setup_document_is_what_the_run_started_from():
         assert client.get("/api/sessions/%s/setup" % sid).status_code == 404
 
 
-def test_choose_encoder_honors_config(monkeypatch):
-    """auto uses the GPU h264_nvenc if the runtime probe passes, else libx264;
-    cpu/nvenc force the choice. No GPU needed — the probe is monkeypatched."""
+def test_auto_encodes_on_the_CPU_and_nvenc_stays_reachable(monkeypatch):
+    """auto is libx264 EVEN WHERE THE GPU WORKS, and that is measured, not lazy.
+
+    The encode is a rounding error against the frame render (2.2 s/frame/worker
+    at 4096^2), so the GPU buys no wall clock — the same 60-frame 1080p export
+    took 4.3 s either way — and h264_nvenc -cq 19 writes 1.8x the bytes of
+    libx264 -crf 18. auto preferring the GPU trades file size for nothing.
+
+    It must still be REACHABLE, per host and per job, which is the half that
+    was broken: the runtime probe encoded a 64x64 clip, under NVENC's 145x49
+    minimum, so it answered "unavailable" on a machine with two idle NVIDIA
+    cards and the option could not be selected at all.
+    """
     import config as appconfig
     monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: True)
     monkeypatch.setattr(appconfig, "EXPORT_ENCODER", "auto")
-    assert videoexport.choose_encoder()[:2] == ["-c:v", "h264_nvenc"]
-    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: False)
     assert videoexport.choose_encoder()[:2] == ["-c:v", "libx264"]
     assert "veryfast" in videoexport.choose_encoder()   # not the old 'medium'
-    # cpu forces libx264 even where nvenc works; nvenc forces the GPU encoder
-    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: True)
+    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: False)
+    assert videoexport.choose_encoder()[:2] == ["-c:v", "libx264"]
+    # cpu is explicit libx264; nvenc forces the GPU encoder, host or job
     monkeypatch.setattr(appconfig, "EXPORT_ENCODER", "cpu")
     assert videoexport.choose_encoder()[:2] == ["-c:v", "libx264"]
-    monkeypatch.setattr(videoexport, "_nvenc_ok", lambda: False)
     monkeypatch.setattr(appconfig, "EXPORT_ENCODER", "nvenc")
     assert videoexport.choose_encoder()[:2] == ["-c:v", "h264_nvenc"]
-    # the explicit-argument form overrides the config
     assert videoexport.choose_encoder("cpu")[:2] == ["-c:v", "libx264"]
+    assert videoexport.choose_encoder("nvenc")[:2] == ["-c:v", "h264_nvenc"]
+
+
+@needs_ffmpeg
+def test_the_nvenc_probe_clip_clears_the_encoder_minimum():
+    """The probe must fail only for the reason it exists to detect.
+
+    NVENC refuses anything under 145x49 with "Frame Dimension less than the
+    minimum supported value", which at the exit code is indistinguishable from
+    "there is no GPU here" — so a 64x64 probe clip reported "unavailable"
+    forever, on every machine, and silently made the nvenc option unselectable.
+    Asserted as the PROPERTY (the clip clears the documented floor) rather than
+    by running the probe, which would skip on any CPU-only host and pass
+    vacuously exactly where the bug lived.
+    """
+    w, h = (int(v) for v in videoexport._PROBE_SIZE.split("x"))
+    assert w >= 145 and h >= 49, videoexport._PROBE_SIZE
 
 
 @needs_ffmpeg
@@ -685,3 +709,47 @@ def test_a_long_expression_is_truncated_with_a_pointer_not_clipped(kind, nd):
     assert len(render_mpl._emit(
         describe.ic_expression(short, 1.0, ndim=nd),
         describe.ic_expression(short, 1.0, ndim=nd, math=True), 150, nd)) == 3
+
+
+def test_the_export_draws_a_plane_at_the_panel_s_own_resolution():
+    """matplotlib's per-frame cost is set by the ARRAY it is handed, not by the
+    figure, and a panel cannot show more samples than it has pixels.
+
+    Measured per frame per worker before this: 2247 ms for a 4096^2 plane
+    against 80 ms for a 256^2 one, while 1080p and 4K differ by 3% — i.e. the
+    export was slow because of the GRID, and it was handing matplotlib 16x the
+    data the video could carry. Reading the stream's own mip pyramid instead
+    took a 4096^2 4-variant 1080p frame from 4429 ms to 92 ms.
+
+    Never BELOW the panel's resolution, which is what makes it free rather than
+    a quality trade — asserted here, since a step one notch too coarse still
+    renders, still looks plausible, and is exactly what nothing else would
+    catch.
+    """
+    import numpy as _np
+    from core import render_mpl as R
+
+    def plane(n, levels):
+        wq = _np.zeros((n, n), dtype=_np.uint16)
+        mips = tuple(_np.zeros((n >> (i+1), n >> (i+1)), dtype=_np.uint16)
+                     for i in range(levels))
+        return protocol.PlaneFrame(a=0, b=1, mode=0, wq=wq, wmin=-1.0,
+                                   wmax=1.0, mips=mips)
+
+    p = plane(4096, 6)                       # levels 2048..64
+    for px in (100, 256, 400, 900, 1920, 5000):
+        step = R.plane_step(p, px)
+        assert step & (step - 1) == 0, step          # a power of two
+        assert step <= p.max_step
+        assert 4096//step >= px or step == 1, (px, step)
+        # ...and it is the COARSEST such level: one notch further would fail
+        if step < p.max_step:
+            assert 4096//(step*2) < px, (px, step)
+
+    # a plane with no pyramid serves itself, whatever is asked
+    assert R.plane_step(plane(256, 0), 10) == 1
+    # px = 0 means "no figure": the whole plane, not the coarsest level
+    assert R.plane_step(p, 0) == 1
+    assert R.dequantize_plane(p).shape == (4096, 4096)
+    # and the decimated draw really is smaller
+    assert R.dequantize_plane(p, 400).shape == (512, 512)

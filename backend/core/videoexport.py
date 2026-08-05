@@ -77,10 +77,23 @@ def ffmpeg_path():
 _NVENC_OK = None
 
 
+# The probe clip's size. NVENC REFUSES ANYTHING SMALLER THAN 145x49 (H.264):
+# it reports "Frame Dimension less than the minimum supported value", which is
+# indistinguishable at the exit code from "there is no GPU here". This probe
+# used 64x64 and therefore answered "unavailable" on every machine it was ever
+# run on, including a workstation with two idle NVIDIA cards — measured
+# 2026-08-05, and the reason every export here had quietly been libx264. Small
+# enough to stay instant, comfortably over the floor so a future NVENC
+# generation raising it does not silently reintroduce the same false negative.
+_PROBE_SIZE = "256x256"
+
+
 def _nvenc_ok():
     """Whether h264_nvenc actually WORKS here — cached. The encoder can be
     built into ffmpeg yet fail at runtime without a driver/GPU (the CPU-only
-    VPS), so grepping -encoders is not enough: we run a tiny encode once."""
+    VPS), so grepping -encoders is not enough: we run a tiny encode once.
+
+    It has to be a REAL encode at a REAL size — see _PROBE_SIZE."""
     global _NVENC_OK
     if _NVENC_OK is None:
         _NVENC_OK = _probe_nvenc()
@@ -96,7 +109,7 @@ def _probe_nvenc():
     try:
         return subprocess.run(
             [exe, "-hide_banner", "-loglevel", "error",
-             "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+             "-f", "lavfi", "-i", "nullsrc=s=%s:d=0.1" % _PROBE_SIZE,
              "-c:v", "h264_nvenc", "-f", "null", "-"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=30).returncode == 0
@@ -106,13 +119,27 @@ def _probe_nvenc():
 
 def choose_encoder(mode=None):
     """ffmpeg `-c:v …` args for the configured encoder (WIGNERF_EXPORT_ENCODER
-    = auto | cpu | nvenc). auto = nvenc if it works, else libx264."""
+    = auto | cpu | nvenc).
+
+    **auto is libx264, NOT the GPU, and that is a measured choice.** The GPU
+    encoder is reachable — `nvenc`, or ExportSpec.encoder per job — and
+    `_nvenc_ok` no longer lies about it. It simply buys nothing here: the same
+    60-frame 1920x1080 export takes 4.3 s either way and h264_nvenc -cq 19
+    writes a 1.8x LARGER file than libx264 -crf 18 (0.35 vs 0.19 MiB), because
+    the ENCODE is a rounding error against the frame RENDER at any grid worth
+    exporting (2.2 s/frame/worker at 4096^2 against milliseconds of encode).
+    Preferring the GPU by default would trade file size for nothing.
+
+    Do not "restore" auto to nvenc without re-measuring both numbers; the
+    reasoning that once made it look right — "it frees cores for the render
+    pool" — is exactly what the wall clock refuses to show.
+    """
     mode = (mode or config.EXPORT_ENCODER or "auto").lower()
-    if mode == "nvenc" or (mode == "auto" and _nvenc_ok()):
+    if mode == "nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19"]
     # veryfast (was medium): ~2x faster encode, file ~7% larger, visually
     # identical for this smooth content — and it frees cores for the render
-    # pool where nvenc is unavailable.
+    # pool, which is where the time actually goes.
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
             "-threads", "0"]
 

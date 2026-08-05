@@ -230,3 +230,75 @@ really was part of the wait.
 Panel formatting is two decimals below 10 fps: this feature lives in the
 0.5-10 range (a 24-panel 2D matrix renders at ~6 fps, a large 1D frame slower),
 where rounding to integers would print "6" and "1" for a 40% difference.
+
+
+## Why exports were slow, and what the encoder had to do with it (2026-08-05)
+
+Reported as "the rendering was so slow that I doubted it used nvenc at all".
+Two separate findings, and the suspicion was half right.
+
+### The nvenc probe had never once succeeded
+
+`_probe_nvenc` encoded a **64x64** clip. NVENC's H.264 minimum is **145x49**,
+and below it ffmpeg fails with
+
+    InitializeEncoder failed: invalid param (8):
+    Frame Dimension less than the minimum supported value
+
+which at the exit code is indistinguishable from "there is no GPU here". So the
+probe answered "unavailable" on every machine it ever ran on, including this
+workstation with a 3090 and a 2080 Ti idle, and `WIGNERF_EXPORT_ENCODER=nvenc`
+could not be reached at all. Measured floor, this ffmpeg (8.0.1):
+
+    64x64   FAIL     145x49  OK
+    128x128 FAIL     256x256 OK
+
+The probe clip is now 256x256 — over the floor with room, still instant.
+`test_the_nvenc_probe_clip_clears_the_encoder_minimum` asserts the PROPERTY
+rather than running the probe, which on a CPU-only host would skip and pass
+vacuously exactly where the bug lived.
+
+### ...and fixing it changed nothing, because the encode was never the cost
+
+Same 60-frame 1920x1080 export, 2 variants, one job after the other:
+
+    libx264 -crf 18      4.3 s wall    0.19 MiB
+    h264_nvenc -cq 19    4.3 s wall    0.35 MiB
+
+Identical wall clock, 1.8x the bytes. So `auto` stays **libx264** and the GPU
+encoder is opt-in per host or per job. The old rationale — "it frees cores for
+the render pool" — is precisely what the wall clock declines to show; do not
+restore auto=nvenc without re-measuring both columns.
+
+### The real cost is the GRID, and the video resolution is nearly free
+
+ms per frame per worker, min of 5, one plane per variant:
+
+    case                     before   after (pyramid)
+    256^2  1080p 2var           80      78
+    2048^2 1080p 2var          516      94
+    4096^2 1080p 2var         2247      93
+    256^2  4K    2var           72      74
+    4096^2 4K    2var         2310     341
+    4096^2 1080p 4var         4429      92
+    4096^2 1080p 4var 5diag   4520     165
+    4096^2 4K    4var 5diag   4618     518
+
+Before, cost scaled as N^2 and 1080p vs 4K differed by **3%** — matplotlib's
+per-frame cost is set by the ARRAY it is handed, not by the figure. A 4096^2
+plane drawn into a ~990 px panel was 16x more data than the video could carry.
+
+`render_mpl.plane_step` now picks the coarsest mip level that still covers the
+panel (`FrameFigure._panel_px`, taken once from the axes' own figure-fraction
+box). Never below the panel's resolution, so it is not a quality trade — 4K
+legitimately costs more than 1080p now, which is the point.
+
+Verified on a cat state with interference fringes at 2048^2, full draw against
+pyramid draw of the same frame: **92.6% of pixels bit-identical, max channel
+difference 2/255, nothing over 8/255.** Fringes are what a wrong level or an
+aliasing subsample would destroy, which is why the check uses them rather than
+noise.
+
+Note the 4-variant row: 4429 -> 92 ms. Four panels in one figure are each half
+the width, so each needs a quarter of the samples — the pyramid makes panel
+COUNT nearly free too, where before it was linear.

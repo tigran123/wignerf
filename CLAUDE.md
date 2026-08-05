@@ -361,18 +361,24 @@ source) is what keeps startup fast. See `README.md`.
   Both refusals live in `routers/export.py`, not the schema: what is available
   depends on the session's ndim, which the request body does not carry. Both
   name what IS available.
-  **The frame RENDER, not the encode, is the bottleneck**, so export renders
+  **The frame RENDER, not the encode, is the bottleneck — and its cost is the
+  GRID, not the video size**: matplotlib is priced by the ARRAY it is handed, so
+  4096² cost 2247 ms/frame/worker against 256²'s 80 while 1080p and 4K differed
+  by 3%. `render_mpl.plane_step` therefore draws the coarsest mip level that
+  still covers the panel (`_panel_px`), never below it — 4429 → 92 ms at 4096²
+  ×4 variants, 92.6% of pixels bit-identical on a fringed cat state. Panel COUNT
+  went nearly free with it: four panels are each half as wide, so each needs a
+  quarter of the samples. So export renders
   frames across a **spawn** `ProcessPoolExecutor` (`WIGNERF_EXPORT_WORKERS`,
   auto = min(cpu, 8)) while this thread feeds ORDERED frames to one ffmpeg:
   a sliding window of ≤w+2 futures consumed FIFO, so workers run ahead with
   memory bounded. Spawn, NOT fork: the backend initializes CUDA and forking
   after that inherits a broken context. A small job (`< max(2·w,
   POOL_MIN_FRAMES=16)`) renders serially, skipping the warmup. Encoder via
-  `choose_encoder`/`WIGNERF_EXPORT_ENCODER`: auto uses the GPU **`h264_nvenc`
-  ENCODER** if a one-shot runtime probe passes (`_nvenc_ok`, cached — it can be
-  built-in yet fail with no driver), else `libx264 -preset veryfast -crf 18`.
-  NB that is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel`, a DECODE flag that
-  does nothing for our rawvideo input.
+  `choose_encoder`/`WIGNERF_EXPORT_ENCODER` — **auto is libx264 EVEN WHERE THE
+  GPU WORKS**, and its probe used to be a 64×64 clip under NVENC's 145×49
+  minimum, so nvenc read as "unavailable" everywhere. See the
+  `WIGNERF_EXPORT_ENCODER` row.
   Two passes: a scan collects the E/ΔX·ΔP/γ series, the per-variant FIXED colour
   scale (no brightness flicker), the fixed marginal amplitudes and the widest
   window any record used, and proves every record is still retained before
@@ -382,16 +388,16 @@ source) is what keeps startup fast. See `README.md`.
   art), as the SPA follows the painted frame. The figure is built ONCE and
   BLITTED (static background + ~15 animated artists), the difference between
   minutes and half an hour for 1000 frames.
-  Sizes offered: FHD / QHD / 4K UHD. The figure is always 19.2×10.8 in and
-  the RESOLUTION RIDES ON THE DPI (`FrameFigure.REF_WIDTH`) — font sizes are in
+  Sizes offered: FHD / QHD / 4K UHD. The figure is always 19.2×10.8 in and the
+  RESOLUTION RIDES ON THE DPI (`FrameFigure.REF_WIDTH`) — font sizes are in
   points, so a fixed dpi renders every label at half its relative size at 4K.
   The downloaded name is descriptive (`Content-Disposition`) while the on-disk
-  path keeps session+job ids, so two exports of one range cannot collide while
-  one is downloading.
+  path keeps session+job ids, so two exports of one range cannot collide mid
+  download.
   **The video must READ like the screen**: every plot title comes from
-  `core/axes.py`, the same source `lib/axes.ts` mirrors (γ keeps the UI's
-  "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²), field labels
-  match the Setup panel, and the series y-window + tick decimals reproduce that
+  `core/axes.py`, the source `lib/axes.ts` mirrors (γ keeps the UI's "purity
+  γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²), field labels match the
+  Setup panel, and the series y-window + tick decimals reproduce that
   component's `scales.y.range` rule (`render_mpl.series_ylim`) — matplotlib's
   autoscale renders a 2e-5 purity drift as a dramatic dive with a "×10⁻⁵+1"
   offset where the UI shows a flat line at 1.000000, from identical data.
@@ -819,7 +825,7 @@ the free/reserved readings behind every claim here — are in
 | `WIGNERF_HISTORY_MB` | `32768` | In-RAM frame-history cap per session (scrub/replay window). 32 GiB ≈ 4000 four-variant records at 1024², ≈ 64000 at 256². On the VPS set `16384`. This is the CEILING as well as the default: `SessionCreate.history_mb` may ask for less, never more, and status reports both `history_cap_bytes` and `history_mb_max`. |
 | `WIGNERF_FFT_THREADS` | `0` | Threads per CPU FFT; `0` = auto (ncores/(2·n_variants), capped at 4). Irrelevant on GPU. |
 | `WIGNERF_EXPORT_DIR` | `<tempdir>/wignerf-exports` | Where mp4 exports are written before download. Under systemd (`PrivateTmp=yes`) the default is a private tmpfs — i.e. RAM, wiped on restart; point it at a disk path for long exports. Files are removed after download, on session close, at shutdown, or 30 min after finishing. |
-| `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. `auto` = the GPU `h264_nvenc` ENCODER if a runtime probe succeeds, else `libx264 -preset veryfast`. The bottleneck is frame RENDERING not encoding, so this only tops up the parallel render pool — and the right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to rawvideo input). The host default; `ExportSpec.encoder` overrides it per JOB, which is the right granularity — the best choice depends on what else is competing for cores at that moment. |
+| `WIGNERF_EXPORT_ENCODER` | `auto` | mp4 video encoder: `auto` \| `cpu` \| `nvenc`. **`auto` = `libx264 -preset veryfast`, even on a working GPU** — measured, the same 60-frame 1080p export takes 4.3 s either way and h264_nvenc writes 1.8× the bytes, because the bottleneck is frame RENDERING and the encode is a rounding error against it. `nvenc` selects the GPU encoder explicitly, as does `ExportSpec.encoder` per JOB. Its runtime probe used to encode a 64×64 clip, under NVENC's 145×49 minimum, and so answered "unavailable" everywhere — see `notes/export.md`. The right GPU path is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel` (a decode flag, irrelevant to rawvideo input). |
 | `WIGNERF_EXPORT_WORKERS` | `0` | Export frame-render processes; `0` = auto (`min(cpu_count, 8)`; scaling flattens past the physical cores). Rendering dominates export time, so it is spread over a **spawn** `ProcessPoolExecutor` while one ffmpeg encodes the ordered stream. One export at a time (`_RENDER_LOCK`); a job below `max(2·workers, 16)` frames renders serially to skip pool warmup. |
 | `WIGNERF_MAX_GRID` | `4096` | Per-axis Nx/Np ceiling — enforced at session creation AND for auto-expand doublings; tunable BOTH ways (schema rail: 16384). The UI's Nx/Np selects follow it — from **`GET /api/device`, per ndim**, NOT from `status`; see the `WIGNERF_MAX_GRID_2D` row for why. Lower it on VRAM-constrained hosts (`lib/config.axisFloor` clamps the 256 floor to the cap, and `setNdim` asks the same function). Measured peak per variant worker with the WHOLE-RECORD harness (`bench.py --footprint`): **192 B/cell in float64 and 104 in float32** — 0.19 / 0.75 / 3.00 / 12.00 GiB at 1024² / 2048² / 4096² / 8192², plus ~300 MiB of CUDA context per process per device. HIGHER than step-loop figures, and not a regression: a step loop misses `adjust_step`'s transient and the frame build. Workers spread over the pool, so what binds is the per-card share — 4 variants at 8192² is ~24 GiB/card at 2+2, which does **not** fit even the 3090, so cap by variant count and not just by grid. At the cap the session warns and keeps computing (moves still allowed). |
 | `WIGNERF_MAX_GRID_2D` | `128` | Per-axis ceiling for **ndim=2** sessions. A sanity rail only — a 4D array grows as N⁴, so a per-axis cap is no guard at all. What actually binds is the per-device fit check, `routers/sessions._fit_error` (see the GPU section). **The UI's per-axis N selects follow this from `GET /api/device`, which reports every ndim's ceiling, NOT from `status`** — `status.max_grid`/`max_cells`/`bytes_per_cell` are resolved once for the ndim of the session that is RUNNING, while the form must describe the ndim it is SHOWING, and `dims` is restart-only so the two disagree until the restart. Reading them off `status` broke the panel in BOTH directions (a 2D form offering N up to 4096 with no footprint line at all, and a 1D form's select collapsing to one option). `lib/config.axisSizeOptions` is the extracted, unit-tested list — extracted because both bugs were reachable only through the DOM. **The list is FIXED per ndim: powers of two from `AXIS_N_FLOOR[ndim]` to this ceiling.** **Its 2D floor is 32, not 16**, because `boundary._band_mass` reports nothing below 32 cells per axis, so a 16⁴ session has no boundary watch and says so nowhere; 16⁴ stays reachable through the API. **`AXIS_N_FLOOR` is shared with `setNdim`**: a dims switch lands N *inside the target's list* — their own choice when offerable, else that ndim's DEFAULT, clamped by the target's cap. Capping from ABOVE alone left a HOLE in the select (1D → 2D → 1D ran a 1D session at 64²); falling back to the FLOOR is its quieter twin. Pinned in `config.test.ts`. |
@@ -1056,38 +1062,30 @@ is that lesson firing a second time).
   not a test).
 - **2D mp4 EXPORT (M4): the frame is a SELECTION, real subscripts are FREE, and
   the blit decides where static art may live.** **Read `notes/export.md` before
-  editing `core/render_mpl.py`**; it carries the measurements. The rules:
-  **MATHTEXT IS USED**, because the figure BLITS: every title and axis label is
-  a STATIC artist baked into the background once and costs nothing in situ.
-  `axes.sub_math` typesets the two-letter axis names as `$p_x$` and everything
-  else — ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ — stays the Unicode the screen uses, so the two
-  cannot drift and 1D is untouched at the byte level. **usetex is NOT used**
-  (12×, needs a LaTeX install the VPS lacks, cannot render our Unicode, and is
-  global — the user's own U(x) would go through it). **And it must be the WHOLE frame**:
-  half the job reads worse than none: the same axis would otherwise appear
-  twice on one screen in two spellings.
-  **The metadata block is WRAPPED PLAIN and typeset afterwards** (`_emit`):
-  `$p_x$` is five characters drawing as two glyphs, so which characters land on
-  which line must be decided by the plain text. **And it must not break a
-  line MID-FACT**: each group is joined with `_NB` and `_emit` restores real
-  spaces after wrapping — it must be a character `textwrap` cannot see as
-  whitespace at all (a Unicode NBSP is `\s`, so it does not work). A test for
-  this must check **per line**. `_wrap` also passes `break_on_hyphens=False`,
-  the same rule for a break `_NB` cannot reach: a minus sign is not a hyphen,
-  and textwrap severed `exp(-x^2/2)` right after the minus.
+  editing `core/render_mpl.py`**; it carries the measurements and the
+  archaeology. The rules:
+  **MATHTEXT IS USED** (the figure BLITS, so titles and labels are static
+  artists baked in once and free in situ) but **usetex is NOT** — 12×, needs a
+  LaTeX install the VPS lacks, cannot render our Unicode, and is global, so the
+  user's own U(x) would go through it. `axes.sub_math` typesets the two-letter
+  axis names as `$p_x$`; ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ stay the Unicode the screen uses,
+  so the two cannot drift and 1D is untouched at the byte level. It has to be
+  the WHOLE frame — half the job puts the same axis on one screen in two
+  spellings.
+  **The metadata block is WRAPPED PLAIN and typeset afterwards** (`_emit`),
+  because `$p_x$` is five characters drawing as two glyphs; it must not break
+  MID-FACT (groups joined with `_NB`, a character `textwrap` cannot see as
+  whitespace at all — a Unicode NBSP is `\s` and fails) and `break_on_hyphens`
+  is off, a minus sign not being a hyphen. Test it PER LINE.
   **U(x,y) is typeset by a LEXICAL rewrite of the user's own string**
-  (`describe.potential_math`), NOT `sympy.latex`, which CANONICALISES (so the
-  block would stop being "the text you paste back") and emits tall `\frac`.
-  **A typeset line built from USER input cannot be the only line of defence**
-  (a mathtext parse error raises at DRAW time), so every candidate goes through
-  `render_mpl.mathtext_ok` and falls back to plain per line.
-  **AN IC EXPRESSION IS NEVER TYPESET AT ALL**, and says so by returning `None`
-  from `describe.ic_expression(math=True)`, not a copy of the plain line.
-  `_emit` only skips substitution on its single-fragment branch, so identical
-  strings looked equivalent and were not: once the line wrapped it ran
-  `sub_math_text` on every fragment and a user's literal `px` became `$p_x$` —
-  invisible at ndim=1, where the axis names are single letters. `None` is the
-  signal `_emit` already had for "there is no typeset twin".
+  (`describe.potential_math`), NOT `sympy.latex`, which CANONICALISES — the
+  block would stop being "the text you paste back" — and emits tall `\frac`.
+  **A typeset line built from USER input cannot be the only defence** (a
+  mathtext parse error raises at DRAW time), so every candidate goes through
+  `render_mpl.mathtext_ok` and falls back to plain per line. **AN IC EXPRESSION
+  IS NEVER TYPESET AT ALL**, and says so by returning `None` rather than a copy
+  of the plain line: `_emit` skips substitution only on its single-fragment
+  branch, so once a line WRAPPED a user's literal `px` became `$p_x$` after all.
   **The header readout and the block deliberately DISAGREE**: the header's
   geometry follows the PAINTED record as the SPA does; the block's is labelled
   "at record k0" and stays.
@@ -1096,9 +1094,8 @@ is that lesson firing a second time).
   INSIDE the axes box is painted over every frame — hence the panel grid lines
   are in `_dynamic`, ordered after the images, and the per-panel scale caption
   (past `CBAR_MAX_CELLS` = 8 panels) lives in the panel's `loc="right"` TITLE,
-  outside the axes box. Its first version sat in the corner
-  of the heatmap and rendered as NOTHING. (2D is CHEAPER per frame than 1D — a
-  2D plane is at most 128×128 where a 1D W is up to 4096².)
+  outside the axes box. Its first version sat in the heatmap's corner and
+  rendered as NOTHING.
 - **AUTO-EXPAND IN 2D (M3): the orchestration was free and the GUARD is the
   whole feature.** `core/fit.py` is the create-time check asked again mid-run,
   SHARED with `routers/sessions._fit_error` so the two cannot drift (each writes
