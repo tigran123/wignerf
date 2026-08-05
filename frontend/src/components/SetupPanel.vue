@@ -81,6 +81,8 @@ function runDiffers(field: keyof LiveRun) {
 // whose mode and Δt rec did not differ at all. Each section reports its own.
 const runStale = computed(() =>
   (['mode', 't2', 'record_dt'] as const).some(runDiffers))
+// Batch has a third RUN field (t₂), which is what its row has to make room for.
+const batch = computed(() => props.cfg.mode === 'batch')
 
 const f32 = computed(() => props.cfg.precision === 'float32')
 // auto-expand is gated by float32 alone (single-precision noise trips its own
@@ -554,14 +556,21 @@ function adoptLive() {
           </select>
         </label>
       </div>
-      <!-- One row per phase-space axis: name, lo, hi, N. A table rather than
+      <!-- One row per phase-space axis: name, low, high, N. A table rather than
            four labelled rows because at 2D there are FOUR axes, and "x₁,x₂"
-           style labels would spend the width twice over in a 320px column. -->
-      <div class="grid grid-cols-[1.2rem_1fr_1fr_3.6rem] gap-x-1 gap-y-1 text-xs
+           style labels would spend the width twice over in a 320px column.
+           N is a FIXED column and the extents share what is left, because the
+           two carry different amounts of text: an extent is a short number the
+           user types ("-6", "12.5") while N is a select whose widest option is
+           the host's ceiling — up to 5 digits at the schema rail's 16384, PLUS
+           the dropdown arrow. At 3.6rem the arrow ate the last digit and 4096
+           rendered as "409⌄"; 4.8rem fits 5 digits with the arrow, and the
+           extents drop from 113.6px to 104px, which neither of them notices. -->
+      <div class="grid grid-cols-[1.2rem_1fr_1fr_4.8rem] gap-x-1 gap-y-1 text-xs
                   items-center">
         <span></span>
-        <span class="text-muted text-[10px]">lo</span>
-        <span class="text-muted text-[10px]">hi</span>
+        <span class="text-muted text-[10px]">low</span>
+        <span class="text-muted text-[10px]">high</span>
         <span class="text-muted text-[10px]">N</span>
         <template v-for="(a, i) in props.cfg.grid.axes" :key="i">
           <span class="text-muted italic" v-html="axisNamesHtml[i]"></span>
@@ -638,24 +647,32 @@ function adoptLive() {
 
     <section class="space-y-1.5">
       <h3 class="text-xs font-semibold text-fg-3 uppercase tracking-wider">Run</h3>
-      <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
+      <!-- ONE row in both modes. Interactive has two fields and splits the
+           column evenly; batch adds t₂ and a third even column would leave the
+           mode select too narrow for "interactive", so batch gets its own
+           ratios (mode widest, t₂ narrowest) and drops the fixed label width —
+           at three fields there is no room to pad a label to a common width,
+           and a wrapped "Δt rec" on a line of its own is what this replaces. -->
+      <div class="grid gap-x-2 gap-y-1 text-xs items-center"
+           :class="batch ? 'grid-cols-[1.15fr_0.85fr_1fr]' : 'grid-cols-2'">
         <label class="flex items-center gap-1"
                title="interactive: no end time — Solve keeps computing new records until you pause, streaming a live preview you can zoom. batch: Solve computes at full speed until t = t₂ with NO frame streaming — the heatmap/marginals dim and only a progress report (t, %, throughput) is sent, so heavy runs are not slowed by transferring frames; the observable curves still update. Then the button becomes Play — playback of the finished history.">
-          <span class="w-14 text-muted">mode</span>
+          <span class="text-muted whitespace-nowrap" :class="batch ? '' : 'w-14'">mode</span>
           <select v-model="props.cfg.mode" class="wf-num"
                   :class="runDiffers('mode') ? 'text-warn' : ''">
             <option value="interactive">interactive</option>
             <option value="batch">batch</option>
           </select>
         </label>
-        <label class="flex items-center gap-1" v-if="props.cfg.mode === 'batch'">
-          <span class="w-14 text-muted">t₂</span>
+        <label class="flex items-center gap-1" v-if="batch">
+          <span class="text-muted whitespace-nowrap">t₂</span>
           <input v-model.number.lazy="props.cfg.t2" type="number" step="any"
                  class="wf-num"
                  :class="runDiffers('t2') ? 'text-warn' : ''" />
         </label>
         <label class="flex items-center gap-1">
-          <span class="w-14 text-muted" title="physical time per record">Δt rec</span>
+          <span class="text-muted whitespace-nowrap" :class="batch ? '' : 'w-14'"
+                title="physical time per record">Δt rec</span>
           <input v-model.number.lazy="props.cfg.record_dt" type="number" step="any" min="0.001"
                  class="wf-num"
                  :class="runDiffers('record_dt') ? 'text-warn' : ''" />
