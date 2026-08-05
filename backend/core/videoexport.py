@@ -187,6 +187,16 @@ class ExportJob(threading.Thread):
         self.state = "queued"      # queued|running|done|error|cancelled
         self.done = 0
         self.total = len(self.records)
+        # Frames actually rendered per second — the number the export panel
+        # shows, and the one that says whether a long render is worth waiting
+        # for. Rolling over ~1 s while running (the same idiom as
+        # worker.steps_per_sec, and for the same reason: a cumulative average
+        # spends its first seconds climbing out of the pool warmup and reads as
+        # a slowdown that is not happening), then replaced by the run's overall
+        # average once the job finishes, which is the figure worth quoting.
+        self.render_fps = 0.0
+        self._render_t0 = None
+        self._rate_mark = (0, 0.0)
         self.error = None
         self.finished_at = None
         self.cancel_evt = threading.Event()
@@ -213,7 +223,12 @@ class ExportJob(threading.Thread):
                           else 0),
                 "error": self.error,
                 "filename": self.download_name,
+                # NB two different rates: `fps` is the VIDEO's frame rate (what
+                # the mp4 plays at), `render_fps` is how fast this machine is
+                # producing those frames. They are unrelated, and conflating
+                # them would make a slow render look like a slow video.
                 "fps": self.spec.fps,
+                "render_fps": round(self.render_fps, 2),
                 "duration_s": self.total/float(self.spec.fps)}
 
     def _post(self):
@@ -249,6 +264,10 @@ class ExportJob(threading.Thread):
                 planes=self.planes, diagnostics=self.diagnostics)
             proc = self._spawn_ffmpeg()
             self._last_post = 0.0
+            # the render clock starts HERE, past the scan and the ffmpeg spawn:
+            # this is the rate of the thing the progress bar is counting
+            self._render_t0 = monotonic()
+            self._rate_mark = (0, self._render_t0)
             # Rendering a frame (matplotlib/Agg) dominates export time, so it
             # is spread over a pool of processes while this thread feeds the
             # ordered frames to one ffmpeg. A small job renders serially: the
@@ -292,6 +311,12 @@ class ExportJob(threading.Thread):
             if fig is not None:
                 fig.close()
             self.finished_at = time.monotonic()
+            # The run is over, so the rolling window is a stale sample of its
+            # last second; report what the whole render actually averaged.
+            if self._render_t0 is not None and self.done:
+                dt = monotonic() - self._render_t0
+                if dt > 0:
+                    self.render_fps = self.done/dt
             self._post()
 
     def _emit(self, proc, buf):
@@ -305,6 +330,10 @@ class ExportJob(threading.Thread):
                              % proc.wait(timeout=10)) from None
         self.done += 1
         now = monotonic()
+        n, mark = self._rate_mark
+        if now - mark > 1.0:
+            self.render_fps = (self.done - n)/(now - mark)
+            self._rate_mark = (self.done, now)
         if now - self._last_post > PROGRESS_PERIOD:
             self._last_post = now
             self._post()

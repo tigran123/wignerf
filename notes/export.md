@@ -202,3 +202,31 @@ each number behind it was measured. Read this before editing
   the extent from `GET /sessions/{id}` when it opens — the streamed status lags
   a frame burst by up to seconds after a pause, and seeding the range from it
   silently exported half the history.
+
+
+## The render rate the panel shows (2026-08-05)
+
+`ExportJob.render_fps`, beside `done/total` on the progress line. Two rates
+exist and they are unrelated: `fps` is the VIDEO's frame rate (what the mp4
+plays at, chosen in the form) and `render_fps` is how fast this machine is
+producing those frames. Conflating them would make a slow render look like a
+slow video.
+
+It is a ROLLING rate while running (the `worker.steps_per_sec` idiom: a ~1 s
+window) and the whole run's average once the job finishes. Measured on a
+40-frame 1920x1080 export of a 256^2 two-variant session, the parallel path:
+
+    while running   0.14 fps  (pool warmup, first samples)
+                    9.66 fps  (steady, 8 workers)
+    final average   4.15 fps
+
+That spread is the reason for the rolling window. A cumulative average would
+have started at 0.14 and spent the whole render climbing toward 4.15, i.e.
+displaying a number that only ever goes UP while nothing about the machine
+changes — and displaying it lowest exactly when someone is deciding whether the
+export is worth waiting for. The final figure keeps the warmup in, because it
+really was part of the wait.
+
+Panel formatting is two decimals below 10 fps: this feature lives in the
+0.5-10 range (a 24-panel 2D matrix renders at ~6 fps, a large 1D frame slower),
+where rounding to integers would print "6" and "1" for a 40% difference.

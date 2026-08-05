@@ -312,21 +312,20 @@ source) is what keeps startup fast. See `README.md`.
 - **Export panel** (header button "⤓ export") carries two things: the mp4
   below, and the run's SETUP — `GET /sessions/{id}/setup` serves
   `describe.setup_document`, the config the session was CREATED with
-  (`state_at(cfg, log, -1)` rewinds every live change; live changes are
-  deliberately not part of a starting state — the video's metadata block is
-  where they are recorded). Import fills the setup form and marks the session
+  (`state_at(cfg, log, -1)` rewinds every live change; live changes are not
+  part of a starting state — the video's metadata block records them). Import fills the setup form and marks the session
   restart-dirty, never restarts by itself (`lib/config.importConfig`, in-place
   merge on the reactive cfg), and accepts that .json OR an exported .mp4: `lib/mp4meta.ts` scans the file's head for the same document in the
-  `comment` tag (faststart keeps it there — byte ~3.5k), so a kept video is
-  self-restoring. Its confirmation line says `press "Restart session" to run
-  it` and NOT "or Solve" — an import moves grid/IC/variants, which are
+  `comment` tag (faststart keeps it there, byte ~3.5k), so a kept video is
+  self-restoring. Its confirmation says `press "Restart session" to run
+  it` and NOT "or Solve": an import moves grid/IC/variants, which are
   SessionCreate-only, so Solve would compute the old ones (the auto-restart in
-  `syncFreshSessionToForm` only fires when the document ALSO moves
+  `syncFreshSessionToForm` fires only when the document ALSO moves
   mode/t₂/Δt rec/precision on a fresh idle session). And it clears on a
   `sessionId` change, because that IS the restart it asks for: it used to
   clear only at the top of the NEXT import, so "press Restart session to run
-  it" stood over a session already running the imported setup. It survives a
-  panel close/reopen on purpose — an import you have not acted on yet is still
+  it" stood over a session already running the imported setup. It survives a panel
+  close/reopen on purpose — an import you have not acted on is still
   actionable.
   A render is destroyed by anything that moves the session on — Restart deletes
   the session (file unlinked mid-write) and computing new records evicts the
@@ -338,97 +337,97 @@ source) is what keeps startup fast. See `README.md`.
   prompt.
 - **mp4 export** (`core/videoexport.py` + `core/render_mpl.py` +
   `routers/export.py`): renders an ALREADY-COMPUTED record range on the
-  BACKEND — matplotlib/Agg frames piped as raw RGBA into ffmpeg (system
-  ffmpeg, absence ⇒ 503). PAUSED-only (409 while running): a running session
-  evicts old records, and the feature is for filming a range you already
-  played back. **Read `notes/export.md` before changing any of it** — every
-  figure below was measured, and the note says how.
-  **WHAT GOES IN THE FRAME IS A CHOICE** (`ExportSpec.planes` /
-  `.diagnostics`), because a 2D record carries far more than a frame can hold:
-  six planes × four variants is 24 panels against a column of NINE diagnostics.
+  BACKEND — matplotlib/Agg frames piped as raw RGBA into ffmpeg (system ffmpeg,
+  absence ⇒ 503). PAUSED-only (409 while running): a running session evicts old
+  records, and the feature is for filming a range you already played back. **Read `notes/export.md` before changing any of it**:
+  every figure below was measured, and the note says how.
+  **WHAT GOES IN THE FRAME IS A CHOICE** (`ExportSpec.planes` / `.diagnostics`),
+  because a 2D record carries far more than a frame can hold: six planes × four
+  variants is 24 panels against a column of NINE diagnostics.
   So **panels are the CARTESIAN PRODUCT of the selected planes and variants**,
   which makes `PanelGrid`'s two readings the two EDGES of one control rather
-  than modes the renderer has to know about — "compare variants" is one plane ×
-  every variant, "phase portrait" is every plane × one variant, and the Export
-  panel offers both as one-click presets that set the checkboxes.
-  `render_mpl.panel_grid` REFLOWS by count when one dimension is 1 and otherwise
-  lays out the matrix itself, rows = planes. Diagnostics are plot ids shared
-  VERBATIM with `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`,
-  `uncertainty0/1`, `purity`, `lz`) — one vocabulary for the hidden-series
-  preferences, the export wire and the metadata block — and an EMPTY list is
-  legal. **The 2D default drops the four marginals, and that is a physical
+  than modes the renderer knows about — "compare variants" is one plane × every
+  variant, "phase portrait" every plane × one variant, and the Export panel
+  offers both as one-click presets setting the checkboxes.
+  `render_mpl.panel_grid` REFLOWS by count when one dimension is 1, else lays
+  out the matrix, rows = planes. Diagnostics are plot ids shared VERBATIM
+  with `frontend/src/lib/plotPrefs.ts` (`marg0..marg3`, `E`, `uncertainty0/1`,
+  `purity`, `lz`) — one vocabulary for the hidden-series preferences, the export
+  wire and the metadata block — and an EMPTY list is legal. **The 2D default drops the four marginals, and that is a physical
   argument, not a space-saving one**: at ndim=2 the (x,y) and (px,py) PANELS
   already ARE the spatial and momentum densities. Past `DIAG_ROWS_MAX` = 7 the
-  column splits in two and the panels pay for it in width (`diag_layout`); the
-  panel states the resulting count and pixel size and warns about thumbnails.
+  column splits in two and the panels pay in width (`diag_layout`); the panel
+  states the resulting count and pixel size and warns about thumbnails.
   Both refusals live in `routers/export.py`, not the schema: what is available
-  depends on the session's ndim, which the request body does not carry — and
-  both name what IS available.
+  depends on the session's ndim, which the request body does not carry. Both
+  name what IS available.
   **The frame RENDER, not the encode, is the bottleneck**, so export renders
   frames across a **spawn** `ProcessPoolExecutor` (`WIGNERF_EXPORT_WORKERS`,
-  auto = min(cpu, 8)) while this thread feeds ORDERED frames to one ffmpeg —
+  auto = min(cpu, 8)) while this thread feeds ORDERED frames to one ffmpeg:
   a sliding window of ≤w+2 futures consumed FIFO, so workers run ahead with
   memory bounded. Spawn, NOT fork: the backend initializes CUDA and forking
-  after that inherits a broken context. A small job
-  (`< max(2·w, POOL_MIN_FRAMES=16)`) renders serially to skip the warmup. Encoder via
+  after that inherits a broken context. A small job (`< max(2·w,
+  POOL_MIN_FRAMES=16)`) renders serially, skipping the warmup. Encoder via
   `choose_encoder`/`WIGNERF_EXPORT_ENCODER`: auto uses the GPU **`h264_nvenc`
   ENCODER** if a one-shot runtime probe passes (`_nvenc_ok`, cached — it can be
   built-in yet fail with no driver), else `libx264 -preset veryfast -crf 18`.
-  NB that is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel`, which is a DECODE
-  flag and does nothing for our rawvideo input.
+  NB that is the h264_nvenc ENCODER, NOT ffmpeg `-hwaccel`, a DECODE flag that
+  does nothing for our rawvideo input.
   Two passes: a scan collects the E/ΔX·ΔP/γ series, the per-variant FIXED colour
   scale (no brightness flicker), the fixed marginal amplitudes and the widest
   window any record used, and proves every record is still retained before
   ffmpeg starts; then one figure update per frame. Only VALUE scales are
   export-wide — the SPATIAL axes follow each record's own geometry
-  (`_apply_geom`, which also re-captures the blit background since ticks are
-  static art), exactly as the SPA follows the painted frame. The figure is built
-  ONCE and BLITTED (static background + ~15 animated artists), the difference
-  between minutes and half an hour for a 1000-frame export.
+  (`_apply_geom`, which re-captures the blit background too, ticks being static
+  art), as the SPA follows the painted frame. The figure is built ONCE and
+  BLITTED (static background + ~15 animated artists), the difference between
+  minutes and half an hour for 1000 frames.
   Sizes offered: FHD / QHD / 4K UHD. The figure is always 19.2×10.8 in and
   the RESOLUTION RIDES ON THE DPI (`FrameFigure.REF_WIDTH`) — font sizes are in
-  points, so a fixed dpi would render every label at half its relative size at
-  4K. The downloaded name is descriptive (`Content-Disposition`) while the
-  on-disk path keeps session+job ids, so two exports of one range cannot
-  collide while one is downloading.
+  points, so a fixed dpi renders every label at half its relative size at 4K.
+  The downloaded name is descriptive (`Content-Disposition`) while the on-disk
+  path keeps session+job ids, so two exports of one range cannot collide while
+  one is downloading.
   **The video must READ like the screen**: every plot title comes from
   `core/axes.py`, the same source `lib/axes.ts` mirrors (γ keeps the UI's
   "purity γ(t) = 2πℏ∬W²dxdp", never an equivalent like Tr ρ²), field labels
   match the Setup panel, and the series y-window + tick decimals reproduce that
   component's `scales.y.range` rule (`render_mpl.series_ylim`) — matplotlib's
-  own autoscale renders a 2e-5 purity drift as a dramatic dive with a "×10⁻⁵+1"
-  offset where the UI shows a flat line at 1.000000, from byte-identical data.
+  autoscale renders a 2e-5 purity drift as a dramatic dive with a "×10⁻⁵+1"
+  offset where the UI shows a flat line at 1.000000, from identical data.
   The "grid lines on plots" toggle rides along in `ExportSpec.show_grid` and
   governs EVERY plot in the frame — charts get uPlot's grid stroke, the W panels
   get `GridOverlay.vue`'s theme-INDEPENDENT lines drawn AFTER the image
-  (matplotlib puts the axes grid under it, which is why the heatmaps first had
-  none). Mirror any change to those rules on both sides.
+  (matplotlib puts the axes grid under it, hence the heatmaps first had none). Mirror any change to those rules on both sides.
   The metadata block carries U(x), parameters, the IC as an analytic expression
-  (`core/describe.py`), and any live parameter change inside the range
-  (`session.param_log`) — so one frame documents the whole run; the same facts
-  go into the mp4 `comment` tag as JSON. It is anchored at `FrameFigure.META_TOP`
-  with `va="top"` and grows DOWNWARD, and **11 lines fit at 8 pt**; a realistic
+  (`core/describe.py`) and any live parameter change inside the range
+  (`session.param_log`), so one frame documents the whole run; the same facts
+  go into the mp4 `comment` tag as JSON. Anchored at `FrameFigure.META_TOP`
+  with `va="top"`, growing DOWNWARD, and **11 lines fit at 8 pt**; a realistic
   4-variant run sits at the edge, so `_meta_fontsize` shrinks to fit (one size
   for BOTH columns) and past a 5 pt floor `_meta_fit` elides with a pointer to
-  the comment tag — honest, because `describe.config_json` really carries it.
+  the comment tag — honest, since `describe.config_json` really carries it.
   `describe.IC_SRC_MAX` caps an IC expression against the same budget, in
-  PHYSICAL lines. Static art, baked into the blit background: no per-frame
-  cost.
-  Progress: `export` events on the session WS plus a REST poll; the file lives
-  in `WIGNERF_EXPORT_DIR` until downloaded, TTL (30 min), session close or
-  shutdown. The header button stays ENABLED while computing (a disabled button
+  PHYSICAL lines. Static art in the blit background, so free per frame.
+  Progress: `export` events on the session WS plus a REST poll, carrying
+  `render_fps` — **the RENDER rate, NOT `fps`, which is the finished mp4's** —
+  ROLLING while running, because a cumulative average spends the render
+  climbing out of the pool warmup and reads as a slowdown that is not
+  happening. The file lives in `WIGNERF_EXPORT_DIR` until downloaded: TTL
+  30 min, session close, or shutdown.
+  The header button stays ENABLED while computing (a disabled button
   explained only by a tooltip is how this feature first read as broken): the
-  panel states the gate, and "Pause & render" pauses, waits for the server to
-  confirm and re-seeds an untouched range before posting. Rendering continues
+  panel states the gate, and "Pause & render" pauses, waits for the server's
+  confirmation and re-seeds an untouched range before posting. Rendering continues
   while the popover is CLOSED, so the button IS the notification — "⤓ export
   42%" while running, emerald "⤓ export ready" (red "failed") when finished. The
-  panel re-reads the extent from `GET /sessions/{id}` when it opens — the
-  streamed status lags a frame burst by up to seconds after a pause, and seeding
-  the range from it silently exported half the history.
+  panel re-reads the extent from `GET /sessions/{id}` when it opens: the
+  streamed status lags a frame burst by seconds after a pause, and seeding the
+  range from it silently exported half the history.
   **The mp4 export follows the UI theme** (`ExportSpec.theme`, defaulted from
-  the app every time the Export panel opens and overridable per job — never
-  persisted, or it would stop tracking). Its schema default is `light`, matching
-  the SPA's. It threads the same path `show_grid` does, down to
+  the app each time the Export panel opens and overridable per job — never
+  persisted, or it would stop tracking). Its schema default is `light`, like the
+  SPA's. It threads the same path `show_grid` does, down to
   `render_mpl.FrameFigure(theme=)`, which resolves `PALETTE[theme]` once.
   `render_mpl`'s `PALETTE`/`VARIANT_COLORS` MIRROR the `--wf-*` values (it
   cannot read our stylesheet) — change a colour on one side and change it on the
@@ -1057,33 +1056,33 @@ is that lesson firing a second time).
   not a test).
 - **2D mp4 EXPORT (M4): the frame is a SELECTION, real subscripts are FREE, and
   the blit decides where static art may live.** **Read `notes/export.md` before
-  editing `core/render_mpl.py`** — it carries the measurements. The rules:
+  editing `core/render_mpl.py`**; it carries the measurements. The rules:
   **MATHTEXT IS USED**, because the figure BLITS: every title and axis label is
   a STATIC artist baked into the background once and costs nothing in situ.
   `axes.sub_math` typesets the two-letter axis names as `$p_x$` and everything
   else — ∬, ⨌, γ, ℏ, ρ, φ, ⟨⟩ — stays the Unicode the screen uses, so the two
   cannot drift and 1D is untouched at the byte level. **usetex is NOT used**
   (12×, needs a LaTeX install the VPS lacks, cannot render our Unicode, and is
-  global — the user's own U(x) would go through it). **And it must be the WHOLE
-  frame**: half the job reads worse than none, since the same axis would
-  otherwise appear twice on one screen in two spellings.
-  **The metadata block is WRAPPED PLAIN and typeset afterwards** (`_emit`) —
-  `$p_x$` is five characters that draw as two glyphs, so which characters land
-  on which line has to be decided by the plain text. **And it must not break a
+  global — the user's own U(x) would go through it). **And it must be the WHOLE frame**:
+  half the job reads worse than none: the same axis would otherwise appear
+  twice on one screen in two spellings.
+  **The metadata block is WRAPPED PLAIN and typeset afterwards** (`_emit`):
+  `$p_x$` is five characters drawing as two glyphs, so which characters land on
+  which line must be decided by the plain text. **And it must not break a
   line MID-FACT**: each group is joined with `_NB` and `_emit` restores real
   spaces after wrapping — it must be a character `textwrap` cannot see as
   whitespace at all (a Unicode NBSP is `\s`, so it does not work). A test for
   this must check **per line**. `_wrap` also passes `break_on_hyphens=False`,
-  which is the same rule for a break `_NB` cannot reach: a minus sign is not a
-  hyphen, and textwrap severed `exp(-x^2/2)` right after the minus.
+  the same rule for a break `_NB` cannot reach: a minus sign is not a hyphen,
+  and textwrap severed `exp(-x^2/2)` right after the minus.
   **U(x,y) is typeset by a LEXICAL rewrite of the user's own string**
-  (`describe.potential_math`), NOT via `sympy.latex`, which CANONICALISES (so
-  the block would stop being "the text you paste back") and emits tall `\frac`.
-  **A typeset line built from USER input cannot be the only line of defence** —
-  a mathtext parse error raises at DRAW time — so every candidate goes through
+  (`describe.potential_math`), NOT `sympy.latex`, which CANONICALISES (so the
+  block would stop being "the text you paste back") and emits tall `\frac`.
+  **A typeset line built from USER input cannot be the only line of defence**
+  (a mathtext parse error raises at DRAW time), so every candidate goes through
   `render_mpl.mathtext_ok` and falls back to plain per line.
   **AN IC EXPRESSION IS NEVER TYPESET AT ALL**, and says so by returning `None`
-  from `describe.ic_expression(math=True)` rather than a copy of the plain line.
+  from `describe.ic_expression(math=True)`, not a copy of the plain line.
   `_emit` only skips substitution on its single-fragment branch, so identical
   strings looked equivalent and were not: once the line wrapped it ran
   `sub_math_text` on every fragment and a user's literal `px` became `$p_x$` —
@@ -1091,16 +1090,15 @@ is that lesson firing a second time).
   signal `_emit` already had for "there is no typeset twin".
   **The header readout and the block deliberately DISAGREE**: the header's
   geometry follows the PAINTED record as the SPA does; the block's is labelled
-  "at record k0" and stays there.
+  "at record k0" and stays.
   **THE BLIT DECIDES WHERE STATIC ART MAY LIVE.** `update()` restores the static
-  background and then `draw_artist`s the images on top, so anything static drawn
-  INSIDE the axes box is painted over every frame — which is why the panel grid
-  lines are in `_dynamic` and ordered after the images, and why the per-panel
-  scale caption (past `CBAR_MAX_CELLS` = 8 panels) lives in the panel's
-  `loc="right"` TITLE, outside the axes box. Its first version sat in the corner
-  of the heatmap and rendered as NOTHING.
-  **COST: 2D is CHEAPER per frame than 1D** — a 2D plane is at most 128×128
-  where a 1D W is up to 4096².
+  background then `draw_artist`s the images on top, so anything static drawn
+  INSIDE the axes box is painted over every frame — hence the panel grid lines
+  are in `_dynamic`, ordered after the images, and the per-panel scale caption
+  (past `CBAR_MAX_CELLS` = 8 panels) lives in the panel's `loc="right"` TITLE,
+  outside the axes box. Its first version sat in the corner
+  of the heatmap and rendered as NOTHING. (2D is CHEAPER per frame than 1D — a
+  2D plane is at most 128×128 where a 1D W is up to 4096².)
 - **AUTO-EXPAND IN 2D (M3): the orchestration was free and the GUARD is the
   whole feature.** `core/fit.py` is the create-time check asked again mid-run,
   SHARED with `routers/sessions._fit_error` so the two cannot drift (each writes

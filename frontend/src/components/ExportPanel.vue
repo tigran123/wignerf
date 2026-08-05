@@ -425,6 +425,21 @@ const pct = computed(() => {
 })
 
 /**
+ * How fast the SERVER is rendering frames, for the progress line.
+ *
+ * Two decimals under 10 fps because that is where this feature lives: a 2D
+ * 24-panel matrix renders at ~6 fps and a large 1D frame slower still, so
+ * "6.4" and "0.72" are the numbers people read, and rounding those to integers
+ * would print "6" and "1" for a 40% difference. Blank until the server has a
+ * sample rather than showing a confident 0.
+ */
+const renderRate = computed(() => {
+  const r = job.value?.render_fps
+  if (!r) return ''
+  return `${r >= 10 ? r.toFixed(0) : r.toFixed(2)} fps render`
+})
+
+/**
  * The header button IS the notification: rendering continues while the
  * popover is closed (the poll and the WS 'export' events keep running), so
  * the button carries the progress and then the finished state — reopening
@@ -686,6 +701,18 @@ onBeforeUnmount(() => clearInterval(poll))
         </div>
         <p class="text-fg-3 tabular-nums">
           {{ job.state }} — {{ job.done }}/{{ job.total }} frames
+          <!-- The RENDER rate, which is not the video's fps two fields up: a
+               1000-frame export is minutes of waiting, and this is the only
+               thing on screen that says whether it is progressing at 8 fps or
+               at 0.5. Averaged over the whole run once it finishes, so it
+               stays readable instead of freezing on its last second. -->
+          <span v-if="renderRate" :title="job.state === 'done'
+                  ? 'frames rendered per second, averaged over the whole render'
+                  : 'frames rendered per second right now. This is the RENDER '
+                    + 'rate on the server, not the video\'s frame rate — the '
+                    + 'finished mp4 plays at ' + job.fps + ' fps whatever this says.'">
+            · {{ renderRate }}
+          </span>
           <span v-if="job.state === 'done'">
             ({{ (job.bytes/2**20).toFixed(1) }} MiB)
           </span>

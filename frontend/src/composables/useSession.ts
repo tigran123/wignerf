@@ -143,7 +143,11 @@ export interface ExportEvent {
   bytes: number
   error: string | null
   filename: string
+  /** the VIDEO's frame rate — what the finished mp4 plays at */
   fps: number
+  /** frames RENDERED per second on the server: rolling while running, the
+   *  run's overall average once it finishes. Unrelated to `fps` above. */
+  render_fps: number
   duration_s: number
 }
 

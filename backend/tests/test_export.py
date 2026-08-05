@@ -418,6 +418,15 @@ def test_export_end_to_end(tmp_path, monkeypatch):
                     break
             assert st["state"] == "done", st
             assert st["done"] == st["total"] and st["bytes"] > 0
+            # The RENDER rate the export panel shows. A finished job reports
+            # the whole run's average, so it is positive and finite whatever
+            # the last second happened to look like — a rate that quietly
+            # stayed 0 would render as a blank field and look intentional.
+            assert st["render_fps"] > 0, st
+            assert st["render_fps"] < 10000, st
+            # ...and it is NOT the video's frame rate, which is what makes two
+            # fields necessary: this render is far slower than 10 fps playback
+            assert st["fps"] == 10
 
             f = client.get("/api/exports/%s/file" % jid)
             assert f.status_code == 200
