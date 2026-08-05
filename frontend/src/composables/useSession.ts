@@ -12,6 +12,9 @@ import { api } from '../api'
 import type { GeomCfg } from '../lib/config'
 import { perfDrop, perfFrame, perfMsg, perfStage } from '../lib/perf'
 import { decodeFrame, type Frame } from '../lib/protocol'
+// type-only, so this pairs with readout.ts's own type-only import of
+// ProgressEvent below and neither becomes a runtime cycle
+import type { ReadoutSource } from '../lib/readout'
 
 export interface VariantStatus {
   variant: string
@@ -191,6 +194,12 @@ export function useSession() {
   // newest batch-compute progress report (t / percent / throughput); the
   // display shows this in place of frames while a batch run computes
   const progress = ref<ProgressEvent | null>(null)
+  // Which of the two spoke LAST — the source the control bar's readouts
+  // describe (lib/readout.pickReadout). Arrival order is a fact this dispatcher
+  // knows for certain; deriving it from watchers in the component would be
+  // guessing at Vue's flush order, and comparing record indices is outright
+  // wrong (see readout.ts). Survives reconnect(), like `progress` itself.
+  const readoutSource = ref<ReadoutSource | null>(null)
 
   let ws: WebSocket | null = null
   const handlers = new Set<FrameHandler>()
@@ -215,6 +224,8 @@ export function useSession() {
     if (queue.length) scheduleDrain()
     const t0 = performance.now()
     lastFrame.value = f
+    // the PAINT step, not the decode: the readouts describe what is on screen
+    readoutSource.value = 'frame'
     // isolate handlers: one throwing panel (e.g. a GL error) must not
     // starve the rest of this frame or escape the rAF callback
     handlers.forEach((h) => {
@@ -281,7 +292,10 @@ export function useSession() {
         else if (d.type === 'eviction' && status.value)
           status.value.record_extent = d.new_extent
         else if (d.type === 'export') exportEvent.value = d as ExportEvent
-        else if (d.type === 'progress') progress.value = d as ProgressEvent
+        else if (d.type === 'progress') {
+          progress.value = d as ProgressEvent
+          readoutSource.value = 'progress'
+        }
         else if (d.type === 'boundary')
           boundary.value = d.axes.length ? (d as BoundaryEvent) : null
         else if (d.type === 'params_applied')
@@ -341,6 +355,7 @@ export function useSession() {
     paramsApplied.value = null
     exportEvent.value = null
     progress.value = null
+    readoutSource.value = null
     if (info.value) {
       const sid = info.value.session_id
       info.value = null
@@ -371,6 +386,6 @@ export function useSession() {
   }
 
   return { status, info, connected, errors, lastFrame, boundary, regrid,
-           paramsApplied, exportEvent, progress, create, send, onFrame, onClose,
-           reconnect, destroy, beaconDestroy }
+           paramsApplied, exportEvent, progress, readoutSource, create, send,
+           onFrame, onClose, reconnect, destroy, beaconDestroy }
 }

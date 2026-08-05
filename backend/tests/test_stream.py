@@ -631,6 +631,15 @@ def test_batch_starts_paused_and_stops_at_t2():
             r = client.get("/api/sessions/%s" % info["session_id"]).json()
             assert r["record_extent"][1] == 0, "computed without being asked"
             assert r["t2"] == 0.5
+            # An IDLE batch session sends no progress report at all: a fresh
+            # sender must never volunteer one (the client's readouts follow
+            # whichever source spoke last, so an unsolicited report would move
+            # them off a painted frame). Record 0 lands a tick after the sender
+            # attaches, which is exactly where that used to be a race.
+            for _ in range(2):                  # the 1 Hz status keeps these coming
+                m = ws.receive()
+                assert not m.get("bytes")
+                assert json.loads(m["text"])["type"] == "status"
 
             # play: workers run flat-out — but batch streams NO frames while
             # computing, only a throttled progress report; the run must
@@ -667,6 +676,22 @@ def test_batch_starts_paused_and_stops_at_t2():
             assert not saw_frame, "batch streamed a frame while computing"
             assert saw_progress, "batch sent no progress report"
             assert done, "batch never auto-paused at t2"
+            # A batch compute that stops leaves a FINAL report behind, and it
+            # describes the record it actually stopped ON: the periodic one is
+            # up to PROGRESS_PERIOD old, so the control bar (which keeps
+            # displaying the newest report — batch paints no frames) would
+            # otherwise sit just short of t2 forever, at 99%.
+            final = None
+            for _ in range(200):
+                m = ws.receive()
+                d = json.loads(m["text"]) if m.get("text") else {}
+                if d.get("type") == "progress" and d["record"] == 10:
+                    final = d
+                    break
+            assert final is not None, "no final progress report at t2"
+            assert final["t"] == pytest.approx(0.5)
+            assert final["percent"] == pytest.approx(100.0)
+            assert {"E", "purity", "std"} <= set(final["per_variant"][0])
             # ... and STOPS at t2: the frontier must not advance past it,
             # and the RUN must end — the workers idle from here on, so a
             # still-"running" clock would freeze the transport button on
@@ -713,6 +738,23 @@ def test_batch_rewind_plays_back_without_computing():
             frontier = client.get("/api/sessions/%s" % sid).json()["record_extent"][1]
             assert 4 <= frontier < 1999, "expected a mid-run pause"
 
+            # The pause must leave a FINAL progress report at the settled
+            # frontier — including the records still in flight when it landed.
+            # It is the only thing that says where the run stopped (batch
+            # painted no frames), and the control bar's whole bottom line —
+            # t, E, ΔX·ΔP, γ — reads "—" without it.
+            final = None
+            for _ in range(2000):
+                m = ws.receive()
+                assert not m.get("bytes"), "batch streamed a frame while paused"
+                d = json.loads(m["text"])
+                if d["type"] == "progress" and d["record"] == frontier:
+                    final = d
+                    break
+            assert final is not None, "no final progress report after the pause"
+            assert final["t"] == pytest.approx(0.05*frontier)
+            assert {"E", "purity", "std"} <= set(final["per_variant"][0])
+
             ws.send_text(json.dumps({"type": "seek", "record": 0}))
             for _ in range(200):                # wait out the seek echo
                 m = ws.receive()
@@ -722,12 +764,19 @@ def test_batch_rewind_plays_back_without_computing():
                 raise AssertionError("seek(0) frame never arrived")
             ws.send_text(json.dumps({"type": "play"}))
             seen = []
+            # A batch PLAYBACK must send no progress report at all — not during
+            # the pass and not at its auto-pause. The client shows whichever
+            # source spoke last, so one here would jump the readouts off the
+            # browsed frame onto the frontier (lib/readout.ts).
             for _ in range(20*frontier + 400):
                 m = ws.receive()
                 if m.get("bytes"):
                     seen.append(protocol.unpack_frame(m["bytes"]).record)
                     if seen[-1] == frontier:
                         break
+                else:
+                    assert json.loads(m["text"])["type"] != "progress", \
+                        "batch playback emitted a progress report"
             assert seen == list(range(1, frontier + 1)), \
                 "batch playback skipped records: %r" % seen[:20]
             r = None
@@ -739,6 +788,21 @@ def test_batch_rewind_plays_back_without_computing():
             assert r is not None and not r["running"]
             assert r["record_extent"][1] == frontier, \
                 "rewound batch playback resumed computing toward t2"
+            # ...and nothing follows the auto-pause either: read past two
+            # not-running status echoes (STATUS_PERIOD apart) to prove it.
+            idle = 0
+            for _ in range(400):
+                m = ws.receive()
+                if m.get("bytes"):
+                    continue                    # trailing frames of the pass
+                d = json.loads(m["text"])
+                assert d["type"] != "progress", \
+                    "the batch playback auto-pause emitted a progress report"
+                if d["type"] == "status" and not d["running"]:
+                    idle += 1
+                    if idle == 2:
+                        break
+            assert idle == 2, "no status echo after the playback auto-pause"
 
             # play AT the frontier resumes the batch run
             ws.send_text(json.dumps({"type": "play"}))

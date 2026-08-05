@@ -180,6 +180,16 @@ async def _sender(ws, s, recv_task):
     last_status = 0.0
     last_progress = 0.0
     last_running = s.clock.running
+    last_computing = (s.cfg.mode == "batch" and s.clock.running
+                      and not s.clock.stop_at_frontier)
+    # The frontier the newest progress report described, or None if THIS sender
+    # has sent none. While a batch compute is stopped, only a record landing
+    # after a report we ourselves sent may trigger another one — so a fresh
+    # sender reports nothing unsolicited, whether it attached to a paused run
+    # (the client keeps its own last report across a socket drop, and an
+    # unsolicited one would flip its readouts off a painted frame onto the
+    # frontier) or to an idle one whose record 0 completes a tick later.
+    last_progress_rec = None
     last_loop_epoch = s.clock.loop_epoch
     await _guard_send(ws.send_text(json.dumps(s.status())))
     # exit on s.closed too: a DELETE/TTL close() pops the session and stops
@@ -223,7 +233,27 @@ async def _sender(ws, s, recv_task):
                            and not s.clock.stop_at_frontier)
         if batch_computing and now - last_progress > PROGRESS_PERIOD:
             last_progress = now
+            last_progress_rec = lc
             await _guard_send(ws.send_text(json.dumps(_progress_msg(s, lc))))
+        # ...and a batch compute that STOPS leaves a FINAL report behind. The
+        # control bar keeps displaying the newest one it received (batch paints
+        # no frames, so nothing else says where the run stopped), and the
+        # periodic report above is up to PROGRESS_PERIOD old — with in-flight
+        # records still landing after the pause. So: once on the compute→stop
+        # flip (a pause, or arriving at t2 inside advance_cursor), and again for
+        # each record that lands afterwards. Self-quiescing — the frontier stops
+        # moving within a record or two of the pause.
+        # It must never fire when a batch PLAYBACK pauses: `batch_computing` was
+        # already False through the replay and `lc` does not move, so neither
+        # condition holds and the readouts stay on the browsed frame.
+        elif s.cfg.mode == "batch" and not batch_computing \
+                and (last_computing
+                     or (last_progress_rec is not None
+                         and lc > last_progress_rec)):
+            last_progress = now
+            last_progress_rec = lc
+            await _guard_send(ws.send_text(json.dumps(_progress_msg(s, lc))))
+        last_computing = batch_computing
 
         k = None
         live = True

@@ -1167,6 +1167,7 @@ onBeforeUnmount(() => {
       :status="session.status.value"
       :last-frame="session.lastFrame.value"
       :progress="session.progress.value"
+      :readout-source="session.readoutSource.value"
       :setup-valid="setupValid"
       @command="sendCommand"
     />

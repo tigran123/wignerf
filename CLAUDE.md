@@ -538,7 +538,19 @@ source) is what keeps startup fast. See `README.md`.
   emit; `history.get` returns references, no array copies) and without them the
   bar read "—" for a whole batch run while the plots two panels away were live:
   the same data on screen, just missing from the one place showing its CURRENT
-  value. Batch's live
+  value. **AND THEY MUST SURVIVE THE PAUSE THAT ENDS THE RUN**, which is when
+  "what t did I stop at?" is actually asked: WHICH source a readout describes is
+  decided by **arrival order** (`useSession.readoutSource` → `lib/readout.
+  pickReadout`), never by record index. Gating it on `computing` blanked t, E,
+  ΔX·ΔP, γ and the batch-% badge together the moment a mid-run Pause landed —
+  interactive mode never showed it because there `lastFrame` survives a pause.
+  "Highest record wins" is the wrong repair: scrubbing to record 50 in a
+  FINISHED batch run would print the retained frontier report's t over a panel
+  painted at 50. `_sender` also emits a FINAL report when a batch compute stops
+  (on the compute→stop flip, and again per record that lands after it), because
+  the periodic one is up to `PROGRESS_PERIOD` old and in-flight records land
+  after the pause — while a batch PLAYBACK's pause must emit NONE, or the
+  readouts jump off the browsed frame onto the frontier. Batch's live
   branch never sends a frame (computing OR paused-at-frontier) — you review a
   finished batch run via explicit playback (seek + sequential replay, which DO
   stream frames). Its t2 auto-stop is NOT delivery-gated (unlike playback):

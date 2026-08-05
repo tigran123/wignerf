@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import type { Frame } from '../lib/protocol'
 import type { SessionStatus, ProgressEvent } from '../composables/useSession'
 import { displayInterval } from '../lib/perf'
+import { pickReadout, type ReadoutSource } from '../lib/readout'
 import { transportAction } from '../lib/transport'
 import { AU_ENERGY_EV, AU_TIME_FS } from '../lib/units'
 
@@ -11,13 +12,10 @@ const props = defineProps<{
   lastFrame: Frame | null
   // batch compute streams no frames, so t comes from the progress report
   progress: ProgressEvent | null
+  // which of those two spoke last — see lib/readout
+  readoutSource: ReadoutSource | null
   setupValid: boolean
 }>()
-
-// batch mode computing: no frames stream, the display is dimmed and t/percent
-// come from the progress report instead of the (frozen/absent) lastFrame
-const batchComputing = computed(() =>
-  props.status?.mode === 'batch' && !!props.status?.computing)
 
 const emit = defineEmits<{
   (e: 'command', cmd: Record<string, unknown>): void
@@ -139,18 +137,27 @@ function setDelay(ev: Event) {
 // "(… fs)" part slid about; fixed decimals plus a right-aligned
 // fixed-width field pin every glyph to its column. The exported frames
 // have the same rule (core/render_mpl.py).
-// during batch compute there is no frame — t rides the progress report
-const tNow = computed<number | null>(() =>
-  batchComputing.value ? (props.progress?.t ?? null)
-                       : (props.lastFrame?.t ?? null))
-const tAu = computed(() => tNow.value != null ? tNow.value.toFixed(3) : '—')
+/**
+ * Every readout below comes from ONE normalized record: the newest painted
+ * frame, or — through a batch run, which streams no frames — the newest
+ * progress report. `readoutSource` says which spoke last, so the values HOLD
+ * across the pause that ends a batch compute instead of the whole line
+ * reverting to "—" (see lib/readout for why arrival order and not the record
+ * index decides). Interactive mode is unaffected: it never sends a progress
+ * report, so the source is always the frame.
+ */
+const readout = computed(() =>
+  pickReadout(props.readoutSource, props.lastFrame, props.progress))
+const tAu = computed(() => readout.value.t != null ? readout.value.t.toFixed(3) : '—')
 const tFs = computed(() =>
-  tNow.value != null ? (tNow.value*AU_TIME_FS).toFixed(3) : '—')
-// percent toward t₂ while a batch run computes (a compact echo of the big
-// progress bar on the dimmed heatmap)
+  readout.value.t != null ? (readout.value.t*AU_TIME_FS).toFixed(3) : '—')
+// percent toward t₂ of a batch run (a compact echo of the big progress bar on
+// the dimmed heatmap). `pct` is a progress-report-only field, so this shows
+// exactly while the readouts are describing that report — through the pause
+// included, which is when how far the run got is most worth knowing.
 const batchPct = computed(() =>
-  batchComputing.value && props.progress
-    ? `${props.progress.percent.toFixed(0)}%` : null)
+  props.status?.mode === 'batch' && readout.value.pct != null
+    ? `${readout.value.pct.toFixed(0)}%` : null)
 
 /**
  * Direct t entry: whenever the session is paused and history exists, the t
@@ -166,8 +173,11 @@ const canEditT = computed(() =>
   !running.value && (props.status?.record_extent?.[1] ?? -1) >= 0)
 
 function startEditT() {
-  if (!canEditT.value || !props.lastFrame) return
-  tDraft.value = props.lastFrame.t.toFixed(3)
+  // seeded from the readout, not from lastFrame: a batch run has no frame, so
+  // demanding one left the underlined-and-clickable t inert for exactly the
+  // paused batch run where typing a t is most useful
+  if (!canEditT.value || readout.value.t == null) return
+  tDraft.value = readout.value.t.toFixed(3)
   editingT.value = true
   void nextTick(() => tInput.value?.select())
 }
@@ -189,42 +199,17 @@ function commitT() {
   const k = Math.min(Math.max(k0 + Math.round((tv - t0) / step), k0), k1)
   emit('command', { type: 'seek', record: k })
 }
-/**
- * Observables of the FIRST active variant, normalized across the two sources.
- * Batch compute streams no frames, so `lastFrame` is stale or absent for the
- * whole run — but the frontier record's scalars ride the progress report
- * (which is already being sent), exactly as `t` does above. Without this the
- * readouts sat at "—" while the series plots two panels away were live.
- */
-/** The uncertainty PRODUCT per spatial dimension: std[i]*std[ndim+i]. One
- *  number in 1D, two in 2D — a single "ΔX·ΔP" would silently report only the
- *  x dimension of a run where y is the interesting one. */
-function products(std: number[]): number[] {
-  const nd = std.length / 2
-  return Array.from({ length: nd }, (_, i) => std[i]! * std[nd + i]!)
-}
-
-const obs = computed<{ E: number; uncert: number[]; purity: number } | null>(() => {
-  if (batchComputing.value) {
-    const v = props.progress?.per_variant[0]
-    if (!v || v.E == null || v.std == null || v.purity == null) return null
-    return { E: v.E, uncert: products(v.std), purity: v.purity }
-  }
-  const v = props.lastFrame?.variants[0]
-  return v ? { E: v.E, uncert: products(v.std), purity: v.purity } : null
-})
-const ndim = computed(() => props.lastFrame?.ndim
-  ?? ((props.progress?.per_variant[0]?.std?.length ?? 2) / 2))
-const uncertLabel = computed(() => ndim.value > 1
+const uncertLabel = computed(() => readout.value.ndim > 1
   ? 'ΔX·ΔPx, ΔY·ΔPy ='
   : 'ΔX·ΔP =')
-const eHa = computed(() => obs.value ? obs.value.E.toPrecision(6) : '—')
+const eHa = computed(() => readout.value.E != null ? readout.value.E.toPrecision(6) : '—')
 const eEv = computed(() =>
-  obs.value ? (obs.value.E*AU_ENERGY_EV).toFixed(3) : '—')
-const uncert = computed(() => obs.value
-  ? obs.value.uncert.map((u) => u.toFixed(4)).join(', ')
+  readout.value.E != null ? (readout.value.E*AU_ENERGY_EV).toFixed(3) : '—')
+const uncert = computed(() => readout.value.uncert
+  ? readout.value.uncert.map((u) => u.toFixed(4)).join(', ')
   : '—')
-const purity = computed(() => obs.value ? obs.value.purity.toFixed(6) : '—')
+const purity = computed(() =>
+  readout.value.purity != null ? readout.value.purity.toFixed(6) : '—')
 const stepInfo = computed(() => {
   // Tag each variant with its device only when the pool actually has
   // more than one device — single-device setups keep the compact form.
@@ -294,13 +279,13 @@ const stepInfo = computed(() => {
         a.u. (<span class="wf-fixnum w-[7ch]">{{ tFs }}</span> fs)</span>
     </div>
     <div v-if="batchPct" class="shrink-0 px-2 py-0.5 rounded bg-warn-soft text-warn-2 text-xs tabular-nums"
-         title="batch compute progress toward t₂ — no frames are streamed; press Play when done to review">
+         title="how far this batch run has reached toward t₂ — no frames are streamed while it computes, so the readouts describe its newest record and hold there when it stops; press Play when done to review">
       batch {{ batchPct }}</div>
     <div class="tabular-nums w-64 truncate shrink-0"><span class="text-fg-3">E =</span>
       <span class="wf-fixnum w-[9ch]">{{ eHa }}</span>
       Ha (<span class="wf-fixnum w-[8ch]">{{ eEv }}</span> eV)</div>
     <div class="tabular-nums truncate shrink-0"
-         :class="ndim > 1 ? 'w-60' : 'w-36'"><span class="text-fg-3">{{ uncertLabel }}</span> {{ uncert }}</div>
+         :class="readout.ndim > 1 ? 'w-60' : 'w-36'"><span class="text-fg-3">{{ uncertLabel }}</span> {{ uncert }}</div>
     <div class="tabular-nums w-36 truncate shrink-0"
          :title="'purity of the first active variant'"><span class="text-fg-3">γ =</span> {{ purity }}</div>
     <div class="ml-auto min-w-0 truncate text-right text-xs text-muted tabular-nums"
