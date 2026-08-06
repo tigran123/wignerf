@@ -82,12 +82,19 @@ const axisNames = computed(() => axisLabels(ndim.value))
  * come out of one response with no extra request.
  *
  * TWO charts, not two traces on one. uPlot's AlignedData has a single shared
- * abscissa, and these two cuts do not share one: x follows the editor's zoom
- * window and y follows the grid's own extent. Overlaying them drew U(0, y) —
+ * abscissa, and these two cuts do not share one: each axis carries its OWN
+ * zoom window, and the two move independently. Overlaying them drew U(0, y) —
  * indexed by y — at the x sample positions, which is right only when the two
  * windows happen to coincide (they do for the isotropic default box, which is
  * exactly why it looked correct) and silently rescales the y cut by
  * (x2-x1)/(y2-y1) otherwise. 1D is unchanged: one chart, one trace.
+ *
+ * BOTH cuts zoom, with the app's whole gesture set (drag / wheel / Shift-wheel /
+ * dblclick-reset) and one createUplotZoom instance each, and each window is sent
+ * back as the range to SAMPLE. A y zoom therefore also moves where the X cut is
+ * taken — it is read at the y sample nearest the origin, which a zoomed-away
+ * window no longer contains — and titleX says so ("U(x, 3.2)"), the mirror of
+ * what an x zoom already does to the y cut's title.
  */
 
 /** "U(x)" / "U(x,y)" — the function's own name, which is a fact about the
@@ -112,17 +119,29 @@ let chart: uPlot | null = null
 let chartY: uPlot | null = null
 let timer: ReturnType<typeof setTimeout> | null = null
 
-// zoomed x window of the plot, DELIBERATELY independent of the grid's
-// x1/x2 (null = follow the grid): zooming is how the "interesting domain"
-// of U(x) is discovered, and the button below copies it into the grid.
-// The backend samples U on this window while the validity probe keeps
+// zoomed windows of the two plots, DELIBERATELY independent of the grid's
+// own extents (null = follow the grid): zooming is how the "interesting domain"
+// of U is discovered, and the buttons below copy either one into the grid.
+// The backend samples U on these windows while the validity probes keep
 // using the SIMULATION range (req.grid) — no restriction to [x1, x2].
 const viewX = ref<{ x1: number; x2: number } | null>(null)
+// viewY exists only at ndim > 1 and is dropped when ndim falls back to 1 (see
+// rebuild): the chart it belongs to is v-if'd away there, so a surviving window
+// would be pinned with nothing left to double-click and would reappear,
+// unasked, on the next switch back to 2D.
+const viewY = ref<{ y1: number; y2: number } | null>(null)
 // clampX: false — zooming out past the data is the point (it re-samples
-// on the wider window via the debounced compile below)
+// on the wider window via the debounced compile below).
+// Each instance reports its own ABSCISSA window, which on the second chart is
+// y; Shift-wheel moves the U scale only and is deliberately not reported,
+// since U's range is autoscaled and never re-sampled.
 const zoom = createUplotZoom({
   clampX: false,
   onXChange: (w) => { viewX.value = w && { x1: w.min, x2: w.max } },
+})
+const zoomY = createUplotZoom({
+  clampX: false,
+  onXChange: (w) => { viewY.value = w && { y1: w.min, y2: w.max } },
 })
 
 async function compile() {
@@ -136,6 +155,11 @@ async function compile() {
       expr,
       x1: viewX.value?.x1 ?? ax[0]!.lo,
       x2: viewX.value?.x2 ?? ax[0]!.hi,
+      // undefined is dropped from the body and the server fills in the grid's
+      // own y extent (routers/preview.preview_potential). NOT `?? ax[1]!.lo`
+      // like x above: at ndim=1 axes[1] is the MOMENTUM axis, not y.
+      y1: viewY.value?.y1,
+      y2: viewY.value?.y2,
       grid: props.grid,
       hbar_eff: props.hbarEff,
     })
@@ -152,9 +176,11 @@ async function compile() {
 
 // grid/ℏ changes move the extended Bopp range, so they can flip validity
 // (a pole may enter it) — recompile on those too, not just on typing.
-// viewX: wheel/drag rescale the old samples instantly client-side; the
-// debounced fetch then refines/extends them to exactly the new window.
-watch([draft, () => props.grid, () => props.hbarEff, viewX], () => {
+// viewX/viewY: wheel/drag rescale the old samples instantly client-side; the
+// debounced fetch then refines/extends them to exactly the new window. Both
+// windows are in here — a y zoom that only stretched the lattice's existing
+// n2 samples would show no more detail than the full extent already did.
+watch([draft, () => props.grid, () => props.hbarEff, viewX, viewY], () => {
   if (timer) clearTimeout(timer)
   timer = setTimeout(compile, 300)
 }, { deep: true })
@@ -176,10 +202,12 @@ function matchesNdim(sm: NonNullable<PreviewResult['samples']>): boolean {
  *  name it instead of claiming 0 — see lib/potentialCuts.ts. */
 const cutFrom = ref<{ x: number; y: number } | null>(null)
 
+// Both go through the zoom's setData, never uPlot's own: that autoscales, so
+// every 300 ms refetch would throw away the window just set.
 function draw(sm: NonNullable<PreviewResult['samples']>) {
   if (chart) zoom.setData(chart, cutAlongX(sm) as unknown as uPlot.AlignedData)
   if (chartY && isLattice(sm))
-    chartY.setData(cutAlongY(sm) as unknown as uPlot.AlignedData)
+    zoomY.setData(chartY, cutAlongY(sm) as unknown as uPlot.AlignedData)
   cutFrom.value = cutAt(sm)
 }
 
@@ -190,13 +218,17 @@ const titleX = computed(() => {
 const titleY = computed(() =>
   `U(${cutLabel(cutFrom.value?.x, result.value?.samples?.x)}, y)`)
 
-/** Copy the zoomed-in "interesting domain" into the FIRST spatial axis
- *  (applies at restart, like any grid edit). */
-function setGridFromView() {
-  const v = viewX.value
+/** Copy the zoomed-in "interesting domain" of spatial axis `i` into the grid
+ *  (applies at restart, like any grid edit). Array order is (q..., k...), so
+ *  axes[0] is x and axes[1] is y; i=1 comes only from the y button, which
+ *  renders only while viewY is set, which happens only at ndim=2. */
+function setGridFromView(i: number) {
+  const v = i === 0
+    ? viewX.value && [viewX.value.x1, viewX.value.x2]
+    : viewY.value && [viewY.value.y1, viewY.value.y2]
   if (!v) return
-  props.grid.axes[0]!.lo = parseFloat(v.x1.toPrecision(6))
-  props.grid.axes[0]!.hi = parseFloat(v.x2.toPrecision(6))
+  props.grid.axes[i]!.lo = parseFloat(v[0]!.toPrecision(6))
+  props.grid.axes[i]!.hi = parseFloat(v[1]!.toPrecision(6))
   emit('gridDirty')
 }
 
@@ -268,10 +300,12 @@ function makeChart(): uPlot {
   )
 }
 
-/** The y cut, on its own abscissa. No zoom plugin: its window follows the
- *  grid's y extent, and the request's y1/y2 fields are where a y zoom would
- *  go if one is ever wanted. Shorter than the x chart — this is the secondary
- *  reading, in the column the W panels are competing with. */
+/** The y cut, on its own abscissa and with its own zoom — the same gesture set
+ *  as the x chart, reported as the request's y1/y2. Shorter than the x chart —
+ *  this is the secondary reading, in the column the W panels are competing
+ *  with. No `cursor` of its own: zoomY.plugin's opts hook assigns o.cursor
+ *  wholesale (drag/wheel/dblclick), so anything set here would be silently
+ *  replaced — the x chart carries none for the same reason. */
 function makeChartY(): uPlot {
   const pal = chartPalette()
   return new uPlot(
@@ -280,7 +314,7 @@ function makeChartY(): uPlot {
       height: 90,
       title: titleY.value,
       legend: { show: false },
-      cursor: { show: false },
+      plugins: [zoomY.plugin],
       scales: { x: { time: false } },
       axes: [
         { stroke: pal.axis, grid: { stroke: pal.gridSoft } },
@@ -301,7 +335,17 @@ function rebuild() {
   chart?.destroy()
   chart = makeChart()
   chartY?.destroy()
-  chartY = ndim.value > 1 && plotElY.value ? makeChartY() : null
+  if (ndim.value > 1 && plotElY.value) {
+    chartY = makeChartY()
+  } else {
+    // The y axis has stopped existing, so display state that ADDRESSES it must
+    // go with it (the ICEditor.cutAxis rule): the chart is v-if'd away, leaving
+    // a pinned window with nothing left to double-click, which would then come
+    // back unasked on the next switch to 2D.
+    chartY = null
+    zoomY.reset()
+    viewY.value = null
+  }
   const sm = result.value?.samples
   if (sm && matchesNdim(sm)) {
     draw(sm)
@@ -384,15 +428,21 @@ onBeforeUnmount(() => { chart?.destroy(); chartY?.destroy() })
     </div>
     <div ref="plotEl" class="wf-plot"></div>
     <!-- 2D: the y cut on its OWN abscissa. It cannot share the x chart's —
-         x follows the zoom window, y the grid's extent — see the note by
-         seriesY(). -->
+         each axis zooms independently — see the note at the top. -->
     <div v-if="ndim > 1" ref="plotElY" class="wf-plot"></div>
-    <div v-if="viewX" class="flex justify-end">
+    <div v-if="viewX || viewY" class="flex justify-end gap-1">
       <button
+        v-if="viewX"
         class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
         title="copy the current zoom window into x₁,x₂ (applies at restart); double-click the plot to reset the zoom"
-        @click="setGridFromView"
+        @click="setGridFromView(0)"
       >x₁,x₂ ← view</button>
+      <button
+        v-if="viewY"
+        class="px-2 py-0.5 rounded bg-raised hover:bg-raised-hover text-xs"
+        title="copy the current zoom window into y₁,y₂ (applies at restart); double-click the plot to reset the zoom"
+        @click="setGridFromView(1)"
+      >y₁,y₂ ← view</button>
     </div>
     <!-- ONE button: the form already holds the draft (see the header
          comment), so the only thing left to ask for is the live push. The

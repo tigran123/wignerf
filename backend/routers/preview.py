@@ -215,8 +215,10 @@ class PotentialPreviewIn(BaseModel):
     n: int = Field(default=400, ge=16, le=4096)
     grid: Optional[GridSpec] = None   # enables the extended-range quantum probe
     hbar_eff: float = Field(default=1.0, gt=0)
-    # 2D only: the y window to sample the heatmap over. Defaults to the grid's
-    # own y extent; x1/x2 stay the (possibly zoomed) x window, exactly as in 1D.
+    # 2D only: the y window to sample the heatmap over. The editor's y-cut chart
+    # zooms this exactly as x1/x2 zoom the x one; absent (the unzoomed case) it
+    # defaults to the grid's own y extent. Neither window restricts the validity
+    # probes, which read req.grid — see the comment in preview_potential.
     y1: Optional[float] = None
     y2: Optional[float] = None
     # 2D heatmap resolution (the client reads its axis cuts out of the same

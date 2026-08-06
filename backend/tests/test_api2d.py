@@ -647,3 +647,49 @@ def test_a_2d_potential_may_use_y_and_a_1d_one_may_not():
                                        "p1": -7, "p2": 7, "Np": 64}})
         d = r.json()
         assert d["ok"] is False and "only 'x'" in d["error"]
+
+
+def test_the_y_zoom_moves_the_samples_and_not_the_validity_boxes():
+    """The 2D twin of test_the_validity_probe_follows_the_GRID_not_the_zoom.
+
+    The editor's y-cut chart zooms y1/y2 exactly as the x one zooms x1/x2, so
+    the same conflation is reachable on the second axis: sample away from a pole
+    and, if the classical gradient probe followed the window, the badge would
+    read ✓, the Solve gate would open, and POST /sessions would 422 on a
+    potential the editor had just approved. Both windows are what to SAMPLE;
+    both validity boxes come from req.grid, whatever either window says.
+
+    Also pins that the two windows do not cross-talk — a y zoom must leave the x
+    samples alone, since they are what the OTHER chart is drawn from.
+    """
+    with TestClient(app) as client:
+        # 1/y is singular at y = 0: inside the grid, outside the y plot window
+        r = client.post("/api/preview/potential",
+                        json={"expr": "1/y", "x1": -6, "x2": 6,
+                              "y1": 1, "y2": 6, "grid": G2})
+        d = r.json()
+        assert d["ok"] and not d["validity"]["classical"], d
+        assert "dU/dy is singular" in " ".join(d["reasons"]), d
+        # ...while the samples follow the zoom, which is what they are for
+        assert d["samples"]["y"][0] == pytest.approx(1.0)
+        assert d["samples"]["y"][-1] == pytest.approx(6.0)
+        # and the x window, which nothing here touched, still spans its own
+        assert d["samples"]["x"][0] == pytest.approx(-6.0)
+
+        # the converse: a pole clear of the domain must not block Solve, however
+        # far out the y plot is zoomed. 30 is outside the extended Bopp range
+        # (±7.795 at this grid) too, so this isolates the range plumbing.
+        r = client.post("/api/preview/potential",
+                        json={"expr": "1/(y - 30)", "x1": -6, "x2": 6,
+                              "y1": -50, "y2": 50, "grid": G2})
+        d = r.json()
+        assert d["ok"] and d["validity"]["classical"] and d["validity"]["quantum"], d
+        assert d["samples"]["y"][0] == pytest.approx(-50.0)
+
+        # unzoomed (the fields absent, which is what the SPA sends until the y
+        # chart is touched): the grid's own y extent
+        r = client.post("/api/preview/potential",
+                        json={"expr": "1/y", "x1": -6, "x2": 6, "grid": G2})
+        d = r.json()
+        assert d["samples"]["y"][0] == pytest.approx(G2["axes"][1]["lo"])
+        assert d["samples"]["y"][-1] == pytest.approx(G2["axes"][1]["hi"])

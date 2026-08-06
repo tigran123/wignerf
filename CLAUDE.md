@@ -691,12 +691,14 @@ source) is what keeps startup fast. See `README.md`.
   `test_the_validity_probe_follows_the_GRID_not_the_zoom`.
   **At ndim=2 the editor draws the two axis cuts on TWO charts, not two traces**
   (`PotentialEditor.vue`): uPlot's `AlignedData` has ONE shared abscissa and
-  these cuts do not share one — U(x, 0) is indexed by x over the zoom window,
-  U(0, y) by y over the grid's own y extent. Overlaid, the y cut was drawn at
-  the x sample positions, i.e. rescaled by (x2−x1)/(y2−y1) — invisible on the
-  isotropic default box, which is exactly why it looked right. Each chart's
-  title also names the coordinate its cut was actually TAKEN at (`nearestZero`),
-  so `U(x, 0.4)` rather than a false `U(x, 0)`. 1D is untouched.
+  these cuts do not share one — **each axis has its OWN zoom window**, one
+  `createUplotZoom` per chart. Overlaid, the y cut was drawn at the x sample
+  positions, i.e. rescaled by (x2−x1)/(y2−y1) — invisible on the isotropic
+  default box, which is exactly why it looked right. Each title names the
+  coordinate its cut was actually TAKEN at (`nearestZero`), so `U(x, 0.4)` not a
+  false `U(x, 0)` — on BOTH axes now, either zoom moving where the OTHER's cut is
+  read. `viewY` is dropped when ndim falls to 1, the axis having stopped existing
+  (cf. `ICEditor.cutAxis`). 1D is untouched.
 - **ICs** (`core/initial.py`): Gaussian mixtures (independent σ per axis) and
   cat states (analytic pairwise cross-Wigner; σ_k derived = ħ/(2σ_q) per
   dimension). **BOTH FACTORISE OVER DIMENSIONS, which is why 2D needed no new

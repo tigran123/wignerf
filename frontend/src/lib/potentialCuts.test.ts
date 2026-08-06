@@ -41,6 +41,20 @@ describe('the 2D axis cuts', () => {
     expect(cutLabel(2.5, [0, 4, 8])).toBe('2.5')
   })
 
+  it('names the y coordinate too when the Y window is zoomed off-origin', () => {
+    // The y cut zooms independently of the x one, so an off-origin window is
+    // reachable on EITHER axis and each moves where the OTHER's cut is read:
+    // a y window of [1, 3] leaves no y = 0 to cut U(x, ·) at, and the x chart's
+    // title must say 1 rather than claim a U(x, 0) it never sampled.
+    const offY = { ...SM, y: [1, 2, 3], U: XS.map((x) => [1, 2, 3].map((y) => x + 10*y)) }
+    expect(cutAt(offY)).toEqual({ x: 0, y: 1 })
+    expect(cutLabel(1, offY.y)).toBe('1')
+    // and the cut really is the row at that y: U(x, 1) = x + 10
+    expect(cutAlongX(offY)[1]).toEqual([2, 6, 10, 14, 18])
+    // the y cut keeps its own abscissa, zoomed or not
+    expect(cutAlongY(offY)[0]).toEqual([1, 2, 3])
+  })
+
   it('leaves 1D alone: one trace against its own x', () => {
     const one = { x: XS, U: [0, 1, 2, 3, 4] }
     expect(isLattice(one)).toBe(false)

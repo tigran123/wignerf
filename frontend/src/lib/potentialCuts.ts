@@ -11,12 +11,16 @@
  *   U(x, y0) = rows[i][j0]  for every i   -> indexed by X
  *   U(x0, y) = rows[i0][j]  for every j   -> indexed by Y
  *
- * which are DIFFERENT abscissae: xs is the editor's (possibly zoomed) window
- * and ys is the grid's own y extent. uPlot's AlignedData carries one shared x
- * per chart, so these need two charts — drawn as two traces on one, the y cut
- * was plotted at the x sample positions and silently rescaled by
+ * which are DIFFERENT abscissae: each axis carries its own (possibly zoomed)
+ * window, and the two move independently. uPlot's AlignedData carries one
+ * shared x per chart, so these need two charts — drawn as two traces on one,
+ * the y cut was plotted at the x sample positions and silently rescaled by
  * (x2-x1)/(y2-y1). On the isotropic default box the two windows coincide and
  * it looked perfect, which is why it survived.
+ *
+ * Which is also why nearestZero exists rather than an index of 0: a window
+ * zoomed away from the origin has no sample there, on EITHER axis, so each cut
+ * is taken at the nearest one and cutLabel names the coordinate it landed on.
  */
 
 export interface PotentialSamples {
